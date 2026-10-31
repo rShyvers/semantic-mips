@@ -6,3 +6,4 @@ import MipsSim.State
 import MipsSim.Instruction
 import MipsSim.Asm
 import MipsSim.Step
+import MipsSim.Specs.StepSpec
