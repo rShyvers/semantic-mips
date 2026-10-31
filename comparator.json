@@ -1,0 +1,16 @@
+{
+  "challenge_module": "MipsSim.Specs.StepSpec",
+  "solution_module": "MipsSim.Specs.StepSpec",
+  "theorem_names": [
+    "add_spec_raw",
+    "sub_spec_raw",
+    "div_by_zero_spec",
+    "beq_taken_spec",
+    "jal_sets_ra",
+    "lw_spec_raw",
+    "add_overflow_not_wrapped",
+    "zero_write_not_observable"
+  ],
+  "definition_names": [],
+  "permitted_axioms": ["propext", "Classical.choice", "Quot.sound"]
+}

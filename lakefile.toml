@@ -1,7 +1,12 @@
 name = "MipsSim"
 version = "0.1.0"
 keywords = ["math"]
-defaultTargets = ["MipsSim", "DiffHarness"]
+# `Checked` (not `MipsSim`) is the default target on purpose: it is the
+# sorry-free subset that `lake check` kernel-replays. See `Checked.lean`
+# and the "Verification gates" section of the root README. `MipsSim`
+# (the full library, including the 3 documented `sorry`s in
+# `MipsSim.Specs.StepSpec`) is still buildable with `lake build MipsSim`.
+defaultTargets = ["Checked", "DiffHarness"]
 
 [leanOptions]
 pp.unicode.fun = true # pretty-prints `fun a ↦ b`
@@ -13,6 +18,9 @@ rev = "v4.35.0"
 
 [[lean_lib]]
 name = "MipsSim"
+
+[[lean_lib]]
+name = "Checked"
 
 [[lean_exe]]
 name = "DiffHarness"
