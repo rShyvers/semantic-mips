@@ -276,7 +276,7 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     match (readReg s 2).toNat with
     | 1 =>
       let n := asSigned (readReg s 4)
-      mkNext { s with out := s.out ++ toString n ++ "\n" }
+      mkNext { s with out := s.out ++ toString n }
     | 4 =>
       let str := readCString s (readReg s 4) printStringFuel
       mkNext { s with out := s.out ++ str }
@@ -577,9 +577,9 @@ private def crossRegionState : State := { regs0 with pc := 0x90400000#32 }
 -- ### syscalls
 
 #guard (stepState (prog1 .syscall) (setRegs regs0 [(2, 1#32), (4, 5#32)])).bind (fun s => some s.out)
-  = some "5\n"
+  = some "5"
 #guard (stepState (prog1 .syscall) (setRegs regs0 [(2, 1#32), (4, 0xfffffffb#32)])).bind (fun s => some s.out)
-  = some "-5\n"
+  = some "-5"
 private def syscall4State : State :=
   { (setRegs regs0 [(2, 4#32), (4, 0x10010000#32)]) with
       mem := (((∅ : Std.HashMap W32 UInt8).insert 0x10010000#32 0x48).insert 0x10010001#32 0x69)
@@ -616,7 +616,7 @@ private def sumProg : Program :=
     , .syscall ]
 
 #guard (match run sumProg regs0 20 with
-        | .halted .exit s steps => s.out == "12\n" && steps == 8
+        | .halted .exit s steps => s.out == "12" && steps == 8
         | _ => false)
 
 -- `limitReached`: a one-instruction infinite self-loop (`beq $zero,$zero,-1`)

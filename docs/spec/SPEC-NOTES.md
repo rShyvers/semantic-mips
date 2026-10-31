@@ -106,11 +106,13 @@ part of the machine-level semantics.
 
 ## 7. Endianness and data representation
 
-Big-endian throughout (word fetch, `lw`/`sw` byte order). See
-`Memory.java` fetch/store methods. Integers are two's complement; arithmetic
-instructions operate on bit patterns with defined wraparound (`addu`, `subu`)
-or the MARS-documented behavior for signed variants — per-instruction details
-are pinned in Lean spec S against `Instruction.java`.
+Our language (the spec target) follows the classic MIPS big-endian
+convention. **MARS itself defaults to little-endian** — see §9 item 4 for
+the correction to an earlier (incorrect) "big-endian throughout" claim here;
+that was a misreading of `Memory.java`. Integers are two's complement;
+arithmetic instructions operate on bit patterns with defined wraparound
+(`addu`, `subu`) or the MARS-documented behavior for signed variants —
+per-instruction details are pinned in Lean spec S against `Instruction.java`.
 
 ## 8. What is trusted / not
 
@@ -143,3 +145,19 @@ the decision for our semantics:
    negative offsets on raw binary input. Our semantics sign-extends per the
    ISA. Differential corpus is assembler-built, so MARS still matches;
    this deviation is documented as a found defect in the test environment.
+4. **Endianness: MARS 4.5 headless defaults to LITTLE-ENDIAN memory
+   storage; we follow the classic MIPS big-endian convention (ISA truth).**
+   `vendor/mars-src/mars/mips/hardware/Memory.java:90`:
+   `private static boolean byteOrder = LITTLE_ENDIAN;`. `setByteOrder`
+   (line 328) exists but is never called anywhere in this source tree, so
+   there is no CLI/GUI override available in headless MARS — every run
+   observes little-endian memory. An earlier version of §7 above claimed
+   MARS was "big-endian throughout"; that was a misreading of this file and
+   has been corrected. Consequence for differential testing: byte-order-
+   sensitive probes (e.g. `lb` at offset 0 of a `.word`-declared value) will
+   diverge between MARS and our big-endian spec *by design*, not due to a
+   bug in either. The differential corpus must stick to endian-invariant
+   access patterns — `lw`/`sw` round-trips (store and reload a word through
+   the same-width access), and sequential `.byte`/`.asciiz` data accessed
+   byte-by-byte — which produce identical observable results under either
+   byte order.

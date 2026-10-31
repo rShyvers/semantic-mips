@@ -1,6 +1,7 @@
 import Std.Data.HashMap.Basic
 import MipsSim.Word
 import MipsSim.Types
+import MipsSim.Instruction
 
 /-!
 # Asm — v1 MIPS assembler
@@ -18,7 +19,8 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   `.asciiz` string is not treated as a comment start).
 - All v1 real instructions (`docs/spec/INSTRUCTION-REF.md`): R-type arith/
   logic/shift/mult-div/mfhi/mflo, I-type immediate/logic/memory, J-type,
-  branches.
+  branches, and `syscall` (zero operands, all fields zero except
+  funct = 0x0c, i.e. word `0x0000000C`).
 - Pseudo-ops: `li`, `la` (label only — see deviation note below), `move`,
   `nop`, expanded per `vendor/mars-src/PseudoOps.txt`.
 - Register names `$zero,$at,$v0,$v1,$a0..$a3,$t0..$t7,$s0..$s7,$t8,$t9,
@@ -307,7 +309,7 @@ private def jTable : List (String × Nat) := [("j", 0x02), ("jal", 0x03)]
 private def bTable : List (String × Nat × BForm) :=
   [("beq", 0x04, .two), ("bne", 0x05, .two), ("blez", 0x06, .one), ("bgtz", 0x07, .one)]
 
-private def pseudoSet : List String := ["li", "la", "move", "nop"]
+private def pseudoSet : List String := ["li", "la", "move", "nop", "syscall"]
 private def directiveSet : List String := [".text", ".data", ".word", ".half", ".byte", ".asciiz", ".space"]
 
 private def isKnownMnemonic (m : String) : Bool :=
@@ -433,6 +435,10 @@ private def wordsForMnemonic (mnemonic : String) (operands : List String) (lineN
     match operands with
     | [] => pure 1
     | _ => throw (.badOperand s!"nop takes no operands" lineNo)
+  | "syscall" =>
+    match operands with
+    | [] => pure 1
+    | _ => throw (.badOperand s!"syscall takes no operands" lineNo)
   | _ => pure 1
 
 private def layoutLine (s : LState) (pl : ParsedLine) : Except AsmError LState := do
@@ -642,6 +648,10 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
         pure [rtWord 0 rs rd 0 0x21]              -- addu rd, $zero, rs
     | _ => throw (.badOperand s!"move expects 'move $dst, $src'" item.lineNo)
   | "nop" => pure [0#32]
+  | "syscall" =>
+    match item.operands with
+    | [] => pure [0x0000000C#32]              -- all fields zero except funct = 0x0c
+    | _ => throw (.badOperand s!"syscall takes no operands" item.lineNo)
   | _ => throw (.unknownMnemonic s!"unknown mnemonic '{name}'" item.lineNo)
 
 private def applyItem (labels : Std.HashMap String W32) (prog : Program) (item : RawItem) :
@@ -801,6 +811,19 @@ def moveNopProg : Program :=
 
 #guard moveNopProg.getD textBase 0 = mkRT (0#32) (9#32) (8#32) (0#32) (0x21#32)
 #guard moveNopProg.getD (textBase + 4#32) 0 = 0#32
+
+-- `syscall`: zero operands, all fields zero except funct = 0x0c (0x0000000C),
+-- per MARS's own runtime table (`InstructionSet.java` lines 1188-1191,
+-- "000000 ccccc ccccc ccccc ccccc 001100"); also matches `Instruction.lean`'s
+-- `encode .syscall`.
+def syscallSrc : String := "addi $t0, $zero, 1\nsyscall\n"
+def syscallProg : Program :=
+  match assemble syscallSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard syscallProg.getD (textBase + 4#32) 0 = 0x0000000C#32
+#guard decode (syscallProg.getD (textBase + 4#32) 0) = some .syscall
 
 -- One error case per major `AsmError` kind.
 #guard (assemble "frobnicate $t0, $t1\n").isOk = false

@@ -681,8 +681,11 @@ convention: `$v0` = service number, `$a0` = register 4 (first argument).
   `syscall` instruction (`opcode=000000`, `funct=001100`).
 - **Semantics**: reads `$a0` (register 4) as a signed 32-bit int, converts
   with `Integer.toString` (decimal, signed), writes to the console via
-  `SystemIO.printString`. No registers or memory are modified by the
-  syscall itself.
+  `SystemIO.printString` to `System.out.print` (`SyscallPrintInt.java:53`).
+  **No trailing newline is appended** -- confirmed both by the source
+  (`print`, not `println`) and empirically (a program printing 42 then 99
+  produces exactly `"4299"`, concatenated with no separator). No registers
+  or memory are modified by the syscall itself.
 - **Errors/halts**: none specific; a missing/invalid service number more
   generally throws `ProcessingException(..., SYSCALL_EXCEPTION)` from
   `findAndSimulateSyscall`, but service 1 is always registered in v1 scope.
