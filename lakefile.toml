@@ -14,3 +14,7 @@ rev = "v4.35.0"
 [[lean_lib]]
 name = "MipsSim"
 
+[[lean_exe]]
+name = "DiffHarness"
+root = "DiffHarness"
+
