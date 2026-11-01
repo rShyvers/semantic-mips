@@ -602,7 +602,7 @@ to `out`, with no trailing newline**, and advances the program counter by 4
 signed; no other state changes). -/
 theorem syscall1_spec (p : Program) (s : State) (w : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some .syscall)
-    (hv0 : readReg s (regIdxSpec 2#32) = 1#32) :
+    (hv0 : readReg s (regIdxSpec 2#32) = 1#32) (hpb : s.pendingBranch = none) :
     step p s =
       StepResult.next { s with out := s.out ++ toString (asSigned (readReg s (regIdxSpec 4#32))), pc := s.pc + 4#32 } := by
   sorry
@@ -684,6 +684,21 @@ weaker versions below pin `s` down to a fully concrete, well-formed state
 evaluation — required for anything that touches `Program`/`State.mem`,
 which are backed by `cbv_opaque` `Std.HashMap`s and are not
 kernel-reducible by `decide`/`rfl`). -/
+
+/-! ADDENDUM (post-merge, orchestrator pass): `syscall1_spec` was also found
+(separately, on the `proof/proof-stalls` branch) to be missing a
+`hpb : s.pendingBranch = none` hypothesis every other `mkNext`-based
+theorem in this file carries -- without it, the claimed right-hand side is
+simply false whenever a delay-slot transfer is pending (checked
+concretely: for `s.pendingBranch = some 0xabcd#32`, `step` actually
+produces `pc = 0xabcd#32`, not `s.pc + 4#32`). That hypothesis has been
+added to the statement above, fixing the false claim regardless of
+provability. Tried closing it with the added hypothesis via the standard
+recipe plus a final `rw [hv0]`: it fails with the exact same "did not find
+an occurrence" error described above for `syscall10_spec` -- confirming
+this is the identical chicken-and-egg blocker, not a second, independent
+issue, and that fixing the missing hypothesis alone does not unstall the
+proof. Left `sorry`. -/
 
 
 /-- One-instruction program containing `instr` at `textBase`, for building
