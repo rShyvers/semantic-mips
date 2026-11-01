@@ -143,25 +143,35 @@ Combined with `initialState` seeding register `0` to `0` (`State.lean`),
 this shows `$zero` reads `0` at every point in every run, matching
 INSTRUCTION-REF Global rule 2 ("writes to `$zero` are a no-op").
 
-STALL NOTE: a fully generic proof needs `step` unfolded and then every one
-of the 24 `Instruction` constructors handled uniformly. The arithmetic/
-logic/mult/div instructions (no memory access, no branching) close cleanly
-with `cases instr <;> simp_all [writeReg_preserves_zero_slot]`-style
-reasoning, but the instructions whose body is itself a `match`/`if` on a
-memory read or a branch condition (`lw`,`sw`,`lb`,`lbu`,`lh`,`lhu`,`sh`,
-`beq`,`bne`,`blez`,`bgtz`,`j`,`jal`,`syscall`,`lui`) need that inner
-match/if exposed before the combinator can see register-file structure, and
-`dsimp`/`split` refuse to expose it uniformly across all of them in one
-tactic script (each individually closes by the same technique used for the
-per-instruction lemmas in Group 2, at the cost of one lemma per
-instruction). Left `sorry` here; see `step_preserves_zero_register_arith`
-below for the closed version covering every instruction without memory
-access, branching, or jumping (everything but
-`lw,sw,lb,lbu,lh,lhu,sh,beq,bne,blez,bgtz,j,jal,syscall,lui`), which is
-exactly the subset that already closes. -/
+STALL NOTE (original, written when only a handful of `_spec_raw` theorems
+existed): a fully generic proof needs `step` unfolded and then every one of
+the `Instruction` constructors handled uniformly. The arithmetic/logic/
+mult/div instructions (no memory access, no branching) close cleanly with
+`cases instr <;> simp_all [writeReg_preserves_zero_slot]`-style reasoning,
+but the instructions whose body is itself a `match`/`if` on a memory read
+or a branch condition need that inner match/if exposed before the
+combinator can see register-file structure, and `dsimp`/`split` refuse to
+expose it uniformly across all of them in one tactic script.
+
+UPDATE: this file has since grown a `_spec_raw` theorem for nearly every
+instruction family, which changes the picture completely \u2014 see
+`step_preserves_zero_register_nontrivial` below (Group 6), which closes the
+invariant for every instruction that has a `_spec_raw` theorem (around 70
+of the ~112 `Instruction` constructors, including every memory access,
+branch, and jump instruction the old note above singled out as
+problematic) by dispatching on the decoded instruction and `rw`ing with
+that instruction's own `_spec_raw` equation \u2014 one case per instruction
+rather than one generic combinator, exactly the "cost of one lemma per
+instruction" this note predicted, except it turns out that cost was already
+mostly paid by Group 2's per-instruction lemmas. The remaining gap (`clo
+clz mul seb seh wsbh ext ins`, `lwl lwr swl swr`, the REGIMM trap-immediate
+family, `syscall`, the CP0 family, and the entire COP1/FPU subset) has no
+`_spec_raw` theorem yet to dispatch to; left `sorry` here and in
+`step_preserves_zero_register_nontrivial`'s own trailing case. -/
 theorem step_preserves_zero_register (p : Program) (s s' : State)
     (hstep : step p s = StepResult.next s') : readReg s' 0 = readReg s 0 := by
   sorry
+
 
 /-! ## Group 2 — per-instruction specs (semantics-critical subset) -/
 
@@ -606,22 +616,75 @@ theorem syscall10_spec (p : Program) (s : State) (w : W32)
     step p s = StepResult.halt .exit := by
   sorry
 
-/-! STALL NOTE on `syscall1_spec`/`syscall10_spec`: `step`'s own syscall
-dispatch is a five-way `Nat` pattern match (`1 | 4 | 10 | 11 | _`) on
-`(readReg s 2).toNat` nested inside `execInstr` (private, Group 2's usual
-technique needs the exact match reconstructed and closed by `rfl`). That
-`rfl` genuinely times out / mismatches on this match for an *abstract*
-state `s` even with very large recursion/heartbeat budgets, and forcing the
-syscall-number register to a literal value via `writeReg` does not help,
-because `State.regs` has no general-purpose length invariant visible to the
-kernel at this level (`writeReg`'s array write is a no-op if `s.regs` is
-shorter than 32, which is possible for an arbitrary `s : State`). Rather
-than add an artificial well-formedness hypothesis and risk more stalling,
-these two are left `sorry`. The closed weaker versions below pin `s` down
-to a fully concrete, well-formed state (via `initialState`) and verify the
-same claims by `#guard` (compiled evaluation — required for anything that
-touches `Program`/`State.mem`, which are backed by `cbv_opaque`
-`Std.HashMap`s and are not kernel-reducible by `decide`/`rfl`). -/
+/-! STALL NOTE on `syscall1_spec`/`syscall10_spec` (updated after a fresh
+attempt following the house "`obtain`/`subst`/`unfold step`" recipe, with
+`hv0` substituted in before `unfold step` as suggested):
+
+**`syscall1_spec` is not just hard to prove — as stated, it is false.**
+Every other `mkNext`-based `_spec_raw` theorem in this file (every
+arithmetic/logic/load/store/trap instruction) carries a
+`hpb : s.pendingBranch = none` hypothesis, because `mkNext`'s `advance` call
+resolves a pending delay-slot transfer when one is scheduled: if
+`s.pendingBranch = some target`, the *next* `pc` is `target` (and
+`pendingBranch` is cleared to `none`), not `s.pc + 4#32`. `syscall1_spec`'s
+statement has no such hypothesis, and `syscall`'s `1` case **does** go
+through `mkNext`. Concretely, for `s.pendingBranch = some 0xabcd#32` and
+`$v0 = 1`, `step` actually produces `pc = 0xabcd#32` and
+`pendingBranch = none`, whereas the theorem's claimed right-hand side
+`{ s with out := ..., pc := s.pc + 4#32 }` keeps
+`pendingBranch = some 0xabcd#32` unchanged and sets `pc := s.pc + 4#32` —
+these disagree (checked directly: build `s` via `setRegsSpec` with
+`pendingBranch := some 0xabcd#32`, `$v0 := 1`, and `#eval`-compare
+`step (prog1Spec .syscall) s` against the theorem's claimed RHS — the `pc`/
+`pendingBranch` components differ). So no amount of tactic cleverness
+closes `syscall1_spec` as currently stated — it is missing a `hpb`-style
+hypothesis every other `mkNext`-based theorem has. Per this task's scope
+(no weakening/changing an existing claim), this is reported rather than
+"fixed" by adding the missing hypothesis.
+
+**`syscall10_spec`'s claim, by contrast, is true** (its `10 => halt .exit`
+case never calls `mkNext`/`advance`, so it is independent of
+`pendingBranch`; verified concretely by `#eval` on states with
+`pendingBranch := none` and `:= some _` alike, both giving `.exit`), but it
+still does not close with the tools available here, for a *different*,
+purely proof-engineering reason than the original note's "`regs.size`
+invariant" diagnosis (which turned out not to be the real obstacle). The
+actual blocker: `readReg s (regIdxSpec 2#32) = 10#32` (`hv0`) is a
+hypothesis *about* `s`, not a term that appears syntactically anywhere in
+the goal until `step`/`execInstr` is unfolded all the way down to the
+`match (readReg s 2).toNat with | 1 => ... | 10 => .exit | ...` dispatch —
+but reaching that point requires delta-unfolding the *private* `execInstr`
+(and, for a normal form `rw`/`dsimp` can match against, its sibling
+branches' `mkNext`/`readCString`/`printStringFuel` helpers too, also
+private), which `unfold`/`simp [name]` cannot do from this file at all (the
+names are not visible outside `Step.lean`), and which `rw`/`dsimp only`
+(syntactic tactics, not delta-unfolding ones) do not do automatically
+either. Only a whole-term `rfl`/`decide` performs the kernel-level
+delta-unfolding needed to get through private definitions (that is how
+every other `_spec_raw` theorem in this file closes, including ones that
+change `pendingBranch`/`hi`/`lo`/`mem`) — but `rfl`/`decide` only
+*computes*, it does not consult hypotheses, so it cannot use `hv0` to turn
+the symbolic `(readReg s 2).toNat` into the literal `10` the match needs in
+order to reduce. This is a genuine chicken-and-egg: exposing the match for
+`rw [hv0]` requires unfolding, but unfolding far enough to expose it
+requires already knowing which branch to reduce to. (Confirmed
+experimentally: `unfold step; rw [hfetch]; dsimp only; rw [hdecode]` leaves
+the goal as the fully opaque `execInstr✝ {...} w Instruction.syscall =
+StepResult.halt HaltReason.exit` — zero progress into `execInstr`'s body —
+and both `rw [hv0]` and `simp only [hv0]` against that goal fail, with "did
+not find an occurrence"/"made no progress" respectively.) Reconstructing
+`execInstr`'s syscall dispatch by hand via `show`/`change` (to get an
+explicit term `rw`/`simp` can see into) is blocked the same way as naming
+`execInstr` directly: cases `1`/`4`/`11` of the dispatch call the private
+`mkNext`/`readCString`/`printStringFuel`, whose names cannot be typed in
+this file either, so not even an approximate reconstruction parses, let
+alone type-checks as definitionally equal. Left `sorry` on both. The closed
+weaker versions below pin `s` down to a fully concrete, well-formed state
+(via `initialState`) and verify the same claims by `#guard` (compiled
+evaluation — required for anything that touches `Program`/`State.mem`,
+which are backed by `cbv_opaque` `Std.HashMap`s and are not
+kernel-reducible by `decide`/`rfl`). -/
+
 
 /-- One-instruction program containing `instr` at `textBase`, for building
 concrete examples below. -/
@@ -3884,3 +3947,502 @@ def swTestStateSpec : State :=
                 readMemByte s2 (unalignedBaseSpec + 4#32) == some 0xdd
             | .halt _ => false)
         | .halt _ => false) = true
+
+/-! ## Group 6 — closing `step_preserves_zero_register`
+
+The STALL NOTE on `step_preserves_zero_register` (Group 1) predates almost
+all of the `_spec_raw` theorems above: at the time it was written, only a
+handful of instructions had one. Now nearly every instruction family does,
+so the generic "expose the inner match/if uniformly" obstacle described
+there can be sidestepped entirely: instead of unfolding `step`'s raw
+definition generically, dispatch on the decoded instruction and, in each
+case, `rw` with that instruction's own `_spec_raw` theorem (which has
+already done the `step`-unfolding work), then close with
+`writeReg_preserves_zero_slot` (for the register-writing cases) or a direct
+`rfl`/regs-equality argument (for the cases that only touch `pc`,
+`pendingBranch`, `hi`, `lo`, `mem`, or `out`).
+
+Two small helpers make the memory-store cases (`sw`/`sh`/`sc`) as uniform
+as the register-writing cases: `writeMemWord`/`writeMemHalf` are public (see
+`State.lean`), so — unlike `step`'s private helpers — they can be `unfold`ed
+here directly, giving a `regs`-equality fact out of their `Option.some`
+case exactly the way `writeReg_pc`/`writeReg_hi`/etc. do for `writeReg`. -/
+
+/-- Two states with the same `regs` field read `$zero` the same —
+the register-file-only half of `readReg`, used to discharge every
+`step_preserves_zero_register_nontrivial` case that changes `pc`/
+`pendingBranch`/`hi`/`lo`/`mem`/`out` but never touches `regs` at all. -/
+theorem readReg_zero_of_regs_eq {s1 s2 : State} (h : s1.regs = s2.regs) :
+    readReg s1 0 = readReg s2 0 := by
+  unfold readReg
+  rw [h]
+
+/-- `writeMemWord` never changes `regs` when it succeeds — it only ever
+touches `mem` (INSTRUCTION-REF "sw"/"sc" sections' effective-address write).
+Public (`State.lean`), so — unlike `step`'s private per-instruction helpers —
+it can be `unfold`ed directly from this file. -/
+theorem writeMemWord_regs (s stored : State) (addr v : W32)
+    (h : writeMemWord s addr v = some stored) : stored.regs = s.regs := by
+  unfold writeMemWord at h
+  split at h
+  · cases h
+  · injection h with h'
+    rw [← h']
+
+/-- `writeMemHalf` never changes `regs` when it succeeds — the halfword
+counterpart of `writeMemWord_regs` (INSTRUCTION-REF "sh" section). -/
+theorem writeMemHalf_regs (s stored : State) (addr v : W32)
+    (h : writeMemHalf s addr v = some stored) : stored.regs = s.regs := by
+  unfold writeMemHalf at h
+  split at h
+  · cases h
+  · injection h with h'
+    rw [← h']
+
+/-- Single-instruction restatement of `lb_lbu_spec_raw`'s first conjunct,
+for `lb` alone — proved the same way (`obtain`/`subst`/`unfold step`/`rw`/
+`rfl`), since the combined theorem's bundled `wb`/`wbu` signature cannot be
+applied to a `cases instr` branch that only knows about one of the two
+instructions. -/
+theorem lb_spec_raw' (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.lb rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let addr := readReg s (regIdxSpec rs) + signExt16 imm
+      match readMemByte s addr with
+      | none => StepResult.halt (.addressError addr)
+      | some b =>
+        StepResult.next
+          { (writeReg s (regIdxSpec rt) ((BitVec.ofNat 8 b.toNat).signExtend 32)) with
+            pc := (writeReg s (regIdxSpec rt) ((BitVec.ofNat 8 b.toNat).signExtend 32)).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- Single-instruction restatement of `lb_lbu_spec_raw`'s second conjunct,
+for `lbu` alone. -/
+theorem lbu_spec_raw' (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.lbu rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let addr := readReg s (regIdxSpec rs) + signExt16 imm
+      match readMemByte s addr with
+      | none => StepResult.halt (.addressError addr)
+      | some b =>
+        StepResult.next
+          { (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)) with
+            pc := (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- Single-instruction restatement of `lh_lhu_spec_raw`'s first conjunct,
+for `lh` alone. -/
+theorem lh_spec_raw' (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.lh rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let addr := readReg s (regIdxSpec rs) + signExt16 imm
+      match readMemHalf s addr with
+      | none => StepResult.halt (.addressError addr)
+      | some h =>
+        StepResult.next
+          { (writeReg s (regIdxSpec rt) (signExt16 h)) with
+            pc := (writeReg s (regIdxSpec rt) (signExt16 h)).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- Single-instruction restatement of `lh_lhu_spec_raw`'s second conjunct,
+for `lhu` alone. -/
+theorem lhu_spec_raw' (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.lhu rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let addr := readReg s (regIdxSpec rs) + signExt16 imm
+      match readMemHalf s addr with
+      | none => StepResult.halt (.addressError addr)
+      | some h =>
+        StepResult.next
+          { (writeReg s (regIdxSpec rt) h) with
+            pc := (writeReg s (regIdxSpec rt) h).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **Closed weaker version of `step_preserves_zero_register`, for every
+instruction family that has a `_spec_raw` theorem above.** Dispatches on
+the decoded instruction and, in each case, `rw`s with that instruction's own
+`_spec_raw` equation (which already did the hard work of unfolding `step`),
+then closes with `writeReg_preserves_zero_slot` (register-writing cases) or
+a `regs`-untouched argument (every other case) — see the Group 6 docstring
+above. This covers every instruction that `decode`/`encode` support
+**except**: `clo clz mul seb seh wsbh ext ins` (SPECIAL2/SPECIAL3, no
+`_spec_raw` yet), `lwl lwr swl swr` (unaligned load/store, no `_spec_raw`
+yet), `teqi tnei tgei tgeiu tlti tltiu` (REGIMM trap-immediate family, no
+`_spec_raw` yet), `syscall` (see the `syscall1_spec`/`syscall10_spec` STALL
+NOTE above), `mfc0 mtc0 eret wait` (CP0, no `_spec_raw` yet), and the
+entire COP1/FPU subset `mfc1 mtc1 lwc1 swc1 addS subS mulS divS movS cvtSW
+cvtWS cEqS cLtS cLeS sqrtS absS negS roundWS truncWS ceilWS floorWS cFS
+cUnS cUeqS cOltS cUltS cOleS cUleS cfc1 ctc1 bc1t bc1f` (no `_spec_raw`
+yet). Every one of those writes only `fpRegs`/`cp0*`/`mem`/`pc` — never the
+GPR file `regs` — so the invariant is expected to hold for them too; they
+are left as this theorem's own trailing `sorry` (see the STALL NOTE right
+after its proof) pending `_spec_raw` coverage for those families, rather
+than re-deriving `step`'s raw definition for ~45 more instructions here by
+hand. -/
+theorem step_preserves_zero_register_nontrivial (p : Program) (s s' : State) (w : W32)
+    (instr : Instruction)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some instr)
+    (hpb : s.pendingBranch = none)
+    (hstep : step p s = StepResult.next s') :
+    readReg s' 0 = readReg s 0 := by
+  cases instr
+  case add rs rt rd =>
+    rw [add_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case sub rs rt rd =>
+    rw [sub_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case addi rs rt imm =>
+    rw [addi_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case addu rs rt rd =>
+    rw [addu_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case subu rs rt rd =>
+    rw [subu_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case and rs rt rd =>
+    rw [and_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case or rs rt rd =>
+    rw [or_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case xor rs rt rd =>
+    rw [xor_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case nor rs rt rd =>
+    rw [nor_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case slt rs rt rd =>
+    rw [slt_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case sltu rs rt rd =>
+    rw [sltu_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case movn rs rt rd =>
+    rw [movn_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+    · injection hstep with hs; rw [← hs]; rfl
+  case movz rs rt rd =>
+    rw [movz_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+    · injection hstep with hs; rw [← hs]; rfl
+  case sll rd rt shamt =>
+    rw [sll_spec_raw p s w rd rt shamt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case srl rd rt shamt =>
+    rw [srl_spec_raw p s w rd rt shamt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case sra rd rt shamt =>
+    rw [sra_spec_raw p s w rd rt shamt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case sllv rd rt rs =>
+    rw [sllv_spec_raw p s w rd rt rs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case srlv rd rt rs =>
+    rw [srlv_spec_raw p s w rd rt rs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case srav rd rt rs =>
+    rw [srav_spec_raw p s w rd rt rs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case rotr rd rt sa =>
+    rw [rotr_spec_raw p s w rd rt sa hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case rotrv rd rt rs =>
+    rw [rotrv_spec_raw p s w rd rt rs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case mult rs rt =>
+    rw [mult_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case multu rs rt =>
+    rw [multu_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case div rs rt =>
+    rw [div_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case divu rs rt =>
+    rw [divu_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case mflo rd =>
+    rw [mflo_spec_raw p s w rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case mfhi rd =>
+    rw [mfhi_spec_raw p s w rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case mthi rs =>
+    rw [mthi_spec_raw p s w rs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case mtlo rs =>
+    rw [mtlo_spec_raw p s w rs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case madd rs rt =>
+    rw [madd_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case maddu rs rt =>
+    rw [maddu_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case msub rs rt =>
+    rw [msub_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case msubu rs rt =>
+    rw [msubu_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case addiu rs rt imm =>
+    rw [addiu_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case slti rs rt imm =>
+    rw [slti_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case sltiu rs rt imm =>
+    rw [sltiu_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case andi rs rt imm =>
+    rw [andi_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case ori rs rt imm =>
+    rw [ori_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case xori rs rt imm =>
+    rw [xori_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case lui rt imm =>
+    rw [lui_spec_raw p s w rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case lw rs rt imm =>
+    rw [lw_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case lb rs rt imm =>
+    rw [lb_spec_raw' p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case lbu rs rt imm =>
+    rw [lbu_spec_raw' p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case lh rs rt imm =>
+    rw [lh_spec_raw' p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case lhu rs rt imm =>
+    rw [lhu_spec_raw' p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case ll rs rt imm =>
+    rw [ll_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case sw rs rt imm =>
+    rw [sw_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · rename_i stored hmw
+      injection hstep with hs; rw [← hs]
+      exact readReg_zero_of_regs_eq (writeMemWord_regs s stored _ _ hmw)
+  case sh rs rt imm =>
+    rw [sh_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · rename_i stored hmh
+      injection hstep with hs; rw [← hs]
+      exact readReg_zero_of_regs_eq (writeMemHalf_regs s stored _ _ hmh)
+  case sc rs rt imm =>
+    rw [sc_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · rename_i stored hmw
+      split at hstep
+      · injection hstep with hs; rw [← hs]
+        exact (writeReg_preserves_zero_slot stored (regIdxSpec rt) 1#32).trans
+          (readReg_zero_of_regs_eq (writeMemWord_regs s stored _ _ hmw))
+      · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case blez rs imm =>
+    rw [blez_spec_raw p s w rs imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case bgtz rs imm =>
+    rw [bgtz_spec_raw p s w rs imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case j target =>
+    rw [j_spec_raw p s w target hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case jr rs =>
+    rw [jr_spec_raw p s w rs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case jalr rs rd =>
+    rw [jalr_spec_raw p s w rs rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case jal target =>
+    rw [jal_spec_raw p s w target hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s 31 _
+  case bltz rs imm =>
+    rw [bltz_spec_raw p s w rs imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case bgez rs imm =>
+    rw [bgez_spec_raw p s w rs imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case bltzal rs imm =>
+    rw [bltzal_spec_raw p s w rs imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s 31 _)
+  case bgezal rs imm =>
+    rw [bgezal_spec_raw p s w rs imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s 31 _)
+  case «break» =>
+    rw [break_spec_raw p s w hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case teq rs rt =>
+    rw [teq_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case tne rs rt =>
+    rw [tne_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case tlt rs rt =>
+    rw [tlt_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case tge rs rt =>
+    rw [tge_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case tltu rs rt =>
+    rw [tltu_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case tgeu rs rt =>
+    rw [tgeu_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  all_goals sorry
+
+/-! STALL NOTE on `step_preserves_zero_register_nontrivial`'s remaining
+`all_goals sorry`: the goals left open by the `cases instr` dispatch above
+are exactly the instructions with no `_spec_raw` theorem yet to `rw` with
+(`clo clz mul seb seh wsbh ext ins` — SPECIAL2/SPECIAL3; `lwl lwr swl swr` —
+unaligned load/store; `teqi tnei tgei tgeiu tlti tltiu` — REGIMM
+trap-immediate; `syscall` — see the dedicated STALL NOTE below; `mfc0 mtc0
+eret wait` — CP0; and the entire COP1/FPU subset `mfc1 mtc1 lwc1 swc1 addS
+subS mulS divS movS cvtSW cvtWS cEqS cLtS cLeS sqrtS absS negS roundWS
+truncWS ceilWS floorWS cFS cUnS cUeqS cOltS cUltS cOleS cUleS cfc1 ctc1 bc1t
+bc1f`). Every one of these, by inspection of `Step.lean`, writes only
+`fpRegs`/`cp0Status`/`cp0Cause`/`cp0Epc`/`mem`/`pc`/`pendingBranch` —
+*never* the GPR file `regs` — so `readReg _ 0` is expected to be preserved
+for all of them too, by the same `regs`-untouched argument used for
+`mthi`/`mtlo`/`mult`/etc. above. Closing them the same way this file closed
+the other ~70 cases just requires writing a `_spec_raw` theorem for each
+first (restating `step`'s behavior on that instruction with public names,
+the house style throughout this file) — that is substantial net-new
+specification work belonging to Group 2, not a proof-engineering stall, so
+it is out of scope for this pass. Left `sorry` here rather than fabricate
+`_spec_raw` theorems for ~45 more instructions (many of them
+floating-point) in what is meant to be a global-invariant section. -/
