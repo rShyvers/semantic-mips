@@ -84,6 +84,16 @@ Field-shape summary (see each constructor's docstring for details):
   purely a software-visible hint with no architecturally-defined effect on
   the exception itself, so it is out of scope here — this is a deliberate
   simplification, not an oversight).
+- I-type trap-immediate (`rs imm`), REGIMM (opcode 0x01; `rt` field unused by
+  the ALU, since it instead selects which trap this is, same multiplexing
+  convention as `bltz`/`bgez`/`bltzal`/`bgezal` above): `teqi tnei tgei
+  tgeiu tlti tltiu` — real MIPS32 immediate-operand trap family (see
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.8), the sign-extended-16-bit-immediate
+  counterpart of the `teq tne tlt tge tltu tgeu` register-register family
+  above; same coprocessor-0 trap/exception model (`takeException` in
+  `Semantics/Step.lean`). `tgeiu`/`tltiu` follow the same "sign-extend the
+  16-bit immediate to 32 bits, then compare the result as unsigned"
+  convention already used by `sltiu`.
 - Coprocessor-1 (FPU) single-precision subset — opcode `0x11` (COP1); real
   MIPS32 encoding, ground truth is the MIPS32 ISA (not MARS), cited in each
   constructor's docstring and in `docs/spec/INSTRUCTION-REF.md`'s
@@ -377,6 +387,33 @@ inductive Instruction where
   `BGEZAL`). Same unconditional-link convention and `rs = $ra`
   UNPREDICTABLE-case resolution as `bltzal`. -/
   | bgezal (rs imm : W32)
+  -- I-type REGIMM trap-immediate family (real MIPS32 ISA; opcode 0x01,
+  -- same opcode as the zero-comparison branches above, selected by the
+  -- same `rt`-field multiplexing). Not part of the original v1 instruction
+  -- set, added on top as the sign-extended-16-bit-immediate counterpart of
+  -- the `teq tne tlt tge tltu tgeu` register-register trap family below
+  -- (see `docs/spec/MIPS-COVERAGE-GAPS.md` §3.8); funct/rt values are cited
+  -- from the real MIPS32 ISA (MD00086 Rev 2.50 §3.2, Table 3-2), not MARS.
+  /-- `if $rs == sext16(imm) then trap`, signed (opcode 0x01, `rt` field =
+  0x0c `TEQI`). -/
+  | teqi (rs imm : W32)
+  /-- `if $rs != sext16(imm) then trap`, signed (opcode 0x01, `rt` field =
+  0x0e `TNEI`). -/
+  | tnei (rs imm : W32)
+  /-- `if $rs >= sext16(imm) then trap`, signed (opcode 0x01, `rt` field =
+  0x08 `TGEI`). -/
+  | tgei (rs imm : W32)
+  /-- `if $rs >=u sext16(imm) then trap`: the immediate is sign-extended to
+  32 bits first, then the comparison is unsigned on the resulting bit
+  patterns — same "sign-extend, then compare unsigned" convention as
+  `sltiu` (opcode 0x01, `rt` field = 0x09 `TGEIU`). -/
+  | tgeiu (rs imm : W32)
+  /-- `if $rs < sext16(imm) then trap`, signed (opcode 0x01, `rt` field =
+  0x0a `TLTI`). -/
+  | tlti (rs imm : W32)
+  /-- `if $rs <u sext16(imm) then trap`: same sign-extend-then-unsigned-compare
+  convention as `tgeiu`/`sltiu` (opcode 0x01, `rt` field = 0x0b `TLTIU`). -/
+  | tltiu (rs imm : W32)
   -- J-type
   /-- `PC = (PC_next & 0xF0000000) | (target << 2)` (opcode 0x02). -/
   | j   (target : W32)
@@ -592,12 +629,19 @@ def decode (w : W32) : Option Instruction :=
   | 0x05 => some (.bne rs rt imm)
   | 0x06 => some (.blez rs imm)
   | 0x07 => some (.bgtz rs imm)
-  | 0x01 =>  -- REGIMM: rt field (not the opcode) selects bltz/bgez/bltzal/bgezal
+  | 0x01 =>  -- REGIMM: rt field (not the opcode) selects
+             -- bltz/bgez/bltzal/bgezal/tgei/tgeiu/tlti/tltiu/teqi/tnei
     match rt.toNat with
     | 0x00 => some (.bltz rs imm)
     | 0x01 => some (.bgez rs imm)
     | 0x10 => some (.bltzal rs imm)
     | 0x11 => some (.bgezal rs imm)
+    | 0x08 => some (.tgei rs imm)
+    | 0x09 => some (.tgeiu rs imm)
+    | 0x0a => some (.tlti rs imm)
+    | 0x0b => some (.tltiu rs imm)
+    | 0x0c => some (.teqi rs imm)
+    | 0x0e => some (.tnei rs imm)
     | _ => none
   | 0x02 => some (.j target)
   | 0x03 => some (.jal target)
@@ -715,6 +759,12 @@ def encode (i : Instruction) : W32 :=
   | .bgez   rs imm => mkIT 0x01#32 rs 0x01#32 imm
   | .bltzal rs imm => mkIT 0x01#32 rs 0x10#32 imm
   | .bgezal rs imm => mkIT 0x01#32 rs 0x11#32 imm
+  | .teqi   rs imm => mkIT 0x01#32 rs 0x0c#32 imm
+  | .tnei   rs imm => mkIT 0x01#32 rs 0x0e#32 imm
+  | .tgei   rs imm => mkIT 0x01#32 rs 0x08#32 imm
+  | .tgeiu  rs imm => mkIT 0x01#32 rs 0x09#32 imm
+  | .tlti   rs imm => mkIT 0x01#32 rs 0x0a#32 imm
+  | .tltiu  rs imm => mkIT 0x01#32 rs 0x0b#32 imm
   | .j   target => (0x02#32 <<< 26) ||| mkJT target
   | .jal target => (0x03#32 <<< 26) ||| mkJT target
   | .syscall => mkRT 0#32 0#32 0#32 0#32 0x0c#32
@@ -878,10 +928,19 @@ example : decode (mkIT 0x01#32 29#32 0x00#32 0x1234#32) = some (.bltz 29#32 0x12
 example : decode (mkIT 0x01#32 29#32 0x01#32 0x1234#32) = some (.bgez 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x01#32 29#32 0x10#32 0x1234#32) = some (.bltzal 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x01#32 29#32 0x11#32 0x1234#32) = some (.bgezal 29#32 0x1234#32) := by decide
--- a REGIMM word with an unrecognized rt field (not 0x00/0x01/0x10/0x11,
--- e.g. the real MIPS32 `tgei`/`tlti`/etc. trap-immediate family, out of
--- v1+ scope) decodes to none
-#guard decode (mkIT 0x01#32 29#32 0x08#32 0x1234#32) = none
+-- REGIMM trap-immediate family: same opcode 0x01, `rt` field selects
+-- teqi/tnei/tgei/tgeiu/tlti/tltiu (real MIPS32 ISA, MD00086 Rev 2.50 §3.2,
+-- Table 3-2 -- see docs/spec/MIPS-COVERAGE-GAPS.md §3.8).
+example : decode (mkIT 0x01#32 29#32 0x0c#32 0x1234#32) = some (.teqi 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x0e#32 0x1234#32) = some (.tnei 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x08#32 0x1234#32) = some (.tgei 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x09#32 0x1234#32) = some (.tgeiu 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x0a#32 0x1234#32) = some (.tlti 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x0b#32 0x1234#32) = some (.tltiu 29#32 0x1234#32) := by decide
+-- a REGIMM word with an unrecognized rt field (0x1d is reserved in the
+-- real MIPS32 REGIMM table -- not one of bltz/bgez/bltzal/bgezal/the trap
+-- family above) decodes to none
+#guard decode (mkIT 0x01#32 29#32 0x1d#32 0x1234#32) = none
 
 -- J-type: target = 0x3ffffff (all 26 bits)
 example : decode ((0x02#32 <<< 26) ||| mkJT 0x3ffffff#32) = some (.j 0x3ffffff#32) := by decide
@@ -1016,6 +1075,20 @@ example : decode (encode (.bltz 29#32 0x1234#32)) = some (.bltz 29#32 0x1234#32)
 example : decode (encode (.bgez 29#32 0x1234#32)) = some (.bgez 29#32 0x1234#32) := by decide
 example : decode (encode (.bltzal 29#32 0x1234#32)) = some (.bltzal 29#32 0x1234#32) := by decide
 example : decode (encode (.bgezal 29#32 0x1234#32)) = some (.bgezal 29#32 0x1234#32) := by decide
+-- REGIMM trap-immediate family: encode matches the hand-computed opcode,
+-- and full decode(encode i) = some i round-trips.
+example : encode (.teqi 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x0c#32 0x1234#32 := by decide
+example : encode (.tnei 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x0e#32 0x1234#32 := by decide
+example : encode (.tgei 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x08#32 0x1234#32 := by decide
+example : encode (.tgeiu 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x09#32 0x1234#32 := by decide
+example : encode (.tlti 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x0a#32 0x1234#32 := by decide
+example : encode (.tltiu 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x0b#32 0x1234#32 := by decide
+example : decode (encode (.teqi 29#32 0x1234#32)) = some (.teqi 29#32 0x1234#32) := by decide
+example : decode (encode (.tnei 29#32 0x1234#32)) = some (.tnei 29#32 0x1234#32) := by decide
+example : decode (encode (.tgei 29#32 0x1234#32)) = some (.tgei 29#32 0x1234#32) := by decide
+example : decode (encode (.tgeiu 29#32 0x1234#32)) = some (.tgeiu 29#32 0x1234#32) := by decide
+example : decode (encode (.tlti 29#32 0x1234#32)) = some (.tlti 29#32 0x1234#32) := by decide
+example : decode (encode (.tltiu 29#32 0x1234#32)) = some (.tltiu 29#32 0x1234#32) := by decide
 -- ll/sc: encode matches the hand-computed opcode, and decode (encode i) = some i
 example : encode (.ll 29#32 8#32 0x1234#32) = mkIT 0x30#32 29#32 8#32 0x1234#32 := by decide
 example : encode (.sc 29#32 8#32 0x1234#32) = mkIT 0x38#32 29#32 8#32 0x1234#32 := by decide
