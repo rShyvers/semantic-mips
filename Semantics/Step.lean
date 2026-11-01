@@ -83,15 +83,17 @@ it). -/
 private def mkNext (orig result : State) : StepResult :=
   StepResult.next (advance orig result)
 
-/-- Whether `instr` is one of the eight branch/jump instructions that
-schedule a delay-slot transfer (`beq`,`bne`,`blez`,`bgtz`,`j`,`jal`,`jr`,
-`jalr`). Used to detect a branch/jump occurring itself inside another's
-delay slot (real MIPS32 leaves this architecturally discouraged/
-implementation-defined), so `execInstr` can halt with
-`HaltReason.branchInDelaySlot` instead of guessing. -/
+/-- Whether `instr` is one of the twelve branch/jump instructions that
+schedule a delay-slot transfer (`beq`,`bne`,`blez`,`bgtz`,`bltz`,`bgez`,
+`bltzal`,`bgezal`,`j`,`jal`,`jr`,`jalr`). Used to detect a branch/jump
+occurring itself inside another's delay slot (real MIPS32 leaves this
+architecturally discouraged/implementation-defined), so `execInstr` can
+halt with `HaltReason.branchInDelaySlot` instead of guessing. -/
 private def isBranchLike (instr : Instruction) : Bool :=
   match instr with
-  | .beq _ _ _ | .bne _ _ _ | .blez _ _ | .bgtz _ _ | .j _ | .jal _ | .jr _ | .jalr _ _ => true
+  | .beq _ _ _ | .bne _ _ _ | .blez _ _ | .bgtz _ _
+  | .bltz _ _ | .bgez _ _ | .bltzal _ _ | .bgezal _ _
+  | .j _ | .jal _ | .jr _ | .jalr _ _ => true
   | _ => false
 
 /-- Signed-overflow predicate for `add`/`addi`, following INSTRUCTION-REF's
@@ -438,6 +440,39 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
       StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
     else
       mkNext s s
+  -- REGIMM zero-comparison branches (opcode 0x01; MD00086 Rev 2.50 \u00a73.2,
+  -- Table 3-2). `bltz`/`bgez` are plain conditional branches, same shape as
+  -- `blez`/`bgtz` above. `bltzal`/`bgezal` additionally link `$ra` to
+  -- `pcNext + 4` (`pc + 8`, past the delay slot, same convention as `jal`)
+  -- -- real MIPS32 performs this link **unconditionally**, on every
+  -- execution of the instruction, regardless of whether the branch itself
+  -- is taken; only the branch transfer is conditional.
+  | .bltz rs imm =>
+    let pcNext := s.pc + 4#32
+    if asSigned (readReg s (regIdx rs)) < 0 then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      mkNext s s
+  | .bgez rs imm =>
+    let pcNext := s.pc + 4#32
+    if 0 ≤ asSigned (readReg s (regIdx rs)) then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      mkNext s s
+  | .bltzal rs imm =>
+    let pcNext := s.pc + 4#32
+    let s' := writeReg s 31 (pcNext + 4#32)
+    if asSigned (readReg s (regIdx rs)) < 0 then
+      StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      mkNext s s'
+  | .bgezal rs imm =>
+    let pcNext := s.pc + 4#32
+    let s' := writeReg s 31 (pcNext + 4#32)
+    if 0 ≤ asSigned (readReg s (regIdx rs)) then
+      StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      mkNext s s'
   | .j target =>
     let pcNext := s.pc + 4#32
     StepResult.next
@@ -988,6 +1023,47 @@ private def memTestState : State :=
 #guard nextPcEq (step (prog1 (.bgtz 8#32 2#32)) (setRegs regs0 [(8, 0#32)]))  -- 0 > 0 is false
   (textBase + 4#32)
 
+-- ### bltz/bgez/bltzal/bgezal (REGIMM, opcode 0x01): same `pendingBranch`
+-- delay-slot scheduling as blez/bgtz, taken/not-taken for each; the `al`
+-- variants additionally link `$ra` unconditionally.
+
+-- bltz: taken on a negative $rs, not taken on zero/positive
+#guard stepThroughDelaySlot textBase (.bltz 8#32 2#32) (setRegs regs0 [(8, 0xfffffffb#32)])  -- -5 < 0
+  = some (textBase + 4#32 + 8#32)
+#guard nextPcEq (step (prog1 (.bltz 8#32 2#32)) (setRegs regs0 [(8, 0#32)]))  -- 0 < 0 is false
+  (textBase + 4#32)
+#guard nextPcEq (step (prog1 (.bltz 8#32 2#32)) (setRegs regs0 [(8, 5#32)]))  -- 5 < 0 is false
+  (textBase + 4#32)
+
+-- bgez: taken on zero/positive $rs, not taken on negative
+#guard stepThroughDelaySlot textBase (.bgez 8#32 2#32) (setRegs regs0 [(8, 0#32)])  -- 0 >= 0
+  = some (textBase + 4#32 + 8#32)
+#guard stepThroughDelaySlot textBase (.bgez 8#32 2#32) (setRegs regs0 [(8, 5#32)])  -- 5 >= 0
+  = some (textBase + 4#32 + 8#32)
+#guard nextPcEq (step (prog1 (.bgez 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)]))  -- -5 >= 0 is false
+  (textBase + 4#32)
+
+-- bltzal: link into $ra is unconditional (pc + 8, past the delay slot),
+-- whether or not the branch itself is taken.
+#guard nextRegEq (step (prog1 (.bltzal 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)])) 31
+  (textBase + 8#32)  -- taken: -5 < 0
+#guard nextRegEq (step (prog1 (.bltzal 8#32 2#32)) (setRegs regs0 [(8, 5#32)])) 31
+  (textBase + 8#32)  -- not taken: 5 < 0 is false, $ra still linked
+#guard stepThroughDelaySlot textBase (.bltzal 8#32 2#32) (setRegs regs0 [(8, 0xfffffffb#32)])
+  = some (textBase + 4#32 + 8#32)
+#guard nextPcEq (step (prog1 (.bltzal 8#32 2#32)) (setRegs regs0 [(8, 5#32)]))
+  (textBase + 4#32)
+
+-- bgezal: same unconditional-link convention as bltzal, >= 0 condition.
+#guard nextRegEq (step (prog1 (.bgezal 8#32 2#32)) (setRegs regs0 [(8, 5#32)])) 31
+  (textBase + 8#32)  -- taken: 5 >= 0
+#guard nextRegEq (step (prog1 (.bgezal 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)])) 31
+  (textBase + 8#32)  -- not taken: -5 >= 0 is false, $ra still linked
+#guard stepThroughDelaySlot textBase (.bgezal 8#32 2#32) (setRegs regs0 [(8, 5#32)])
+  = some (textBase + 4#32 + 8#32)
+#guard nextPcEq (step (prog1 (.bgezal 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)]))
+  (textBase + 4#32)
+
 -- ### j/jal: exact targets including top-4-bit preservation from `pc_next`;
 -- jal $ra links to `pc + 8` (past the delay slot), not `pc + 4`
 
@@ -1070,6 +1146,14 @@ private def crossRegionState : State := { regs0 with pc := 0x90400000#32 }
           (setRegs regs0 [(8, 5#32), (9, 5#32)]) with
         | some s1 =>
           isHaltBranchInDelaySlot (step (buildProg textBase [.beq 8#32 9#32 1#32, .j 0x1000#32]) s1)
+        | none => false)
+-- `bltz` right after a taken `beq` halts the same way (confirms the REGIMM
+-- branches are included in `isBranchLike`).
+#guard (match stepState (buildProg textBase [.beq 8#32 9#32 1#32, .bltz 8#32 0#32])
+          (setRegs regs0 [(8, 5#32), (9, 5#32)]) with
+        | some s1 =>
+          isHaltBranchInDelaySlot
+            (step (buildProg textBase [.beq 8#32 9#32 1#32, .bltz 8#32 0#32]) s1)
         | none => false)
 
 -- ### syscalls

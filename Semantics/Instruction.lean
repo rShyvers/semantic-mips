@@ -251,6 +251,33 @@ inductive Instruction where
   | blez (rs imm : W32)
   /-- `if $rs > 0 then PC = PC_next + (sext16(imm) << 2)` (opcode 0x07). -/
   | bgtz (rs imm : W32)
+  -- I-type REGIMM zero-comparison branches (MIPS32 ISA; opcode 0x01). All
+  -- four share this one opcode; the `rt` field (not a separate opcode)
+  -- selects which instruction it is (ground truth: MD00086 Rev 2.50 §3.2,
+  -- Table 3-2, p. 25; see docs/spec/INSTRUCTION-REF.md for the full
+  -- citation). Same `rs, offset` field shape as `blez`/`bgtz`.
+  /-- `if $rs < 0 then PC = PC_next + (sext16(imm) << 2)`, signed
+  (opcode 0x01, `rt` field = 0x00 `BLTZ`). -/
+  | bltz (rs imm : W32)
+  /-- `if $rs >= 0 then PC = PC_next + (sext16(imm) << 2)`, signed
+  (opcode 0x01, `rt` field = 0x01 `BGEZ`). -/
+  | bgez (rs imm : W32)
+  /-- `$ra = PC_next + 4` unconditionally, **then** `if $rs < 0 then
+  PC = PC_next + (sext16(imm) << 2)`, signed (opcode 0x01, `rt` field = 0x10
+  `BLTZAL`). Real MIPS32: the link into `$ra` always happens (it is not
+  conditional on the branch being taken), same convention as `jal`'s link —
+  see docs/spec/INSTRUCTION-REF.md for the citation. The real ISA
+  pseudocode links `$ra` one cycle before testing `$rs`, so `rs = $ra` (31)
+  is architecturally UNPREDICTABLE (the test could observe either the old
+  or the freshly-linked value); `Step.lean` resolves this by testing the
+  pre-link value of `$rs`, a documented, defensible choice for an
+  explicitly-unspecified case rather than an oversight. -/
+  | bltzal (rs imm : W32)
+  /-- `$ra = PC_next + 4` unconditionally, **then** `if $rs >= 0 then
+  PC = PC_next + (sext16(imm) << 2)`, signed (opcode 0x01, `rt` field = 0x11
+  `BGEZAL`). Same unconditional-link convention and `rs = $ra`
+  UNPREDICTABLE-case resolution as `bltzal`. -/
+  | bgezal (rs imm : W32)
   -- J-type
   /-- `PC = (PC_next & 0xF0000000) | (target << 2)` (opcode 0x02). -/
   | j   (target : W32)
@@ -446,6 +473,13 @@ def decode (w : W32) : Option Instruction :=
   | 0x05 => some (.bne rs rt imm)
   | 0x06 => some (.blez rs imm)
   | 0x07 => some (.bgtz rs imm)
+  | 0x01 =>  -- REGIMM: rt field (not the opcode) selects bltz/bgez/bltzal/bgezal
+    match rt.toNat with
+    | 0x00 => some (.bltz rs imm)
+    | 0x01 => some (.bgez rs imm)
+    | 0x10 => some (.bltzal rs imm)
+    | 0x11 => some (.bgezal rs imm)
+    | _ => none
   | 0x02 => some (.j target)
   | 0x03 => some (.jal target)
   | 0x31 => some (.lwc1 rs rt imm)
@@ -540,6 +574,10 @@ def encode (i : Instruction) : W32 :=
   | .bne rs rt imm => mkIT 0x05#32 rs rt imm
   | .blez rs imm => mkIT 0x06#32 rs 0#32 imm
   | .bgtz rs imm => mkIT 0x07#32 rs 0#32 imm
+  | .bltz   rs imm => mkIT 0x01#32 rs 0x00#32 imm
+  | .bgez   rs imm => mkIT 0x01#32 rs 0x01#32 imm
+  | .bltzal rs imm => mkIT 0x01#32 rs 0x10#32 imm
+  | .bgezal rs imm => mkIT 0x01#32 rs 0x11#32 imm
   | .j   target => (0x02#32 <<< 26) ||| mkJT target
   | .jal target => (0x03#32 <<< 26) ||| mkJT target
   | .syscall => mkRT 0#32 0#32 0#32 0#32 0x0c#32
@@ -667,6 +705,17 @@ example : decode (mkIT 0x05#32 29#32 8#32 0x1234#32) = some (.bne 29#32 8#32 0x1
 example : decode (mkIT 0x06#32 29#32 0#32 0x1234#32) = some (.blez 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x07#32 29#32 0#32 0x1234#32) = some (.bgtz 29#32 0x1234#32) := by decide
 
+-- REGIMM zero-comparison branches: opcode 0x01, rs=29, imm=0x1234, rt field
+-- selects bltz/bgez/bltzal/bgezal
+example : decode (mkIT 0x01#32 29#32 0x00#32 0x1234#32) = some (.bltz 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x01#32 0x1234#32) = some (.bgez 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x10#32 0x1234#32) = some (.bltzal 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x11#32 0x1234#32) = some (.bgezal 29#32 0x1234#32) := by decide
+-- a REGIMM word with an unrecognized rt field (not 0x00/0x01/0x10/0x11,
+-- e.g. the real MIPS32 `tgei`/`tlti`/etc. trap-immediate family, out of
+-- v1+ scope) decodes to none
+#guard decode (mkIT 0x01#32 29#32 0x08#32 0x1234#32) = none
+
 -- J-type: target = 0x3ffffff (all 26 bits)
 example : decode ((0x02#32 <<< 26) ||| mkJT 0x3ffffff#32) = some (.j 0x3ffffff#32) := by decide
 example : decode ((0x03#32 <<< 26) ||| mkJT 0x3ffffff#32) = some (.jal 0x3ffffff#32) := by decide
@@ -768,8 +817,14 @@ example : decode (encode (.cLeS 7#32 6#32)) = some (.cLeS 7#32 6#32) := by decid
 example : decode (encode (.bc1t 0x1234#32)) = some (.bc1t 0x1234#32) := by decide
 example : decode (encode (.bc1f 0x1234#32)) = some (.bc1f 0x1234#32) := by decide
 
+-- REGIMM zero-comparison branches: full decode(encode i) = some i round-trips
+example : decode (encode (.bltz 29#32 0x1234#32)) = some (.bltz 29#32 0x1234#32) := by decide
+example : decode (encode (.bgez 29#32 0x1234#32)) = some (.bgez 29#32 0x1234#32) := by decide
+example : decode (encode (.bltzal 29#32 0x1234#32)) = some (.bltzal 29#32 0x1234#32) := by decide
+example : decode (encode (.bgezal 29#32 0x1234#32)) = some (.bgezal 29#32 0x1234#32) := by decide
+
 -- unknown opcodes → none
-#guard decode (mkIT 0x01#32 0#32 0#32 0#32) = none  -- REGIMM, unimplemented
+#guard decode (mkIT 0x3a#32 0#32 0#32 0#32) = none  -- opcode 0x3a, unassigned/not in v1+ scope
 -- opcode 0x11 (COP1) is implemented for the fmt/funct combinations below;
 -- an unrecognized fmt (not MF/MT/BC1/S/W) still decodes to `none`.
 #guard decode (mkIT 0x11#32 0x1f#32 0#32 0#32) = none
