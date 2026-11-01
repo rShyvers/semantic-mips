@@ -130,6 +130,7 @@ def runOne (prog : Program) (a0 a1 : Int) (fuel : Nat) : RunOutcome :=
   | .halted (.illegalInstruction w) _ _ => .otherHalt s!"illegalInstruction {w}"
   | .halted (.addressError a) _ _ => .otherHalt s!"addressError {a}"
   | .halted .arithmeticOverflow _ _ => .otherHalt "arithmeticOverflow"
+  | .halted .branchInDelaySlot _ _ => .otherHalt "branchInDelaySlot"
   | .limitReached _ _ => .limitReached
 
 instance : ToString RunOutcome where

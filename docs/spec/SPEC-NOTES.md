@@ -192,3 +192,25 @@ the decision for our semantics:
    the same-width access), and sequential `.byte`/`.asciiz` data accessed
    byte-by-byte — which produce identical observable results under either
    byte order.
+5. **`jal`'s `$ra` value: diverges from MARS whenever the delay slot is
+   non-empty, as a direct consequence of item 1 — language wins.** Per item
+   1, real MIPS32 sets `jal`'s `$ra` to `pc + 8` (the address *after* the
+   delay slot), since the delay-slot instruction always executes before
+   control returns to `$ra`. MARS's default `DelayedBranching=false` has no
+   delay slot at all, so it always sets `$ra = pc + 4` — the address of
+   whatever instruction textually follows `jal`, regardless of whether that
+   instruction is ever executed. Before real delay slots were implemented,
+   `jal` was typically followed immediately by its logical continuation (no
+   gap), so `pc + 4 == pc + 8` and the two engines agreed by coincidence.
+   Once a real delay-slot instruction (even a pure no-op, inserted solely to
+   give `jal` a harmless instruction to execute as required by item 1) sits
+   between `jal` and its continuation, `pc + 4` and `pc + 8` are two
+   different addresses, and the two engines' `$ra` values necessarily
+   disagree — this is not fixable by any choice of delay-slot filler
+   instruction, since it follows purely from the fixed 4-byte gap between
+   the two conventions. Affects `tests/corpus/jump_jal.asm`: its former
+   `andi $a0, $ra, 0xff` / syscall probe of `$ra`'s raw low byte was removed
+   for this reason (that file's own header already notes `jr` is out of v1
+   scope, so the program never actually uses `$ra` to return — it hardcodes
+   `j AfterCall` instead — so the probe was a demonstration that `$ra` held
+   *something*, not a load-bearing control-flow check).
