@@ -32,12 +32,29 @@ Field-shape summary (see each constructor's docstring for details):
 - No fields: `syscall` — the syscall *number* lives in `$v0` at execution
   time (MARS convention), so the instruction word carries no operand data
   beyond `opcode=0`/`funct=0x0c`.
+- R-type trap-on-condition (`rs rt`, same shape as `mult`/`div`; `rd`/`shamt`
+  unused): `teq tne tlt tge tltu tgeu` — real MIPS32 SPECIAL-opcode trap
+  family, not part of the original v1 instruction set but added as a
+  minimal coprocessor-0 trap/exception model (see `docs/spec/INSTRUCTION-REF.md`
+  and `Semantics/Step.lean` for the exception-taken semantics). Ground
+  truth is the real MIPS32 ISA (not MARS, which models exceptions only very
+  loosely) — funct values are cited per-constructor below.
+- No fields: `break` — same shape as `syscall` (opcode 0, funct 0x0d, the
+  very next funct value after `syscall`'s 0x0c), always raises an exception
+  unconditionally; no operand data of any kind (real MIPS32 `break` does
+  have an optional 20-bit "code" field packed into bits 25..6, but it is
+  purely a software-visible hint with no architecturally-defined effect on
+  the exception itself, so it is out of scope here — this is a deliberate
+  simplification, not an oversight).
 -/
 
-/-- The full v1 machine-instruction set (24 real instructions plus `syscall`).
-Each constructor's fields are the **raw** bit-field values extracted from the
-32-bit encoding — see the module docstring for which fields each variant
-carries and INSTRUCTION-REF for the exact bit layout and semantics. -/
+/-- The full v1 machine-instruction set (24 original real instructions plus
+`syscall`, plus the 7 coprocessor-0 trap/exception instructions added on top
+— `teq tne tlt tge tltu tgeu break` — for 31 real instructions plus
+`syscall` in total). Each constructor's fields are the **raw** bit-field
+values extracted from the 32-bit encoding — see the module docstring for
+which fields each variant carries and INSTRUCTION-REF for the exact bit
+layout and semantics. -/
 inductive Instruction where
   -- R-type reg/reg/reg
   /-- `$rd = $rs + $rt`, signed; traps on overflow (opcode 0, funct 0x20). -/
@@ -132,6 +149,27 @@ inductive Instruction where
   -- syscall (no fields; the syscall number lives in $v0 at execution time)
   /-- Dispatch on `$v0` (opcode 0, funct 0x0c); MARS syscalls 1/4/10/11 in v1 scope. -/
   | syscall
+  -- R-type trap-on-condition (rd, shamt unused) — real MIPS32 SPECIAL-opcode
+  -- trap family. Not modeled realistically by MARS (see
+  -- docs/spec/INSTRUCTION-REF.md); funct values below are the standard
+  -- MIPS32 ISA encoding, cited from the real architecture, not MARS.
+  /-- `if $rs == $rt then trap` (opcode 0, funct 0x34). -/
+  | teq (rs rt : W32)
+  /-- `if $rs != $rt then trap` (opcode 0, funct 0x36). -/
+  | tne (rs rt : W32)
+  /-- `if $rs < $rt then trap`, signed (opcode 0, funct 0x32). -/
+  | tlt (rs rt : W32)
+  /-- `if $rs >= $rt then trap`, signed (opcode 0, funct 0x30). -/
+  | tge (rs rt : W32)
+  /-- `if $rs <u $rt then trap`, unsigned (opcode 0, funct 0x33). -/
+  | tltu (rs rt : W32)
+  /-- `if $rs >=u $rt then trap`, unsigned (opcode 0, funct 0x31). -/
+  | tgeu (rs rt : W32)
+  -- break (no fields; see module docstring — the real "code" field is
+  -- out of scope)
+  /-- Unconditional trap (opcode 0, funct 0x0d — the funct value immediately
+  after `syscall`'s 0x0c). -/
+  | break
   deriving Repr, DecidableEq
 
 /-- Extract the 6-bit opcode field (bits 31..26), zero-extended to a `W32`. -/
@@ -192,6 +230,13 @@ def decode (w : W32) : Option Instruction :=
     | 0x12 => some (.mflo rd)
     | 0x10 => some (.mfhi rd)
     | 0x0c => some .syscall
+    | 0x0d => some .break
+    | 0x34 => some (.teq rs rt)
+    | 0x36 => some (.tne rs rt)
+    | 0x32 => some (.tlt rs rt)
+    | 0x30 => some (.tge rs rt)
+    | 0x33 => some (.tltu rs rt)
+    | 0x31 => some (.tgeu rs rt)
     | _ => none
   | 0x08 => some (.addi rs rt imm)
   | 0x09 => some (.addiu rs rt imm)
@@ -261,6 +306,13 @@ def encode (i : Instruction) : W32 :=
   | .j   target => (0x02#32 <<< 26) ||| mkJT target
   | .jal target => (0x03#32 <<< 26) ||| mkJT target
   | .syscall => mkRT 0#32 0#32 0#32 0#32 0x0c#32
+  | .teq  rs rt => mkRT rs rt 0#32 0#32 0x34#32
+  | .tne  rs rt => mkRT rs rt 0#32 0#32 0x36#32
+  | .tlt  rs rt => mkRT rs rt 0#32 0#32 0x32#32
+  | .tge  rs rt => mkRT rs rt 0#32 0#32 0x30#32
+  | .tltu rs rt => mkRT rs rt 0#32 0#32 0x33#32
+  | .tgeu rs rt => mkRT rs rt 0#32 0#32 0x31#32
+  | .break => mkRT 0#32 0#32 0#32 0#32 0x0d#32
 
 -- ## Tests
 
@@ -296,6 +348,17 @@ example : decode (mkRT 0#32 0#32 3#32 0#32 0x10#32) = some (.mfhi 3#32) := by de
 
 -- syscall: opcode 0, funct 0x0c, all other fields 0
 example : decode (mkRT 0#32 0#32 0#32 0#32 0x0c#32) = some .syscall := by decide
+
+-- break: opcode 0, funct 0x0d, all other fields 0
+example : decode (mkRT 0#32 0#32 0#32 0#32 0x0d#32) = some .break := by decide
+
+-- R-type trap-on-condition: rs=29, rt=8 (same shape as mult/div)
+example : decode (mkRT 29#32 8#32 0#32 0#32 0x34#32) = some (.teq 29#32 8#32) := by decide
+example : decode (mkRT 29#32 8#32 0#32 0#32 0x36#32) = some (.tne 29#32 8#32) := by decide
+example : decode (mkRT 29#32 8#32 0#32 0#32 0x32#32) = some (.tlt 29#32 8#32) := by decide
+example : decode (mkRT 29#32 8#32 0#32 0#32 0x30#32) = some (.tge 29#32 8#32) := by decide
+example : decode (mkRT 29#32 8#32 0#32 0#32 0x33#32) = some (.tltu 29#32 8#32) := by decide
+example : decode (mkRT 29#32 8#32 0#32 0#32 0x31#32) = some (.tgeu 29#32 8#32) := by decide
 
 -- I-type arith/logic: rs=29, rt=8, imm=0x1234
 example : decode (mkIT 0x08#32 29#32 8#32 0x1234#32) = some (.addi 29#32 8#32 0x1234#32) := by decide
@@ -337,6 +400,17 @@ example : encode (.beq 29#32 8#32 0x1234#32) = mkIT 0x04#32 29#32 8#32 0x1234#32
 example : encode (.j 0x3ffffff#32) = (0x02#32 <<< 26) ||| mkJT 0x3ffffff#32 := by decide
 example : encode .syscall = mkRT 0#32 0#32 0#32 0#32 0x0c#32 := by decide
 example : encode (.sll 3#32 8#32 5#32) = mkRT 0#32 8#32 3#32 5#32 0x00#32 := by decide
+example : encode .break = mkRT 0#32 0#32 0#32 0#32 0x0d#32 := by decide
+example : encode (.teq 29#32 8#32) = mkRT 29#32 8#32 0#32 0#32 0x34#32 := by decide
+
+-- `decode (encode ...)` round-trips for every new trap/break instruction
+example : decode (encode (.teq 29#32 8#32)) = some (.teq 29#32 8#32) := by decide
+example : decode (encode (.tne 29#32 8#32)) = some (.tne 29#32 8#32) := by decide
+example : decode (encode (.tlt 29#32 8#32)) = some (.tlt 29#32 8#32) := by decide
+example : decode (encode (.tge 29#32 8#32)) = some (.tge 29#32 8#32) := by decide
+example : decode (encode (.tltu 29#32 8#32)) = some (.tltu 29#32 8#32) := by decide
+example : decode (encode (.tgeu 29#32 8#32)) = some (.tgeu 29#32 8#32) := by decide
+example : decode (encode .break) = some .break := by decide
 
 -- unknown opcodes → none
 #guard decode (mkIT 0x01#32 0#32 0#32 0#32) = none  -- coprocessor-1, unimplemented
@@ -355,3 +429,9 @@ example : encode (.sll 3#32 8#32 5#32) = mkRT 0#32 8#32 3#32 5#32 0x00#32 := by 
 #guard decode (mkIT 0x23#32 29#32 8#32 0x1234#32) = some (.lw 29#32 8#32 0x1234#32)
 #guard decode ((0x02#32 <<< 26) ||| mkJT 0x3ffffff#32) = some (.j 0x3ffffff#32)
 #guard decode (mkRT 0#32 0#32 0#32 0#32 0x0c#32) = some .syscall
+#guard decode (mkRT 29#32 8#32 0#32 0#32 0x34#32) = some (.teq 29#32 8#32)
+#guard decode (mkRT 0#32 0#32 0#32 0#32 0x0d#32) = some .break
+
+-- funct 0x35 sits between teq (0x34) and tne (0x36) and is reserved/unused
+-- in the real MIPS32 trap family; no mnemonic maps to it.
+#guard decode (mkRT 0#32 0#32 0#32 0#32 0x35#32) = none
