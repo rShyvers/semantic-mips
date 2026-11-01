@@ -1081,3 +1081,125 @@ Everything else checked (`add`/`addi`/`sub` overflow trapping, `addu`/
 `subu`/`mult`/`multu` never trapping, `andi`/`ori`/`xori` zero-extending,
 `sltiu` sign-extending its immediate, `$zero` write-ignore, big-endian
 memory) matches textbook/ISA-spec MIPS behavior and is marked "none" above.
+
+---
+
+## Floating point (coprocessor 1, single precision) — v1.x addition
+
+This section documents a v1.x addition: a minimal real-MIPS32 coprocessor-1
+(FPU) instruction subset, added on top of the v1 scope documented above.
+**Grounding note**: unlike every section above (grounded in the vendored
+MARS 4.5 source), this section's semantics are grounded directly in the
+**real MIPS32 architecture** — specifically the standard MIPS32 ISA's
+"COP1"/FPU encoding (opcode `0x11`, the `fmt`/`ft`/`fs`/`fd`/`funct` field
+layout, and the standard `funct` assignments for `ADD.fmt`/`SUB.fmt`/
+`MUL.fmt`/`DIV.fmt`/`MOV.fmt`/`CVT.S.fmt`/`CVT.W.fmt`/`C.cond.fmt`/`BC1`), not
+MARS-specific behavior, per this track's explicit brief. MARS is not
+consulted as ground truth for this section.
+
+### Scope
+
+- **Single precision only.** All 32 FP registers `$f0`..`$f31` are modeled as
+  independent 32-bit registers holding a raw IEEE-754 binary32 bit pattern
+  (`State.fpRegs`). **Double precision (`.d`) is out of scope for this pass**
+  — real MIPS32 pairs adjacent `$f` registers for 64-bit doubles, which this
+  v1.x addition does not model at all. This is flagged as a documented
+  follow-up, not a silent gap.
+- **One FP condition flag, not eight.** Real MIPS32 has 8 FP condition-code
+  registers (the 3-bit `cc` field in compare/branch encodings). This addition
+  models only `cc = 0`, as a single `State.fpCondFlag : Bool`. Any encoding
+  with a nonzero `cc` (or nonzero `nd`/"likely" bit on `BC1`) is treated as
+  undecodable (`decode` returns `none`), not silently misinterpreted.
+- **No FP traps/exceptions.** Divide-by-zero and invalid operations (e.g.
+  `0.0 / 0.0`) are never trapped; IEEE-754 ±Infinity/NaN propagate naturally
+  through register writes, matching this project's existing precedent for
+  integer `div`/`divu` by zero (see "Flagged MARS deviations" item 1 above).
+- **No delay slot for `bc1t`/`bc1f`.** Real MIPS32 hardware has an
+  architecturally-mandated branch delay slot for every branch, including
+  `bc1t`/`bc1f`. This v1.x addition does **not** model one: `bc1t`/`bc1f`
+  jump immediately, matching this codebase's existing no-delay-slot
+  convention for `beq`/`bne`/`blez`/`bgtz`/`j`/`jal` (see "Flagged MARS
+  deviations" item 2 above — that deviation was MARS's `DelayedBranching`
+  default, but the resulting *simulator* behavior is the same shape this
+  addition reuses for consistency). Flagged for integration: a parallel
+  track is adding real delay-slot semantics (`State.pendingBranch`) for the
+  existing branches; `bc1t`/`bc1f` were deliberately left out of that scheme
+  to avoid touching the shared `step` dispatch loop, and should be
+  reconciled with that track by the orchestrator if delay slots are adopted
+  project-wide.
+- **Only `CVT.S.W`/`CVT.W.S`** of the `CVT.*` family are implemented (the
+  other source/destination format combinations — `.L`, `.D` — are out of
+  scope, since they all involve either double precision or 64-bit integers).
+  `cvt.w.s` always truncates toward zero; real MIPS32 instead rounds
+  according to the current FCSR rounding mode (default: round-to-nearest,
+  ties-to-even), since there is no `FCSR` in this project's scope. This is a
+  deliberate, documented simplification, not an oversight.
+- **Only `ADD.S`/`SUB.S`/`MUL.S`/`DIV.S`/`MOV.S`** of the arithmetic-format
+  instructions are implemented; `SQRT.S`, `ABS.S`, `NEG.S`, and the
+  `ROUND`/`TRUNC`/`CEIL`/`FLOOR` family are out of scope for this pass.
+- **Only `C.EQ.S`/`C.LT.S`/`C.LE.S`** of the sixteen `C.cond.S` compares are
+  implemented (the three most common; the rest — `C.UN.S`, `C.OLE.S`, etc. —
+  are out of scope).
+
+### Register/state model
+
+- `State.fpRegs : Array W32`, size 32 — `$f0`..`$f31`, each a raw 32-bit
+  IEEE-754 binary32 bit pattern (same raw-bit-pattern storage convention as
+  the integer `regs` array; conversion to/from Lean's `Float32` happens only
+  at the point of doing arithmetic, in `Step.lean`, via `Float32.ofBits`/
+  `Float32.toBits`, Lean core's exact IEEE-754 bit-pattern round-trip).
+  Initialized to all-zero (`initialState`). Unlike the integer registers,
+  **no FP register is hardwired to zero** — `$f0` is an ordinary read/write
+  register in real MIPS32, and `writeFpReg` never ignores a write.
+- `State.fpCondFlag : Bool` — the single modeled FP condition flag (`cc = 0`
+  only; see Scope above). Initialized to `false`.
+
+### Encoding summary
+
+| Mnemonic | Encoding | One-line semantics |
+|---|---|---|
+| `mtc1 $rt, $fs` | opcode 0x11, fmt=`MT`=0x04 | `$fs = rawbits($rt)`, no conversion |
+| `mfc1 $rt, $fs` | opcode 0x11, fmt=`MF`=0x00 | `$rt = rawbits($fs)`, no conversion |
+| `lwc1 $ft, off($rs)` | opcode 0x31 | `$ft = MEM32[$rs + off]`, raw bits |
+| `swc1 $ft, off($rs)` | opcode 0x39 | `MEM32[$rs + off] = rawbits($ft)` |
+| `add.s $fd, $fs, $ft` | opcode 0x11, fmt=`S`=0x10, funct=0x00 | `$fd = $fs + $ft` (IEEE-754) |
+| `sub.s $fd, $fs, $ft` | fmt=S, funct=0x01 | `$fd = $fs - $ft` |
+| `mul.s $fd, $fs, $ft` | fmt=S, funct=0x02 | `$fd = $fs * $ft` |
+| `div.s $fd, $fs, $ft` | fmt=S, funct=0x03 | `$fd = $fs / $ft`; `$ft=0` → ±Inf/NaN, no trap |
+| `mov.s $fd, $fs` | fmt=S, funct=0x06 | `$fd = $fs`, raw copy |
+| `cvt.s.w $fd, $fs` | fmt=`W`=0x14, funct=0x20 | `$fd = float32(int32bits($fs))` |
+| `cvt.w.s $fd, $fs` | fmt=S, funct=0x24 | `$fd = int32bits(trunc($fs))` |
+| `c.eq.s $fs, $ft` | fmt=S, funct=0x32, cc=0 | `fpCondFlag := ($fs == $ft)` |
+| `c.lt.s $fs, $ft` | fmt=S, funct=0x3c, cc=0 | `fpCondFlag := ($fs < $ft)` |
+| `c.le.s $fs, $ft` | fmt=S, funct=0x3e, cc=0 | `fpCondFlag := ($fs <= $ft)` |
+| `bc1t target` | opcode 0x11, fmt=`BC1`=0x08, tf=1 | `if fpCondFlag: PC = PC_next + (offset<<2)` |
+| `bc1f target` | fmt=BC1, tf=0 | `if !fpCondFlag: PC = PC_next + (offset<<2)` |
+
+Field layout for the arithmetic/compare format (`add.s` etc.): opcode(31-26)
+= 0x11, `fmt`(25-21), `ft`(20-16), `fs`(15-11), `fd`(10-6), `funct`(5-0) — the
+same positions as a plain R-type word's `rs`/`rt`/`rd`/`shamt`/`funct`, which
+is why `Instruction.lean`'s `mkRT` helper is reused (with opcode 0x11 OR'd in
+explicitly, since `mkRT` itself always leaves the opcode field 0). `mtc1`/
+`mfc1` use the same R-type-shaped layout with `fmt` in the `rs` position and
+all of `fd`/`funct` (bits 10-0) fixed to 0. `lwc1`/`swc1` are ordinary I-type
+words (opcode/`rs`=base/`rt`-position=`ft`/16-bit offset), identical in shape
+to `lw`/`sw`. `bc1t`/`bc1f` are also I-type-shaped: opcode 0x11, `rs`-position
+field = `BC1` sub-opcode `0x08`, `rt`-position field holds `cc`(bits 4-2,
+forced 0)/`nd`(bit 1, forced 0)/`tf`(bit 0) — so the whole `rt`-position field
+is exactly `0` (`bc1f`) or `1` (`bc1t`) in this subset — and a 16-bit
+sign-extended branch offset, exactly like `beq`/`bne`.
+
+### Citation
+
+Standard MIPS32 instruction-set architecture (the public "MIPS32 Architecture
+For Programmers" reference manual family, Volume II-A, "The MIPS32
+Instruction Set" — the COP1/FPU chapter). All opcode/fmt/funct values above
+(COP1 = 0x11, `LWC1`/`SWC1` = 0x31/0x39, `fmt` codes `MF`=0, `MT`=4, `BC1`=8,
+`S`=0x10, `W`=0x14, and `funct` codes 0x00/0x01/0x02/0x03/0x06/0x20/0x24 and
+the `C.cond.fmt` family `0x30 | cond` with `cond(EQ)=2`, `cond(LT)=12`,
+`cond(LE)=14`) are the standard, invariant MIPS32 COP1 encodings, not
+MARS-specific or implementation-chosen values. No internet access was used to
+write this section; these are well-established, memorized ISA constants, and
+any single value a future reader doubts should be cross-checked against a
+primary MIPS32 ISA reference before relying on it for anything beyond this
+simulator.

@@ -56,6 +56,30 @@ Field-shape summary (see each constructor's docstring for details):
   purely a software-visible hint with no architecturally-defined effect on
   the exception itself, so it is out of scope here — this is a deliberate
   simplification, not an oversight).
+- Coprocessor-1 (FPU) single-precision subset — opcode `0x11` (COP1); real
+  MIPS32 encoding, ground truth is the MIPS32 ISA (not MARS), cited in each
+  constructor's docstring and in `docs/spec/INSTRUCTION-REF.md`'s
+  floating-point section:
+  - `mtc1`/`mfc1` (`rt fs`): raw GPR↔FPR bit-pattern move, no numeric
+    conversion.
+  - `lwc1`/`swc1` (`rs ft imm`): identical addressing to `lw`/`sw`, but the
+    loaded/stored register is FP register `ft`.
+  - `addS subS mulS divS` (`fd fs ft`): single-precision IEEE-754 arithmetic,
+    field order matching the `add.s $fd, $fs, $ft` assembly operand order.
+  - `movS` (`fd fs`): FP register raw-bit copy.
+  - `cvtSW`/`cvtWS` (`fd fs`): int-bit-pattern↔float numeric conversion.
+  - `cEqS cLtS cLeS` (`fs ft`): single-precision IEEE-754 comparison, sets
+    `State.fpCondFlag`; only FP condition-code register 0 is modeled (see
+    `Types.lean`'s `fpCondFlag` docstring).
+  - `bc1t`/`bc1f` (`imm`): branch on `fpCondFlag`. Simplification flagged for
+    integration: this v1.x addition does **not** model a branch delay slot
+    (jumps immediately), matching this codebase's existing no-delay-slot
+    convention for `beq`/`bne`/`j`/etc. (SPEC-NOTES §9.1), not real MIPS32
+    hardware.
+  Double-precision (`.d`) and the rest of the COP1 format (`sqrt.s`, `neg.s`,
+  `abs.s`, `cvt.d.*`, `cvt.*.d`, multi-cc compares, `bc1tl`/`bc1fl`) are out
+  of scope for this pass; see `docs/spec/INSTRUCTION-REF.md` for the
+  documented follow-up.
 -/
 
 /-- The full v1 machine-instruction set (24 original real instructions plus
@@ -206,6 +230,64 @@ inductive Instruction where
   /-- Unconditional trap (opcode 0, funct 0x0d — the funct value immediately
   after `syscall`'s 0x0c). -/
   | break
+  -- Coprocessor 1 (FPU), single-precision subset. Ground truth: the MIPS32
+  -- ISA (not MARS) "COP1" encodings; see docs/spec/INSTRUCTION-REF.md's
+  -- floating-point section for the full citation and scope notes.
+  /-- `$rt = rawbits($fs)`, no numeric conversion (opcode 0x11 COP1, `fmt`
+  field = `MF` = 0x00). -/
+  | mfc1 (rt fs : W32)
+  /-- `$fs = rawbits($rt)`, no numeric conversion (opcode 0x11 COP1, `fmt`
+  field = `MT` = 0x04). -/
+  | mtc1 (rt fs : W32)
+  /-- `$ft = MEM32[$rs + offset]`, word-aligned, raw bits (opcode 0x31). -/
+  | lwc1 (rs ft imm : W32)
+  /-- `MEM32[$rs + offset] = rawbits($ft)`, word-aligned (opcode 0x39). -/
+  | swc1 (rs ft imm : W32)
+  /-- `$fd = $fs + $ft`, single-precision IEEE-754 (opcode 0x11 COP1,
+  `fmt` = `S` = 0x10, `funct` = 0x00 `ADD.S`). -/
+  | addS (fd fs ft : W32)
+  /-- `$fd = $fs - $ft`, single-precision IEEE-754 (opcode 0x11 COP1,
+  `fmt` = `S`, `funct` = 0x01 `SUB.S`). -/
+  | subS (fd fs ft : W32)
+  /-- `$fd = $fs * $ft`, single-precision IEEE-754 (opcode 0x11 COP1,
+  `fmt` = `S`, `funct` = 0x02 `MUL.S`). -/
+  | mulS (fd fs ft : W32)
+  /-- `$fd = $fs / $ft`, single-precision IEEE-754 (opcode 0x11 COP1,
+  `fmt` = `S`, `funct` = 0x03 `DIV.S`); division by zero produces ±Infinity
+  or NaN per IEEE-754, no trap (SPEC-NOTES §9 item 2 precedent). -/
+  | divS (fd fs ft : W32)
+  /-- `$fd = $fs`, raw bit copy (opcode 0x11 COP1, `fmt` = `S`, `funct` = 0x06
+  `MOV.S`; `ft`-position field unused/fixed 0). -/
+  | movS (fd fs : W32)
+  /-- `$fd = float32(int32bits($fs))`, numeric conversion of `$fs`'s bit
+  pattern read as a 32-bit two's-complement int (opcode 0x11 COP1,
+  `fmt` = `W` = 0x14, `funct` = 0x20 `CVT.S.W`; `ft`-position field unused). -/
+  | cvtSW (fd fs : W32)
+  /-- `$fd = int32bits(truncate($fs))`, numeric conversion truncating toward
+  zero (opcode 0x11 COP1, `fmt` = `S`, `funct` = 0x24 `CVT.W.S`;
+  `ft`-position field unused). Real MIPS32 rounds per the current FCSR
+  rounding mode (default round-to-nearest-even); this v1.x addition always
+  truncates toward zero, a documented simplification pinned by this track's
+  brief (no `FCSR` in scope). -/
+  | cvtWS (fd fs : W32)
+  /-- `fpCondFlag := ($fs == $ft)`, IEEE-754 single-precision compare (opcode
+  0x11 COP1, `fmt` = `S`, `funct` = 0x32 `C.EQ.S`; FP condition-code field
+  fixed to `cc = 0`). -/
+  | cEqS (fs ft : W32)
+  /-- `fpCondFlag := ($fs < $ft)`, IEEE-754 single-precision compare (opcode
+  0x11 COP1, `fmt` = `S`, `funct` = 0x3c `C.LT.S`; `cc` fixed 0). -/
+  | cLtS (fs ft : W32)
+  /-- `fpCondFlag := ($fs <= $ft)`, IEEE-754 single-precision compare (opcode
+  0x11 COP1, `fmt` = `S`, `funct` = 0x3e `C.LE.S`; `cc` fixed 0). -/
+  | cLeS (fs ft : W32)
+  /-- `if fpCondFlag then PC = PC_next + (sext16(imm) << 2)` (opcode 0x11
+  COP1, `fmt` = `BC1` = 0x08, `tf` bit = 1). No delay slot modeled — see
+  the module docstring's COP1 bullet. -/
+  | bc1t (imm : W32)
+  /-- `if !fpCondFlag then PC = PC_next + (sext16(imm) << 2)` (opcode 0x11
+  COP1, `fmt` = `BC1` = 0x08, `tf` bit = 0). No delay slot modeled — see
+  the module docstring's COP1 bullet. -/
+  | bc1f (imm : W32)
   deriving Repr, DecidableEq
 
 /-- Extract the 6-bit opcode field (bits 31..26), zero-extended to a `W32`. -/
@@ -310,6 +392,40 @@ def decode (w : W32) : Option Instruction :=
   | 0x07 => some (.bgtz rs imm)
   | 0x02 => some (.j target)
   | 0x03 => some (.jal target)
+  | 0x31 => some (.lwc1 rs rt imm)
+  | 0x39 => some (.swc1 rs rt imm)
+  -- Coprocessor 1 (FPU): `rs`-position field is `fmt`/sub-opcode, `rt` is
+  -- `ft` (or the GPR for mtc1/mfc1), `rd` is `fs` (or `ft` for arithmetic
+  -- format, see each case), `shamt` is `fd` for arithmetic format.
+  | 0x11 =>
+    match rs.toNat with
+    | 0x00 => some (.mfc1 rt rd)  -- fmt = MF: rt = GPR, rd-position = fs
+    | 0x04 => some (.mtc1 rt rd)  -- fmt = MT
+    | 0x08 =>
+      -- BC1: `rt`-position field is `cc`(3)/`nd`(1)/`tf`(1); only cc=0,
+      -- nd=0 (i.e. the field's raw value is exactly 0 or 1) is modeled.
+      match rt.toNat with
+      | 1 => some (.bc1t imm)
+      | 0 => some (.bc1f imm)
+      | _ => none
+    | 0x10 =>  -- fmt = S: arithmetic/compare format, ft=rt, fs=rd, fd=shamt
+      match (functOf w).toNat with
+      | 0x00 => some (.addS shamt rd rt)
+      | 0x01 => some (.subS shamt rd rt)
+      | 0x02 => some (.mulS shamt rd rt)
+      | 0x03 => some (.divS shamt rd rt)
+      | 0x06 => some (.movS shamt rd)
+      | 0x24 => some (.cvtWS shamt rd)
+      -- `fd`-position field holds `cc`(3)/0/0 for compares; only cc=0 modeled.
+      | 0x32 => if shamt.toNat == 0 then some (.cEqS rd rt) else none
+      | 0x3c => if shamt.toNat == 0 then some (.cLtS rd rt) else none
+      | 0x3e => if shamt.toNat == 0 then some (.cLeS rd rt) else none
+      | _ => none
+    | 0x14 =>  -- fmt = W
+      match (functOf w).toNat with
+      | 0x20 => some (.cvtSW shamt rd)
+      | _ => none
+    | _ => none
   | _ => none
 
 /-- Encode an `Instruction` back into its raw 32-bit word. Inverse of `decode`
@@ -372,6 +488,25 @@ def encode (i : Instruction) : W32 :=
   | .tltu rs rt => mkRT rs rt 0#32 0#32 0x33#32
   | .tgeu rs rt => mkRT rs rt 0#32 0#32 0x31#32
   | .break => mkRT 0#32 0#32 0#32 0#32 0x0d#32
+  -- Coprocessor 1 (FPU). `mkRT` leaves the opcode field 0 (correct for
+  -- plain R-type), so the COP1 cases OR in opcode 0x11 explicitly, the same
+  -- way `.j`/`.jal` OR in their opcode over `mkJT`'s target-only field.
+  | .mfc1 rt fs => (0x11#32 <<< 26) ||| mkRT 0x00#32 rt fs 0#32 0#32
+  | .mtc1 rt fs => (0x11#32 <<< 26) ||| mkRT 0x04#32 rt fs 0#32 0#32
+  | .lwc1 rs ft imm => mkIT 0x31#32 rs ft imm
+  | .swc1 rs ft imm => mkIT 0x39#32 rs ft imm
+  | .addS fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs fd 0x00#32
+  | .subS fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs fd 0x01#32
+  | .mulS fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs fd 0x02#32
+  | .divS fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs fd 0x03#32
+  | .movS fd fs => (0x11#32 <<< 26) ||| mkRT 0x10#32 0#32 fs fd 0x06#32
+  | .cvtSW fd fs => (0x11#32 <<< 26) ||| mkRT 0x14#32 0#32 fs fd 0x20#32
+  | .cvtWS fd fs => (0x11#32 <<< 26) ||| mkRT 0x10#32 0#32 fs fd 0x24#32
+  | .cEqS fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs 0#32 0x32#32
+  | .cLtS fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs 0#32 0x3c#32
+  | .cLeS fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs 0#32 0x3e#32
+  | .bc1t imm => mkIT 0x11#32 0x08#32 1#32 imm
+  | .bc1f imm => mkIT 0x11#32 0x08#32 0#32 imm
 
 -- ## Tests
 
@@ -466,6 +601,44 @@ example : decode (mkIT 0x07#32 29#32 0#32 0x1234#32) = some (.bgtz 29#32 0x1234#
 example : decode ((0x02#32 <<< 26) ||| mkJT 0x3ffffff#32) = some (.j 0x3ffffff#32) := by decide
 example : decode ((0x03#32 <<< 26) ||| mkJT 0x3ffffff#32) = some (.jal 0x3ffffff#32) := by decide
 
+-- Coprocessor 1 (FPU): mtc1/mfc1 (fmt=MT/MF, rt=8, fs=3). Unlike plain
+-- R-type, COP1 words need opcode 0x11 OR'd in explicitly over `mkRT`'s
+-- (always-0) opcode field.
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x00#32 8#32 3#32 0#32 0#32) = some (.mfc1 8#32 3#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x04#32 8#32 3#32 0#32 0#32) = some (.mtc1 8#32 3#32) := by decide
+-- lwc1/swc1: rs=29 (base), ft=5, imm=0x1234 (identical layout to lw/sw)
+example : decode (mkIT 0x31#32 29#32 5#32 0x1234#32) = some (.lwc1 29#32 5#32 0x1234#32) := by
+  decide
+example : decode (mkIT 0x39#32 29#32 5#32 0x1234#32) = some (.swc1 29#32 5#32 0x1234#32) := by
+  decide
+-- add.s/sub.s/mul.s/div.s: fmt=S, ft=6, fs=7, fd=8
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 8#32 0x00#32) = some (.addS 8#32 7#32 6#32) := by
+  decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 8#32 0x01#32) = some (.subS 8#32 7#32 6#32) := by
+  decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 8#32 0x02#32) = some (.mulS 8#32 7#32 6#32) := by
+  decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 8#32 0x03#32) = some (.divS 8#32 7#32 6#32) := by
+  decide
+-- mov.s/cvt.w.s: fmt=S, fs=7, fd=8 (ft-position fixed 0)
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 0#32 7#32 8#32 0x06#32) = some (.movS 8#32 7#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 0#32 7#32 8#32 0x24#32) = some (.cvtWS 8#32 7#32) := by
+  decide
+-- cvt.s.w: fmt=W, fs=7, fd=8
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x14#32 0#32 7#32 8#32 0x20#32) = some (.cvtSW 8#32 7#32) := by
+  decide
+-- c.eq.s/c.lt.s/c.le.s: fmt=S, fs=7, ft=6, fd-position (cc) fixed 0
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 0#32 0x32#32) = some (.cEqS 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 0#32 0x3c#32) = some (.cLtS 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 0#32 0x3e#32) = some (.cLeS 7#32 6#32) := by decide
+-- c.eq.s with a nonzero cc field (unsupported, only cc=0 modeled) → none
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 1#32 0x32#32) = none := by decide
+-- bc1t/bc1f: fmt=BC1, tf=1/0, offset=0x1234
+example : decode (mkIT 0x11#32 0x08#32 1#32 0x1234#32) = some (.bc1t 0x1234#32) := by decide
+example : decode (mkIT 0x11#32 0x08#32 0#32 0x1234#32) = some (.bc1f 0x1234#32) := by decide
+-- a BC1 word with a nonzero cc/nd (rt-field > 1, unsupported) → none
+example : decode (mkIT 0x11#32 0x08#32 2#32 0x1234#32) = none := by decide
+
 -- `encode ∘ decode` round-trips, spanning R / I / J / branch / syscall
 example : encode (.add 29#32 8#32 3#32) = mkRT 29#32 8#32 3#32 0#32 0x20#32 := by decide
 example : encode (.lw 29#32 8#32 0x1234#32) = mkIT 0x23#32 29#32 8#32 0x1234#32 := by decide
@@ -495,9 +668,31 @@ example : decode (encode (.tltu 29#32 8#32)) = some (.tltu 29#32 8#32) := by dec
 example : decode (encode (.tgeu 29#32 8#32)) = some (.tgeu 29#32 8#32) := by decide
 example : decode (encode .break) = some .break := by decide
 
+-- Coprocessor 1 (FPU): full `decode (encode i) = some i` round-trips
+example : decode (encode (.mfc1 8#32 3#32)) = some (.mfc1 8#32 3#32) := by decide
+example : decode (encode (.mtc1 8#32 3#32)) = some (.mtc1 8#32 3#32) := by decide
+example : decode (encode (.lwc1 29#32 5#32 0x1234#32)) = some (.lwc1 29#32 5#32 0x1234#32) := by
+  decide
+example : decode (encode (.swc1 29#32 5#32 0x1234#32)) = some (.swc1 29#32 5#32 0x1234#32) := by
+  decide
+example : decode (encode (.addS 8#32 7#32 6#32)) = some (.addS 8#32 7#32 6#32) := by decide
+example : decode (encode (.subS 8#32 7#32 6#32)) = some (.subS 8#32 7#32 6#32) := by decide
+example : decode (encode (.mulS 8#32 7#32 6#32)) = some (.mulS 8#32 7#32 6#32) := by decide
+example : decode (encode (.divS 8#32 7#32 6#32)) = some (.divS 8#32 7#32 6#32) := by decide
+example : decode (encode (.movS 8#32 7#32)) = some (.movS 8#32 7#32) := by decide
+example : decode (encode (.cvtSW 8#32 7#32)) = some (.cvtSW 8#32 7#32) := by decide
+example : decode (encode (.cvtWS 8#32 7#32)) = some (.cvtWS 8#32 7#32) := by decide
+example : decode (encode (.cEqS 7#32 6#32)) = some (.cEqS 7#32 6#32) := by decide
+example : decode (encode (.cLtS 7#32 6#32)) = some (.cLtS 7#32 6#32) := by decide
+example : decode (encode (.cLeS 7#32 6#32)) = some (.cLeS 7#32 6#32) := by decide
+example : decode (encode (.bc1t 0x1234#32)) = some (.bc1t 0x1234#32) := by decide
+example : decode (encode (.bc1f 0x1234#32)) = some (.bc1f 0x1234#32) := by decide
+
 -- unknown opcodes → none
-#guard decode (mkIT 0x01#32 0#32 0#32 0#32) = none  -- coprocessor-1, unimplemented
-#guard decode (mkIT 0x11#32 0#32 0#32 0#32) = none
+#guard decode (mkIT 0x01#32 0#32 0#32 0#32) = none  -- REGIMM, unimplemented
+-- opcode 0x11 (COP1) is implemented for the fmt/funct combinations below;
+-- an unrecognized fmt (not MF/MT/BC1/S/W) still decodes to `none`.
+#guard decode (mkIT 0x11#32 0x1f#32 0#32 0#32) = none
 #guard decode (mkIT 0x16#32 0#32 0#32 0#32) = none
 #guard decode (mkIT 0x17#32 0#32 0#32 0#32) = none
 #guard decode (mkIT 0x1c#32 0#32 0#32 0#32) = none
@@ -518,3 +713,4 @@ example : decode (encode .break) = some .break := by decide
 -- funct 0x35 sits between teq (0x34) and tne (0x36) and is reserved/unused
 -- in the real MIPS32 trap family; no mnemonic maps to it.
 #guard decode (mkRT 0#32 0#32 0#32 0#32 0x35#32) = none
+#guard decode (encode (.addS 8#32 7#32 6#32)) = some (.addS 8#32 7#32 6#32)

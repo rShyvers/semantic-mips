@@ -21,6 +21,19 @@ structure State where
   hi : W32
   /-- `lo` register (mult/div results). -/
   lo : W32
+  /-- Coprocessor-1 (FPU) single-precision registers `$f0`..`$f31`, size 32;
+  index = FP register number. Each holds a raw 32-bit IEEE-754
+  single-precision bit pattern (same raw-bit-pattern storage convention as
+  `regs`); conversion to/from Lean's `Float32` happens only at the point of
+  doing actual arithmetic (`Step.lean`). Double-precision (`$f0`..`$f31`
+  used as 16 64-bit pairs) is out of scope for this pass — see
+  `docs/spec/INSTRUCTION-REF.md`'s floating-point section. -/
+  fpRegs : Array W32
+  /-- The single FPU condition flag set by `c.eq.s`/`c.lt.s`/`c.le.s` and
+  tested by `bc1t`/`bc1f`. Real MIPS32 has 8 FP condition-code registers
+  (`cc` field); this v1.x addition models only `cc = 0`, matching the
+  single-flag subset in `docs/spec/INSTRUCTION-REF.md`. -/
+  fpCondFlag : Bool
   /-- Byte-addressable, sparse memory. -/
   mem : Std.HashMap W32 UInt8
   /-- Accumulated syscall output. -/
@@ -169,6 +182,8 @@ def sampleState : State :=
     regs := (Array.replicate 32 (0#32)).set! 29 spInit
     hi := 0#32
     lo := 0#32
+    fpRegs := Array.replicate 32 (0#32)
+    fpCondFlag := false
     mem := ∅
     out := ""
     cp0Status := 0#32
@@ -178,10 +193,15 @@ def sampleState : State :=
 example : sampleState.pc = textBase := by decide
 example : sampleState.regs.size = 32 := by decide
 example : sampleState.regs[29]! = spInit := by decide
+example : sampleState.fpRegs.size = 32 := by decide
+example : sampleState.fpRegs[0]! = 0#32 := by decide
+example : sampleState.fpCondFlag = false := by decide
 example : sampleState.out = "" := by decide
 #guard sampleState.pc = textBase
 #guard sampleState.regs.size = 32
 #guard sampleState.regs[29]! = spInit
+#guard sampleState.fpRegs.size = 32
+#guard sampleState.fpCondFlag = false
 
 -- `HaltReason` / `StepResult` sanity
 example : HaltReason.exit ≠ HaltReason.arithmeticOverflow := by decide

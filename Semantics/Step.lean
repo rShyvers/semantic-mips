@@ -22,6 +22,16 @@ trap/exception model (`teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu`/`break` and
 `takeException` below) is grounded in the real MIPS32 ISA instead, per
 INSTRUCTION-REF's dedicated "Coprocessor 0 / traps and exceptions" section.
 
+The coprocessor-1 (FPU) instructions (v1.x addition; single-precision only,
+double-precision out of scope — see `docs/spec/INSTRUCTION-REF.md`'s
+floating-point section) are grounded directly in the real MIPS32 ISA, not
+MARS; their arithmetic uses Lean core's native `Float32` (`Init.Data.Float.
+Float32`), which implements IEEE-754 binary32 exactly, including
+`Float32.ofBits`/`Float32.toBits` for the lossless bit-pattern round-trip
+`fpRegs` storage needs. No FP traps are modeled: divide-by-zero and invalid
+operations propagate IEEE-754 Infinity/NaN naturally, the same precedent as
+integer `div`/`divu` by zero (SPEC-NOTES §9 item 2).
+
 ## Design notes
 
 - `step` is total: every input `(p, s)` produces a `StepResult`, never `panic`
@@ -168,6 +178,31 @@ private def readCString (s : State) (addr : W32) : Nat → String
     let b := (s.mem.get? addr).getD 0
     if b == 0 then ""
     else String.singleton (Char.ofNat b.toNat) ++ readCString s (addr + 1#32) fuel
+
+/-- Reinterpret `w`'s raw bit pattern as an IEEE-754 single-precision float
+(no numeric conversion \u2014 matches `fpRegs`' raw-bit-pattern storage
+convention, `Types.lean`). `Float32.ofBits` is Lean core's exact IEEE-754
+bit-pattern decode (`Init.Data.Float.Float32`). -/
+private def floatOfBits (w : W32) : Float32 :=
+  Float32.ofBits w.toNat.toUInt32
+
+/-- Inverse of `floatOfBits`: the raw bit pattern of `f`, as a `W32`. -/
+private def bitsOfFloat (f : Float32) : W32 :=
+  BitVec.ofNat 32 f.toBits.toNat
+
+/-- `cvt.s.w`'s numeric conversion: read `w`'s bit pattern as a 32-bit
+two's-complement int (`Int32.ofBitVec`), then convert that integer *value*
+to the nearest `Float32` (`Int32.toFloat32`, exact for every `Int32`). -/
+private def floatOfIntBits (w : W32) : Float32 :=
+  (Int32.ofBitVec w).toFloat32
+
+/-- `cvt.w.s`'s numeric conversion: truncate `f` toward zero to a 32-bit
+two's-complement int (`Float32.toInt32`, which clamps on overflow and maps
+`NaN` to `0`), returned as a raw bit pattern. See `Instruction.cvtWS`'s
+docstring for the truncating-vs-FCSR-rounding-mode simplification this
+pins. -/
+private def intBitsOfFloatTrunc (f : Float32) : W32 :=
+  f.toInt32.toBitVec
 
 /-- Execute a single already-fetched-and-decoded instruction. `w` is the raw
 instruction word (needed only to report `illegalInstruction` for an unknown
@@ -393,6 +428,71 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     let s' := writeReg s 31 linkVal
     StepResult.next
       { s' with pc := pcNext, pendingBranch := some ((pcNext &&& 0xf0000000#32) ||| (target <<< 2)) }
+  -- Coprocessor 1 (FPU), single-precision subset (docs/spec/INSTRUCTION-REF.md
+  -- floating-point section). `mtc1`/`mfc1`/`lwc1`/`swc1` move/transfer raw
+  -- bit patterns with no numeric conversion; arithmetic/compare/convert go
+  -- through `floatOfBits`/`bitsOfFloat` at the point of computation.
+  | .mfc1 rt fs =>
+    mkNext s (writeReg s (regIdx rt) (readFpReg s (regIdx fs)))
+  | .mtc1 rt fs =>
+    mkNext s (writeFpReg s (regIdx fs) (readReg s (regIdx rt)))
+  | .lwc1 rs ft imm =>
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    match readMemWord s addr with
+    | none => StepResult.halt (.addressError addr)
+    | some v => mkNext s (writeFpReg s (regIdx ft) v)
+  | .swc1 rs ft imm =>
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    match writeMemWord s addr (readFpReg s (regIdx ft)) with
+    | none => StepResult.halt (.addressError addr)
+    | some s' => mkNext s s'
+  | .addS fd fs ft =>
+    let v := (floatOfBits (readFpReg s (regIdx fs))).add (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat v))
+  | .subS fd fs ft =>
+    let v := (floatOfBits (readFpReg s (regIdx fs))).sub (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat v))
+  | .mulS fd fs ft =>
+    let v := (floatOfBits (readFpReg s (regIdx fs))).mul (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat v))
+  | .divS fd fs ft =>
+    -- IEEE-754 division; `$ft == 0` yields ±Infinity/NaN, never a trap
+    -- (module docstring; SPEC-NOTES §9 item 2 precedent).
+    let v := (floatOfBits (readFpReg s (regIdx fs))).div (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat v))
+  | .movS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (readFpReg s (regIdx fs)))
+  | .cvtSW fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat (floatOfIntBits (readFpReg s (regIdx fs)))))
+  | .cvtWS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (intBitsOfFloatTrunc (floatOfBits (readFpReg s (regIdx fs)))))
+  | .cEqS fs ft =>
+    let flag := (floatOfBits (readFpReg s (regIdx fs))).beq (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s { s with fpCondFlag := flag }
+  | .cLtS fs ft =>
+    let flag := (floatOfBits (readFpReg s (regIdx fs))).lt (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s { s with fpCondFlag := flag }
+  | .cLeS fs ft =>
+    let flag := (floatOfBits (readFpReg s (regIdx fs))).le (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s { s with fpCondFlag := flag }
+  -- `bc1t`/`bc1f`: upgraded during dev/v2 integration to use the same
+  -- `pendingBranch` delay-slot scheduling as `beq`/`bne`/etc. (real MIPS32
+  -- gives every branch, including FP ones, exactly one delay slot) instead
+  -- of the immediate-jump the fpu track shipped under time pressure --
+  -- closing that documented gap rather than leaving two different branch
+  -- disciplines coexisting in one semantics.
+  | .bc1t imm =>
+    let pcNext := s.pc + 4#32
+    if s.fpCondFlag then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      mkNext s s
+  | .bc1f imm =>
+    let pcNext := s.pc + 4#32
+    if s.fpCondFlag then
+      mkNext s s
+    else
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
   -- Syscalls (v1 scope: 1/4/10/11; see docs/spec/INSTRUCTION-REF.md syscall section).
   | .syscall =>
     match (readReg s 2).toNat with
@@ -484,6 +584,9 @@ private def regs0 : State := initialState textBase
 private def setRegs (s : State) (kvs : List (Fin 32 × W32)) : State :=
   kvs.foldl (fun acc kv => writeReg acc kv.1 kv.2) s
 
+private def setFpRegs (s : State) (kvs : List (Fin 32 × W32)) : State :=
+  kvs.foldl (fun acc kv => writeFpReg acc kv.1 kv.2) s
+
 private def prog1 (instr : Instruction) : Program :=
   (∅ : Program).insert textBase (encode instr)
 
@@ -512,6 +615,16 @@ private def nextPcEq (r : StepResult) (pc : W32) : Bool :=
 private def nextHiLoEq (r : StepResult) (hi lo : W32) : Bool :=
   match r with
   | .next s => s.hi == hi && s.lo == lo
+  | .halt _ => false
+
+private def nextFpRegEq (r : StepResult) (i : Fin 32) (v : W32) : Bool :=
+  match r with
+  | .next s => readFpReg s i == v
+  | .halt _ => false
+
+private def nextFpCondFlagEq (r : StepResult) (v : Bool) : Bool :=
+  match r with
+  | .next s => s.fpCondFlag == v
   | .halt _ => false
 
 private def isNext (r : StepResult) : Bool :=
@@ -928,9 +1041,95 @@ private def vectorHandlerProg : Program :=
 
 -- ### Undecodable word → illegalInstruction
 
-private def badWord : W32 := 0x11#32 <<< 26  -- opcode 0x11, unimplemented
+-- opcode 0x11 (COP1) is implemented for the fmt/funct combinations decoded
+-- in `Instruction.lean`; fmt=0x1f is not one of them, so this word is still
+-- genuinely undecodable.
+private def badWord : W32 := (0x11#32 <<< 26) ||| (0x1f#32 <<< 21)
 private def badProg : Program := (∅ : Program).insert textBase badWord
 #guard isHaltIllegal (step badProg regs0) badWord
+
+-- ### Coprocessor 1 (FPU): mtc1/mfc1/lwc1/swc1 raw bit-pattern moves
+
+-- mtc1 then mfc1 round-trips an arbitrary bit pattern through $f3
+#guard nextFpRegEq (step (prog1 (.mtc1 8#32 3#32)) (setRegs regs0 [(8, 0x12345678#32)])) 3
+  0x12345678#32
+#guard (match stepState (prog1 (.mtc1 8#32 3#32)) (setRegs regs0 [(8, 0x12345678#32)]) with
+        | some s' => nextRegEq (step (prog1 (.mfc1 9#32 3#32)) { s' with pc := textBase }) 9
+            0x12345678#32
+        | none => false)
+
+private def fpMemTestState : State :=
+  { (setRegs regs0 [(8, 0x10010000#32)]) with
+      mem := (((∅ : Std.HashMap W32 UInt8).insert 0x10010004#32 0x3f).insert 0x10010005#32 0x80)
+               |>.insert 0x10010006#32 0x00 |>.insert 0x10010007#32 0x00 }  -- 1.0 at offset 4
+#guard nextFpRegEq (step (prog1 (.lwc1 8#32 9#32 4#32)) fpMemTestState) 9 0x3f800000#32
+#guard (stepState (prog1 (.swc1 8#32 9#32 4#32))
+          (setFpRegs (setRegs regs0 [(8, 0x10010000#32)]) [(9, 0x3f800000#32)])).bind
+        (fun s' => readMemWord s' 0x10010004#32) = some 0x3f800000#32
+-- lwc1/swc1 alignment rules match lw/sw exactly
+#guard isHaltAddr (step (prog1 (.lwc1 8#32 9#32 1#32)) (setRegs regs0 [(8, 0x10010000#32)]))
+  0x10010001#32
+
+-- ### Coprocessor 1 (FPU): add.s/sub.s/mul.s/div.s/mov.s (IEEE-754 single-precision)
+
+-- 1.0 = 0x3f800000, 2.0 = 0x40000000, 3.0 = 0x40400000, 5.0 = 0x40a00000,
+-- 6.0 = 0x40c00000 (standard IEEE-754 binary32 bit patterns).
+#guard nextFpRegEq (step (prog1 (.addS 10#32 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x40000000#32)])) 10 0x40400000#32  -- 1.0+2.0=3.0
+#guard nextFpRegEq (step (prog1 (.subS 10#32 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x40a00000#32), (9, 0x40000000#32)])) 10 0x40400000#32  -- 5.0-2.0=3.0
+#guard nextFpRegEq (step (prog1 (.mulS 10#32 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x40000000#32), (9, 0x40400000#32)])) 10 0x40c00000#32  -- 2.0*3.0=6.0
+#guard nextFpRegEq (step (prog1 (.divS 10#32 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x40c00000#32), (9, 0x40000000#32)])) 10 0x40400000#32  -- 6.0/2.0=3.0
+-- div.s by zero: IEEE-754 Infinity, no trap (SPEC-NOTES §9 item 2 precedent)
+#guard isNext (step (prog1 (.divS 10#32 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x00000000#32)]))
+#guard nextFpRegEq (step (prog1 (.divS 10#32 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x00000000#32)])) 10 0x7f800000#32  -- 1.0/0.0=+Inf
+#guard nextFpRegEq (step (prog1 (.movS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40400000#32)])) 10
+  0x40400000#32
+
+-- ### Coprocessor 1 (FPU): cvt.s.w / cvt.w.s numeric conversions
+
+-- cvt.s.w: int bit pattern -> float value; 5 -> 5.0, -5 (0xfffffffb) -> -5.0
+#guard nextFpRegEq (step (prog1 (.cvtSW 10#32 8#32)) (setFpRegs regs0 [(8, 5#32)])) 10
+  0x40a00000#32
+#guard nextFpRegEq (step (prog1 (.cvtSW 10#32 8#32)) (setFpRegs regs0 [(8, 0xfffffffb#32)])) 10
+  0xc0a00000#32
+-- cvt.w.s: float value -> int bit pattern, truncating toward zero (not
+-- rounding); 5.9 (0x40bccccd) -> 5, -5.9 (0xc0bccccd) -> -5
+#guard nextFpRegEq (step (prog1 (.cvtWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40a00000#32)])) 10
+  0x00000005#32
+#guard nextFpRegEq (step (prog1 (.cvtWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40bccccd#32)])) 10
+  0x00000005#32
+#guard nextFpRegEq (step (prog1 (.cvtWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0bccccd#32)])) 10
+  0xfffffffb#32
+
+-- ### Coprocessor 1 (FPU): c.eq.s/c.lt.s/c.le.s set `fpCondFlag`; bc1t/bc1f branch on it
+
+#guard nextFpCondFlagEq (step (prog1 (.cEqS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) true   -- 1.0 == 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cEqS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x40000000#32)])) false  -- 1.0 != 2.0
+#guard nextFpCondFlagEq (step (prog1 (.cLtS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x40000000#32)])) true   -- 1.0 < 2.0
+#guard nextFpCondFlagEq (step (prog1 (.cLtS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x40000000#32), (9, 0x3f800000#32)])) false  -- 2.0 < 1.0 is false
+#guard nextFpCondFlagEq (step (prog1 (.cLeS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) true   -- 1.0 <= 1.0
+
+-- `bc1t`/`bc1f` get the same delay slot as every other branch (dev/v2
+-- integration: upgraded from the fpu track's original immediate-jump
+-- implementation to match `beq`/`bne`/etc.'s `pendingBranch` scheduling --
+-- see `Step.lean`'s `.bc1t`/`.bc1f` cases). Taken: two steps via
+-- `stepThroughDelaySlot` land on the target. Not taken: one step is an
+-- ordinary fallthrough to `pc + 4`, same as before.
+private def fpFlagState (b : Bool) : State := { regs0 with fpCondFlag := b }
+#guard stepThroughDelaySlot textBase (.bc1t 3#32) (fpFlagState true) = some (textBase + 4#32 + 12#32)
+#guard nextPcEq (step (prog1 (.bc1t 3#32)) (fpFlagState false)) (textBase + 4#32)
+#guard stepThroughDelaySlot textBase (.bc1f 3#32) (fpFlagState false) = some (textBase + 4#32 + 12#32)
+#guard nextPcEq (step (prog1 (.bc1f 3#32)) (fpFlagState true)) (textBase + 4#32)
 
 -- ### `run`: a short program that computes something and exits
 

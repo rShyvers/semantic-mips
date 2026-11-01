@@ -159,7 +159,7 @@ theorem add_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rd) sumBV) with
             pc := (writeReg s (regIdxSpec rd) sumBV).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, mem, out, pb⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -201,7 +201,7 @@ theorem sub_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rd) diffBV) with
             pc := (writeReg s (regIdxSpec rd) diffBV).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, mem, out, pb⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -227,7 +227,7 @@ theorem addi_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) sumBV) with
             pc := (writeReg s (regIdxSpec rt) sumBV).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, mem, out, pb⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -253,7 +253,7 @@ theorem div_spec_raw (p : Program) (s : State) (w rs rt : W32)
         StepResult.next { s with pc := s.pc + 4#32 }
       else
         StepResult.next { s with lo := ofInt32 (a.tdiv b), hi := ofInt32 (a.tmod b), pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, mem, out, pb⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -317,7 +317,7 @@ theorem beq_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, mem, out, pb⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -336,7 +336,7 @@ theorem bne_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       else
         StepResult.next
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) } := by
-  obtain ⟨pc, regs, hi, lo, mem, out, pb⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -432,7 +432,7 @@ theorem jal_spec_raw (p : Program) (s : State) (w target : W32)
       StepResult.next
         { (writeReg s 31 (pcNext + 4#32)) with
           pc := pcNext, pendingBranch := some ((pcNext &&& 0xf0000000#32) ||| (target <<< 2)) } := by
-  obtain ⟨pc, regs, hi, lo, mem, out, pb⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -468,7 +468,7 @@ theorem branch_in_delay_slot_halts (p : Program) (s : State) (w : W32) (instr : 
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some instr)
     (hpb : s.pendingBranch.isSome = true) (hbr : isBranchLikeSpec instr = true) :
     step p s = StepResult.halt .branchInDelaySlot := by
-  obtain ⟨pc, regs, hi, lo, mem, out, pb⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   cases pb with
   | none => simp at hpb
@@ -496,7 +496,7 @@ theorem lw_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) v) with
             pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, mem, out, pb⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -544,7 +544,7 @@ theorem lb_lbu_spec_raw (p : Program) (s : State) (wb wbu rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)) with
             pc := (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)).pc + 4#32 }) := by
-  obtain ⟨pc, regs, hi, lo, mem, out, pb⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   constructor
