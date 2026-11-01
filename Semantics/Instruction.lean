@@ -170,15 +170,62 @@ Field-shape summary (see each constructor's docstring for details):
   - `cfc1`/`ctc1` (`rt fs`): GPR↔FPU-control-register move (v1.x addition,
     MIPS-COVERAGE-GAPS.md §3.9C). No FCSR/FIR semantics are modeled; see
     `cfc1`'s docstring for the chosen scratch-storage model.
-  Double-precision (`.d`) and the remaining 6 "signaling" `C.cond.S`
-  predicates (`c.sf`/`c.ngle`/`c.seq`/`c.ngl`/`c.nge`/`c.ngt`, cond numbers
+  Double-precision (`.d`) — opcode `0x11` COP1, `fmt` = `D` = `0x11` (not to
+  be confused with the single-precision `fmt` = `S` = `0x10`) — v2 addition,
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.9A. A double value in `$fN` occupies
+  a **pair** of adjacent 32-bit FPRs under the classic MIPS32 FR=0
+  convention this project's `fpRegs : Array W32` already follows: `$fN`
+  holds the low 32 bits, `$f(N+1)` holds the high 32 bits (real MIPS32
+  requires `N` even for double operands; this model does not check/enforce
+  that, it just follows the convention when composing/decomposing — see
+  `Step.lean`'s `doubleOfRegPair`/`regPairOfDouble`). `fd`/`fs`/`ft` below
+  name the *low* register of each pair; the high register is implicitly
+  `+1`.
+  - `ldc1`/`sdc1` (`rs ft imm`): load/store a full 64-bit doubleword between
+    memory and an FPR pair, identical addressing to `lwc1`/`swc1` (opcodes
+    `0x35`/`0x3d`). Implemented as two `readMemWord`/`writeMemWord` calls (at
+    `addr` and `addr + 4`), reusing `lw`/`sw`'s already-correct alignment and
+    big-endian byte-order logic rather than adding dedicated 64-bit memory
+    helpers — see `Step.lean`'s cases for the resulting (documented)
+    4-byte-alignment-per-half simplification vs. real MIPS32's 8-byte
+    doubleword alignment.
+  - `addD subD mulD divD` (`fd fs ft`): double-precision IEEE-754
+    arithmetic, same shape/semantics as `addS subS mulS divS` but on
+    register-pair-composed 64-bit `Float` values (`fmt` = `D`, `funct` =
+    `0x00`/`0x01`/`0x02`/`0x03`).
+  - `movD` (`fd fs`): FP register-pair raw-bit copy (both 32-bit halves),
+    no `Float` arithmetic (`fmt` = `D`, `funct` = `0x06`).
+  - `cvtDS`/`cvtSD` (`fd fs`): single↔double numeric promotion/demotion
+    (`cvtDS`: `fmt` = `S` = `0x10` since the *source* is single, `funct` =
+    `0x21`; `cvtSD`: `fmt` = `D`, `funct` = `0x20`).
+  - `cvtDW`/`cvtWD` (`fd fs`): int↔double numeric conversion, the
+    double-precision counterpart of `cvtSW`/`cvtWS` (`cvtDW`: `fmt` = `W` =
+    `0x14`, `funct` = `0x21`; `cvtWD`: `fmt` = `D`, `funct` = `0x24`).
+  - `cEqD cLtD cLeD cFD cUnD cUeqD cOltD cUltD cOleD cUleD` (`fs ft`): the
+    double-precision counterparts of the same 10 quiet `C.cond.S`
+    predicates this project already implements for single precision (`fmt`
+    = `D`, same `funct = 0x30 | cond` numbering as the `.S` family —
+    `cEqD`=`0x32`, `cLtD`=`0x3c`, `cLeD`=`0x3e`, `cFD`=`0x30`, `cUnD`=`0x31`,
+    `cUeqD`=`0x33`, `cOltD`=`0x34`, `cUltD`=`0x35`, `cOleD`=`0x36`,
+    `cUleD`=`0x37`); the remaining 6 "signaling" predicates are out of scope
+    here for the same reason they are for `.S` (see below).
+  - `absD negD` (`fd fs`): raw sign-bit operations on the **high** 32-bit
+    half only (`fmt` = `D`, `funct` = `0x05`/`0x07`) — a double's sign bit is
+    bit 63 of the 64-bit value, which lives in the high register's bit 31
+    under the register-pair convention; the low register is copied
+    unchanged. No `Float` arithmetic involved, same rationale as `absS`/
+    `negS`.
+  - `sqrtD` (`fd fs`): double-precision IEEE-754 square root (`fmt` = `D`,
+    `funct` = `0x04`), via Lean core's `Float.sqrt`.
+  The remaining 6 "signaling" `C.cond.S`/`C.cond.D` predicates
+  (`c.sf`/`c.ngle`/`c.seq`/`c.ngl`/`c.nge`/`c.ngt`, cond numbers
   8/9/10/11/13/15 — the signaling counterparts of `c.un`/`c.eq`/`c.ueq`/
   `c.ult`/`c.ule`; this model has no FP-exception mechanism, so a signaling
   predicate would compute an identical `fpCondFlag` result to its quiet
   counterpart, the same relationship already documented between `cLtS`/
-  `cOltS` and `cLeS`/`cOleS` above) are out of scope for this pass, along
-  with `cvt.d.*`/`cvt.*.d`, multi-cc compares, and `bc1tl`/`bc1fl`; see
-  `docs/spec/INSTRUCTION-REF.md` for the documented follow-up.
+  `cOltS` and `cLeS`/`cOleS` above) remain out of scope, along with
+  multi-cc compares and `bc1tl`/`bc1fl`; see `docs/spec/INSTRUCTION-REF.md`
+  for the documented follow-up.
 -/
 
 /-- The full v1 machine-instruction set (24 original real instructions plus
@@ -592,6 +639,16 @@ inductive Instruction where
   | lwc1 (rs ft imm : W32)
   /-- `MEM32[$rs + offset] = rawbits($ft)`, word-aligned (opcode 0x39). -/
   | swc1 (rs ft imm : W32)
+  /-- `{$ft,$ft+1} = MEM64[$rs + offset]`, raw bits, into an FPR pair per the
+  module docstring's register-pair convention (opcode 0x35 `LDC1`). This
+  model only checks each 32-bit half's own 4-byte alignment (via two
+  `readMemWord` calls at `addr`/`addr+4`), not real MIPS32's 8-byte
+  doubleword alignment requirement -- a documented simplification (see
+  `Step.lean`). -/
+  | ldc1 (rs ft imm : W32)
+  /-- `MEM64[$rs + offset] = rawbits({$ft,$ft+1})`, inverse of `ldc1`
+  (opcode 0x3d `SDC1`); same alignment simplification. -/
+  | sdc1 (rs ft imm : W32)
   /-- `$fd = $fs + $ft`, single-precision IEEE-754 (opcode 0x11 COP1,
   `fmt` = `S` = 0x10, `funct` = 0x00 `ADD.S`). -/
   | addS (fd fs ft : W32)
@@ -717,6 +774,107 @@ inductive Instruction where
   `funct` = 0x37, `cond(ULE) = 7`; `cc` fixed 0). Built from `Float32.isNaN`
   explicitly, same rationale as `cUnS`. -/
   | cUleS (fs ft : W32)
+  -- Double-precision (`.d`) arithmetic/move/convert/compare -- opcode 0x11
+  -- COP1, `fmt` = `D` = 0x11 (see the module docstring's double-precision
+  -- bullet for the register-pair convention). `fd`/`fs`/`ft` name the *low*
+  -- register of each operand's pair; `Step.lean`'s `doubleOfRegPair`/
+  -- `regPairOfDouble` do the pair composition/decomposition.
+  /-- `{$fd,$fd+1} = {$fs,$fs+1} + {$ft,$ft+1}`, double-precision IEEE-754
+  (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x00 `ADD.D`). -/
+  | addD (fd fs ft : W32)
+  /-- `{$fd,$fd+1} = {$fs,$fs+1} - {$ft,$ft+1}`, double-precision IEEE-754
+  (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x01 `SUB.D`). -/
+  | subD (fd fs ft : W32)
+  /-- `{$fd,$fd+1} = {$fs,$fs+1} * {$ft,$ft+1}`, double-precision IEEE-754
+  (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x02 `MUL.D`). -/
+  | mulD (fd fs ft : W32)
+  /-- `{$fd,$fd+1} = {$fs,$fs+1} / {$ft,$ft+1}`, double-precision IEEE-754
+  (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x03 `DIV.D`); division by zero
+  produces ±Infinity/NaN per IEEE-754, no trap, same as `divS`. -/
+  | divD (fd fs ft : W32)
+  /-- `{$fd,$fd+1} = {$fs,$fs+1}`, raw pair-to-pair bit copy, both 32-bit
+  halves (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x06 `MOV.D`;
+  `ft`-position field unused/fixed 0). -/
+  | movD (fd fs : W32)
+  /-- `{$fd,$fd+1} = float64(float32bits($fs))`, single-to-double promotion
+  (opcode 0x11 COP1, `fmt` = `S` = 0x10 since the *source* is single,
+  `funct` = 0x21 `CVT.D.S`; `ft`-position field unused). Exact: every
+  `Float32` value is exactly representable as a `Float` (binary64 strictly
+  extends binary32's range/precision). -/
+  | cvtDS (fd fs : W32)
+  /-- `$fd = float32(float64bits({$fs,$fs+1}))`, double-to-single demotion,
+  rounding to the nearest `Float32` (opcode 0x11 COP1, `fmt` = `D`, `funct`
+  = 0x20 `CVT.S.D`; `ft`-position field unused). May lose precision/
+  overflow to ±Infinity, per IEEE-754 double-to-single conversion. -/
+  | cvtSD (fd fs : W32)
+  /-- `{$fd,$fd+1} = float64(int32bits($fs))`, numeric conversion of `$fs`'s
+  bit pattern read as a 32-bit two's-complement int (opcode 0x11 COP1,
+  `fmt` = `W` = 0x14, `funct` = 0x21 `CVT.D.W`; `ft`-position field unused).
+  Exact for every `Int32` value (binary64 has 52 mantissa bits). -/
+  | cvtDW (fd fs : W32)
+  /-- `$fd = int32bits(truncate({$fs,$fs+1}))`, numeric conversion
+  truncating toward zero (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x24
+  `CVT.W.D`; `ft`-position field unused). Same truncating-vs-FCSR-rounding-
+  mode simplification as `cvtWS`. -/
+  | cvtWD (fd fs : W32)
+  /-- `fpCondFlag := ({$fs,$fs+1} == {$ft,$ft+1})`, IEEE-754 double-precision
+  compare (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x32 `C.EQ.D`; `cc`
+  fixed 0). -/
+  | cEqD (fs ft : W32)
+  /-- `fpCondFlag := ({$fs,$fs+1} < {$ft,$ft+1})`, IEEE-754 double-precision
+  compare (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x3c `C.LT.D`; `cc`
+  fixed 0). -/
+  | cLtD (fs ft : W32)
+  /-- `fpCondFlag := ({$fs,$fs+1} <= {$ft,$ft+1})`, IEEE-754 double-precision
+  compare (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x3e `C.LE.D`; `cc`
+  fixed 0). -/
+  | cLeD (fs ft : W32)
+  /-- `fpCondFlag := false`, unconditionally (opcode 0x11 COP1, `fmt` = `D`,
+  `funct` = 0x30, `cond(F) = 0`; `cc` fixed 0). Double-precision counterpart
+  of `cFS`. -/
+  | cFD (fs ft : W32)
+  /-- `fpCondFlag := isNaN({$fs,$fs+1}) ∨ isNaN({$ft,$ft+1})` ("unordered")
+  (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x31, `cond(UN) = 1`; `cc` fixed
+  0). Double-precision counterpart of `cUnS`, same `Float.isNaN`-based
+  rationale. -/
+  | cUnD (fs ft : W32)
+  /-- `fpCondFlag := ({$fs,$fs+1} == {$ft,$ft+1}) ∨ unordered` (opcode 0x11
+  COP1, `fmt` = `D`, `funct` = 0x33, `cond(UEQ) = 3`; `cc` fixed 0). -/
+  | cUeqD (fs ft : W32)
+  /-- `fpCondFlag := ordered ∧ ({$fs,$fs+1} < {$ft,$ft+1})` (opcode 0x11
+  COP1, `fmt` = `D`, `funct` = 0x34, `cond(OLT) = 4`; `cc` fixed 0).
+  Numerically identical to `cLtD`'s modeled result, same `cLtS`/`cOltS`
+  relationship. -/
+  | cOltD (fs ft : W32)
+  /-- `fpCondFlag := ({$fs,$fs+1} < {$ft,$ft+1}) ∨ unordered` (opcode 0x11
+  COP1, `fmt` = `D`, `funct` = 0x35, `cond(ULT) = 5`; `cc` fixed 0). -/
+  | cUltD (fs ft : W32)
+  /-- `fpCondFlag := ordered ∧ ({$fs,$fs+1} <= {$ft,$ft+1})` (opcode 0x11
+  COP1, `fmt` = `D`, `funct` = 0x36, `cond(OLE) = 6`; `cc` fixed 0). -/
+  | cOleD (fs ft : W32)
+  /-- `fpCondFlag := ({$fs,$fs+1} <= {$ft,$ft+1}) ∨ unordered` (opcode 0x11
+  COP1, `fmt` = `D`, `funct` = 0x37, `cond(ULE) = 7`; `cc` fixed 0). -/
+  | cUleD (fs ft : W32)
+  /-- `$fd = sqrt({$fs,$fs+1})`, double-precision IEEE-754 square root
+  (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x04 `SQRT.D`; `ft`-position
+  field unused). Via Lean core's `Float.sqrt` (`@[extern "sqrt"]`, backed by
+  the C library's `sqrt`). -/
+  | sqrtD (fd fs : W32)
+  /-- `{$fd,$fd+1} = |{$fs,$fs+1}|`, i.e. the pair with the sign bit (bit 31
+  of the **high** register, `$fs+1`) cleared and the low register copied
+  unchanged (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x05 `ABS.D`;
+  `ft`-position field unused). A double's sign bit is bit 63 of the 64-bit
+  value, which lives in the high register's bit 31 under the register-pair
+  convention -- implemented in `Step.lean` as the raw bit operation
+  `($fs+1) &&& 0x7fffffff` on the high half only, same rationale as
+  `absS`. -/
+  | absD (fd fs : W32)
+  /-- `{$fd,$fd+1} = -{$fs,$fs+1}`, i.e. the pair with the high register's
+  sign bit flipped and the low register copied unchanged (opcode 0x11 COP1,
+  `fmt` = `D`, `funct` = 0x07 `NEG.D`; `ft`-position field unused).
+  Implemented in `Step.lean` as `($fs+1) ^^^ 0x80000000` on the high half
+  only, same rationale as `negS`. -/
+  | negD (fd fs : W32)
   /-- `$rt = FpuControl[$fs]`, move from a coprocessor-1 control register to
   a GPR (opcode 0x11 COP1, `rs`-position field = `CF` = 0x02). Real MIPS32
   exposes named control registers (`FIR` = reg 0, `FCSR` = reg 31, ...) with
@@ -910,6 +1068,8 @@ def decode (w : W32) : Option Instruction :=
     | _ => none
   | 0x31 => some (.lwc1 rs rt imm)
   | 0x39 => some (.swc1 rs rt imm)
+  | 0x35 => some (.ldc1 rs rt imm)
+  | 0x3d => some (.sdc1 rs rt imm)
   -- Coprocessor 1 (FPU): `rs`-position field is `fmt`/sub-opcode, `rt` is
   -- `ft` (or the GPR for mtc1/mfc1), `rd` is `fs` (or `ft` for arithmetic
   -- format, see each case), `shamt` is `fd` for arithmetic format.
@@ -952,10 +1112,42 @@ def decode (w : W32) : Option Instruction :=
       | 0x35 => if shamt.toNat == 0 then some (.cUltS rd rt) else none
       | 0x36 => if shamt.toNat == 0 then some (.cOleS rd rt) else none
       | 0x37 => if shamt.toNat == 0 then some (.cUleS rd rt) else none
+      -- `cvt.d.s`: source is single, so it's funct 0x21 in the *S* fmt block
+      -- (not the D block below), same "fmt names the source format"
+      -- convention as `cvtSW`/`cvtWS`.
+      | 0x21 => some (.cvtDS shamt rd)
       | _ => none
     | 0x14 =>  -- fmt = W
       match (functOf w).toNat with
       | 0x20 => some (.cvtSW shamt rd)
+      -- `cvt.d.w`: source is a word (int), funct 0x21, same field shape.
+      | 0x21 => some (.cvtDW shamt rd)
+      | _ => none
+    -- fmt = D (0x11): double-precision arithmetic/compare/move/convert
+    -- format, exact same field shape as fmt = S above (ft=rt, fs=rd,
+    -- fd=shamt) -- see the module docstring's double-precision bullet.
+    | 0x11 =>
+      match (functOf w).toNat with
+      | 0x00 => some (.addD shamt rd rt)
+      | 0x01 => some (.subD shamt rd rt)
+      | 0x02 => some (.mulD shamt rd rt)
+      | 0x03 => some (.divD shamt rd rt)
+      | 0x06 => some (.movD shamt rd)
+      | 0x20 => some (.cvtSD shamt rd)
+      | 0x24 => some (.cvtWD shamt rd)
+      | 0x04 => some (.sqrtD shamt rd)
+      | 0x05 => some (.absD shamt rd)
+      | 0x07 => some (.negD shamt rd)
+      | 0x32 => if shamt.toNat == 0 then some (.cEqD rd rt) else none
+      | 0x3c => if shamt.toNat == 0 then some (.cLtD rd rt) else none
+      | 0x3e => if shamt.toNat == 0 then some (.cLeD rd rt) else none
+      | 0x30 => if shamt.toNat == 0 then some (.cFD rd rt) else none
+      | 0x31 => if shamt.toNat == 0 then some (.cUnD rd rt) else none
+      | 0x33 => if shamt.toNat == 0 then some (.cUeqD rd rt) else none
+      | 0x34 => if shamt.toNat == 0 then some (.cOltD rd rt) else none
+      | 0x35 => if shamt.toNat == 0 then some (.cUltD rd rt) else none
+      | 0x36 => if shamt.toNat == 0 then some (.cOleD rd rt) else none
+      | 0x37 => if shamt.toNat == 0 then some (.cUleD rd rt) else none
       | _ => none
     | _ => none
   | _ => none
@@ -1075,6 +1267,8 @@ def encode (i : Instruction) : W32 :=
   | .mtc1 rt fs => (0x11#32 <<< 26) ||| mkRT 0x04#32 rt fs 0#32 0#32
   | .lwc1 rs ft imm => mkIT 0x31#32 rs ft imm
   | .swc1 rs ft imm => mkIT 0x39#32 rs ft imm
+  | .ldc1 rs ft imm => mkIT 0x35#32 rs ft imm
+  | .sdc1 rs ft imm => mkIT 0x3d#32 rs ft imm
   | .addS fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs fd 0x00#32
   | .subS fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs fd 0x01#32
   | .mulS fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs fd 0x02#32
@@ -1099,6 +1293,31 @@ def encode (i : Instruction) : W32 :=
   | .cUltS fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs 0#32 0x35#32
   | .cOleS fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs 0#32 0x36#32
   | .cUleS fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs 0#32 0x37#32
+  -- Double-precision (`.d`): `fmt` = `D` = 0x11, same field shape as the
+  -- single-precision cases above; `cvtDS`/`cvtDW` use the *source*'s `fmt`
+  -- (`S`/`W`), same convention as `cvtSW`/`cvtWS`.
+  | .addD fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs fd 0x00#32
+  | .subD fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs fd 0x01#32
+  | .mulD fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs fd 0x02#32
+  | .divD fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs fd 0x03#32
+  | .movD fd fs => (0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 fs fd 0x06#32
+  | .cvtDS fd fs => (0x11#32 <<< 26) ||| mkRT 0x10#32 0#32 fs fd 0x21#32
+  | .cvtSD fd fs => (0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 fs fd 0x20#32
+  | .cvtDW fd fs => (0x11#32 <<< 26) ||| mkRT 0x14#32 0#32 fs fd 0x21#32
+  | .cvtWD fd fs => (0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 fs fd 0x24#32
+  | .sqrtD fd fs => (0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 fs fd 0x04#32
+  | .absD fd fs => (0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 fs fd 0x05#32
+  | .negD fd fs => (0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 fs fd 0x07#32
+  | .cEqD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x32#32
+  | .cLtD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x3c#32
+  | .cLeD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x3e#32
+  | .cFD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x30#32
+  | .cUnD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x31#32
+  | .cUeqD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x33#32
+  | .cOltD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x34#32
+  | .cUltD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x35#32
+  | .cOleD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x36#32
+  | .cUleD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x37#32
   | .cfc1 rt fs => (0x11#32 <<< 26) ||| mkRT 0x02#32 rt fs 0#32 0#32
   | .ctc1 rt fs => (0x11#32 <<< 26) ||| mkRT 0x06#32 rt fs 0#32 0#32
   | .bc1t imm => mkIT 0x11#32 0x08#32 1#32 imm
@@ -1324,6 +1543,52 @@ example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 0#32 0x36#32) = so
 example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 0#32 0x37#32) = some (.cUleS 7#32 6#32) := by decide
 -- c.un.s with a nonzero cc field (unsupported, only cc=0 modeled) → none
 example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 1#32 0x31#32) = none := by decide
+
+-- ldc1/sdc1: rs=29 (base), ft=5, imm=0x1234 (identical layout to lwc1/swc1)
+example : decode (mkIT 0x35#32 29#32 5#32 0x1234#32) = some (.ldc1 29#32 5#32 0x1234#32) := by
+  decide
+example : decode (mkIT 0x3d#32 29#32 5#32 0x1234#32) = some (.sdc1 29#32 5#32 0x1234#32) := by
+  decide
+-- add.d/sub.d/mul.d/div.d: fmt=D, ft=6, fs=7, fd=8
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 8#32 0x00#32) = some (.addD 8#32 7#32 6#32) := by
+  decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 8#32 0x01#32) = some (.subD 8#32 7#32 6#32) := by
+  decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 8#32 0x02#32) = some (.mulD 8#32 7#32 6#32) := by
+  decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 8#32 0x03#32) = some (.divD 8#32 7#32 6#32) := by
+  decide
+-- mov.d/sqrt.d/abs.d/neg.d/cvt.w.d: fmt=D, fs=7, fd=8 (ft-position fixed 0)
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 7#32 8#32 0x06#32) = some (.movD 8#32 7#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 7#32 8#32 0x04#32) = some (.sqrtD 8#32 7#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 7#32 8#32 0x05#32) = some (.absD 8#32 7#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 7#32 8#32 0x07#32) = some (.negD 8#32 7#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 7#32 8#32 0x24#32) = some (.cvtWD 8#32 7#32) := by
+  decide
+-- cvt.d.s: fmt=S (source is single), fs=7, fd=8
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 0#32 7#32 8#32 0x21#32) = some (.cvtDS 8#32 7#32) := by
+  decide
+-- cvt.s.d: fmt=D (source is double), fs=7, fd=8
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 7#32 8#32 0x20#32) = some (.cvtSD 8#32 7#32) := by
+  decide
+-- cvt.d.w: fmt=W (source is a word), fs=7, fd=8
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x14#32 0#32 7#32 8#32 0x21#32) = some (.cvtDW 8#32 7#32) := by
+  decide
+-- c.eq.d/c.lt.d/c.le.d/c.f.d/c.un.d/c.ueq.d/c.olt.d/c.ult.d/c.ole.d/c.ule.d:
+-- fmt=D, fs=7, ft=6, fd-position (cc) fixed 0
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x32#32) = some (.cEqD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x3c#32) = some (.cLtD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x3e#32) = some (.cLeD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x30#32) = some (.cFD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x31#32) = some (.cUnD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x33#32) = some (.cUeqD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x34#32) = some (.cOltD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x35#32) = some (.cUltD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x36#32) = some (.cOleD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x37#32) = some (.cUleD 7#32 6#32) := by decide
+-- c.eq.d with a nonzero cc field (unsupported, only cc=0 modeled) → none
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 1#32 0x32#32) = none := by decide
+
 -- cfc1/mfc1 share the same (rt, fs) field shape, distinguished by the
 -- rs-position sub-opcode (CF=0x02 vs MF=0x00); ctc1/mtc1 likewise (CT=0x06 vs MT=0x04)
 example : decode ((0x11#32 <<< 26) ||| mkRT 0x02#32 8#32 3#32 0#32 0#32) = some (.cfc1 8#32 3#32) := by decide
@@ -1442,6 +1707,34 @@ example : decode (encode (.ctc1 8#32 3#32)) = some (.ctc1 8#32 3#32) := by decid
 example : decode (encode (.bc1t 0x1234#32)) = some (.bc1t 0x1234#32) := by decide
 example : decode (encode (.bc1f 0x1234#32)) = some (.bc1f 0x1234#32) := by decide
 
+-- Coprocessor 1 (FPU), double-precision: full `decode (encode i) = some i` round-trips
+example : decode (encode (.ldc1 29#32 5#32 0x1234#32)) = some (.ldc1 29#32 5#32 0x1234#32) := by
+  decide
+example : decode (encode (.sdc1 29#32 5#32 0x1234#32)) = some (.sdc1 29#32 5#32 0x1234#32) := by
+  decide
+example : decode (encode (.addD 8#32 7#32 6#32)) = some (.addD 8#32 7#32 6#32) := by decide
+example : decode (encode (.subD 8#32 7#32 6#32)) = some (.subD 8#32 7#32 6#32) := by decide
+example : decode (encode (.mulD 8#32 7#32 6#32)) = some (.mulD 8#32 7#32 6#32) := by decide
+example : decode (encode (.divD 8#32 7#32 6#32)) = some (.divD 8#32 7#32 6#32) := by decide
+example : decode (encode (.movD 8#32 7#32)) = some (.movD 8#32 7#32) := by decide
+example : decode (encode (.cvtDS 8#32 7#32)) = some (.cvtDS 8#32 7#32) := by decide
+example : decode (encode (.cvtSD 8#32 7#32)) = some (.cvtSD 8#32 7#32) := by decide
+example : decode (encode (.cvtDW 8#32 7#32)) = some (.cvtDW 8#32 7#32) := by decide
+example : decode (encode (.cvtWD 8#32 7#32)) = some (.cvtWD 8#32 7#32) := by decide
+example : decode (encode (.sqrtD 8#32 7#32)) = some (.sqrtD 8#32 7#32) := by decide
+example : decode (encode (.absD 8#32 7#32)) = some (.absD 8#32 7#32) := by decide
+example : decode (encode (.negD 8#32 7#32)) = some (.negD 8#32 7#32) := by decide
+example : decode (encode (.cEqD 7#32 6#32)) = some (.cEqD 7#32 6#32) := by decide
+example : decode (encode (.cLtD 7#32 6#32)) = some (.cLtD 7#32 6#32) := by decide
+example : decode (encode (.cLeD 7#32 6#32)) = some (.cLeD 7#32 6#32) := by decide
+example : decode (encode (.cFD 7#32 6#32)) = some (.cFD 7#32 6#32) := by decide
+example : decode (encode (.cUnD 7#32 6#32)) = some (.cUnD 7#32 6#32) := by decide
+example : decode (encode (.cUeqD 7#32 6#32)) = some (.cUeqD 7#32 6#32) := by decide
+example : decode (encode (.cOltD 7#32 6#32)) = some (.cOltD 7#32 6#32) := by decide
+example : decode (encode (.cUltD 7#32 6#32)) = some (.cUltD 7#32 6#32) := by decide
+example : decode (encode (.cOleD 7#32 6#32)) = some (.cOleD 7#32 6#32) := by decide
+example : decode (encode (.cUleD 7#32 6#32)) = some (.cUleD 7#32 6#32) := by decide
+
 -- REGIMM zero-comparison branches: full decode(encode i) = some i round-trips
 example : decode (encode (.bltz 29#32 0x1234#32)) = some (.bltz 29#32 0x1234#32) := by decide
 example : decode (encode (.bgez 29#32 0x1234#32)) = some (.bgez 29#32 0x1234#32) := by decide
@@ -1505,6 +1798,8 @@ example : decode (encode (.swr 29#32 8#32 0x1234#32)) = some (.swr 29#32 8#32 0x
 -- in the real MIPS32 trap family; no mnemonic maps to it.
 #guard decode (mkRT 0#32 0#32 0#32 0#32 0x35#32) = none
 #guard decode (encode (.addS 8#32 7#32 6#32)) = some (.addS 8#32 7#32 6#32)
+#guard decode (encode (.addD 8#32 7#32 6#32)) = some (.addD 8#32 7#32 6#32)
+#guard decode (encode (.ldc1 29#32 5#32 0x1234#32)) = some (.ldc1 29#32 5#32 0x1234#32)
 
 -- Coprocessor 0 (CP0) register move / execution control: mfc0/mtc0/eret/wait
 -- (docs/spec/MIPS-COVERAGE-GAPS.md §3.10A). rt=8 (GPR), rd=13 (Cause).

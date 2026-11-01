@@ -22,15 +22,20 @@ trap/exception model (`teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu`/`break` and
 `takeException` below) is grounded in the real MIPS32 ISA instead, per
 INSTRUCTION-REF's dedicated "Coprocessor 0 / traps and exceptions" section.
 
-The coprocessor-1 (FPU) instructions (v1.x addition; single-precision only,
-double-precision out of scope — see `docs/spec/INSTRUCTION-REF.md`'s
+The coprocessor-1 (FPU) instructions (v1.x addition; single-precision, plus a
+v2 double-precision addition -- see `docs/spec/INSTRUCTION-REF.md`'s
 floating-point section) are grounded directly in the real MIPS32 ISA, not
-MARS; their arithmetic uses Lean core's native `Float32` (`Init.Data.Float.
-Float32`), which implements IEEE-754 binary32 exactly, including
-`Float32.ofBits`/`Float32.toBits` for the lossless bit-pattern round-trip
-`fpRegs` storage needs. No FP traps are modeled: divide-by-zero and invalid
-operations propagate IEEE-754 Infinity/NaN naturally, the same precedent as
-integer `div`/`divu` by zero (SPEC-NOTES §9 item 2).
+MARS; single-precision arithmetic uses Lean core's native `Float32`
+(`Init.Data.Float.Float32`), which implements IEEE-754 binary32 exactly,
+including `Float32.ofBits`/`Float32.toBits` for the lossless bit-pattern
+round-trip `fpRegs` storage needs. Double-precision arithmetic uses Lean
+core's native 64-bit `Float` (`Init.Data.Float.Float`, IEEE-754 binary64)
+over a *pair* of adjacent `fpRegs` entries, per the classic MIPS32 FR=0
+register-pair convention (`$fN` = low 32 bits, `$f(N+1)` = high 32 bits) --
+see `doubleOfRegPair`/`regPairOfDouble` below. No FP traps are modeled:
+divide-by-zero and invalid operations propagate IEEE-754 Infinity/NaN
+naturally, the same precedent as integer `div`/`divu` by zero (SPEC-NOTES §9
+item 2).
 
 `ll`/`sc` (v1.x addition; real MIPS32 atomic synchronization primitives, not
 part of the original v1 instruction set) are grounded directly in the real
@@ -259,6 +264,62 @@ private def intBitsOfFloatCeil (f : Float32) : W32 :=
 (`Float32.floor`, `floorf`), then clamp/convert to `Int32`. -/
 private def intBitsOfFloatFloor (f : Float32) : W32 :=
   f.floor.toInt32.toBitVec
+
+-- ### Double-precision (`.d`) register-pair bit-pattern composition
+--
+-- Classic MIPS32 FR=0 convention (this project's `fpRegs : Array W32`
+-- already follows it): a double value in assembly register `$fN` occupies
+-- the *pair* of adjacent 32-bit FPRs `fpRegs[n]` (low 32 bits) and
+-- `fpRegs[n+1]` (high 32 bits). `doubleOfRegPair`/`regPairOfDouble` compose/
+-- decompose that pair into/from Lean core's 64-bit `Float`, mirroring
+-- `floatOfBits`/`bitsOfFloat`'s raw-bit-pattern round-trip above but for
+-- `Float.ofBits`/`Float.toBits` (`Init.Data.Float.Float`) instead of
+-- `Float32.ofBits`/`Float32.toBits`. Public (not `private`): used by both
+-- `execInstr`'s double-precision cases below and available to `StepSpec`
+-- reasoning about double-precision results.
+
+/-- Compose the raw 64-bit bit pattern of a double-precision value from an
+FPR register pair `(lo, hi)` -- `lo` is the low 32 bits (the register named
+`$fN` in assembly), `hi` is the high 32 bits (`$f(N+1)`) -- into a `Float`
+via Lean core's `Float.ofBits : UInt64 → Float`. Real MIPS32 requires `N`
+to be even for double operands; this is not checked/enforced here, the
+function just follows the register-pair convention when composing. -/
+def doubleOfRegPair (lo hi : W32) : Float :=
+  Float.ofBits (hi ++ lo : BitVec 64).toNat.toUInt64
+
+/-- Inverse of `doubleOfRegPair`: decompose `f`'s raw 64-bit bit pattern
+(`Float.toBits`) into an FPR register pair `(lo, hi)` -- `lo` (low 32 bits)
+goes in `$fN`, `hi` (high 32 bits) goes in `$f(N+1)`. -/
+def regPairOfDouble (f : Float) : W32 × W32 :=
+  let bits : BitVec 64 := BitVec.ofNat 64 f.toBits.toNat
+  (bits.extractLsb 31 0, bits.extractLsb 63 32)
+
+/-- `cvt.d.w`'s numeric conversion: read `w`'s bit pattern as a 32-bit
+two's-complement int (`Int32.ofBitVec`), then convert that integer *value*
+to the nearest `Float` (`Int32.toFloat`, exact for every `Int32` -- binary64
+has 52 mantissa bits). -/
+private def doubleOfIntBits (w : W32) : Float :=
+  (Int32.ofBitVec w).toFloat
+
+/-- `cvt.w.d`'s numeric conversion: truncate `f` toward zero to a 32-bit
+two's-complement int (`Float.toInt32`, which clamps on overflow and maps
+`NaN` to `0`, the double-precision counterpart of `intBitsOfFloatTrunc`),
+returned as a raw bit pattern. Same truncating-vs-FCSR-rounding-mode
+simplification as `intBitsOfFloatTrunc`/`cvtWS`. -/
+private def intBitsOfDoubleTrunc (f : Float) : W32 :=
+  f.toInt32.toBitVec
+
+/-- Read the double-precision `Float` held in the FPR pair named by `f` (the
+raw 5-bit field of the pair's *low* register, e.g. `fs`/`ft`/`fd` as decoded)
+in `s`'s `fpRegs`, composing via `doubleOfRegPair`. -/
+private def readDoubleReg (s : State) (f : W32) : Float :=
+  doubleOfRegPair (readFpReg s (regIdx f)) (readFpReg s (regIdx (f + 1#32)))
+
+/-- Write double-precision `Float` value `v` into the FPR pair named by `f`
+(the low register) in `s`, decomposing via `regPairOfDouble`. -/
+private def writeDoubleReg (s : State) (f : W32) (v : Float) : State :=
+  let (lo, hi) := regPairOfDouble v
+  writeFpReg (writeFpReg s (regIdx f) lo) (regIdx (f + 1#32)) hi
 
 /-- Execute a single already-fetched-and-decoded instruction. `w` is the raw
 instruction word (needed only to report `illegalInstruction` for an unknown
@@ -804,6 +865,31 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     match writeMemWord s addr (readFpReg s (regIdx ft)) with
     | none => StepResult.halt (.addressError addr)
     | some s' => mkNext s { s' with llBit := false }
+  -- `ldc1`/`sdc1`: two `readMemWord`/`writeMemWord` calls at `addr`/
+  -- `addr + 4` (`Instruction.ldc1`'s docstring) instead of dedicated 64-bit
+  -- memory helpers -- reuses `readMemWord`/`writeMemWord`'s already-correct
+  -- big-endian byte order and (per-half) alignment checking. Big-endian
+  -- doubleword order matches the existing big-endian word order: the word
+  -- at the lower address (`addr`) is the *more*-significant half, so it
+  -- maps to the high register (`$ft+1`); `addr + 4` is the low register
+  -- (`$ft`).
+  | .ldc1 rs ft imm =>
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    match readMemWord s addr, readMemWord s (addr + 4#32) with
+    | some hi, some lo =>
+      let s' := writeFpReg s (regIdx ft) lo
+      mkNext s (writeFpReg s' (regIdx (ft + 1#32)) hi)
+    | _, _ => StepResult.halt (.addressError addr)
+  | .sdc1 rs ft imm =>
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    let lo := readFpReg s (regIdx ft)
+    let hi := readFpReg s (regIdx (ft + 1#32))
+    match writeMemWord s addr hi with
+    | none => StepResult.halt (.addressError addr)
+    | some s' =>
+      match writeMemWord s' (addr + 4#32) lo with
+      | none => StepResult.halt (.addressError addr)
+      | some s'' => mkNext s { s'' with llBit := false }
   | .addS fd fs ft =>
     let v := (floatOfBits (readFpReg s (regIdx fs))).add (floatOfBits (readFpReg s (regIdx ft)))
     mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat v))
@@ -882,6 +968,86 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
   | .cUleS fs ft =>
     let a := floatOfBits (readFpReg s (regIdx fs))
     let b := floatOfBits (readFpReg s (regIdx ft))
+    mkNext s { s with fpCondFlag := a.le b || a.isNaN || b.isNaN }
+  -- Double-precision (`.d`): exact same shape as the single-precision cases
+  -- above, but operating on `readDoubleReg`/`writeDoubleReg`-composed
+  -- 64-bit `Float` values from register pairs instead of `floatOfBits`/
+  -- `bitsOfFloat`-composed `Float32` values from single registers (module
+  -- docstring; `Instruction.lean`'s double-precision bullet).
+  | .addD fd fs ft =>
+    let v := (readDoubleReg s fs).add (readDoubleReg s ft)
+    mkNext s (writeDoubleReg s fd v)
+  | .subD fd fs ft =>
+    let v := (readDoubleReg s fs).sub (readDoubleReg s ft)
+    mkNext s (writeDoubleReg s fd v)
+  | .mulD fd fs ft =>
+    let v := (readDoubleReg s fs).mul (readDoubleReg s ft)
+    mkNext s (writeDoubleReg s fd v)
+  | .divD fd fs ft =>
+    -- IEEE-754 division; `$ft == 0` yields +/-Infinity/NaN, never a trap,
+    -- same as `divS`.
+    let v := (readDoubleReg s fs).div (readDoubleReg s ft)
+    mkNext s (writeDoubleReg s fd v)
+  -- `mov.d`: raw pair-to-pair bit copy, both 32-bit halves
+  -- (`Instruction.movD`'s docstring) -- no `Float` arithmetic involved.
+  | .movD fd fs =>
+    let s' := writeFpReg s (regIdx fd) (readFpReg s (regIdx fs))
+    mkNext s (writeFpReg s' (regIdx (fd + 1#32)) (readFpReg s (regIdx (fs + 1#32))))
+  -- `cvt.d.s`/`cvt.s.d`: single<->double numeric conversion, via Lean core's
+  -- `Float32.toFloat`/`Float.toFloat32` (`Instruction.cvtDS`/`cvtSD`'s
+  -- docstrings).
+  | .cvtDS fd fs =>
+    mkNext s (writeDoubleReg s fd (floatOfBits (readFpReg s (regIdx fs))).toFloat)
+  | .cvtSD fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat (readDoubleReg s fs).toFloat32))
+  | .cvtDW fd fs =>
+    mkNext s (writeDoubleReg s fd (doubleOfIntBits (readFpReg s (regIdx fs))))
+  | .cvtWD fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (intBitsOfDoubleTrunc (readDoubleReg s fs)))
+  | .cEqD fs ft =>
+    let flag := (readDoubleReg s fs).beq (readDoubleReg s ft)
+    mkNext s { s with fpCondFlag := flag }
+  | .cLtD fs ft =>
+    let flag := (readDoubleReg s fs).lt (readDoubleReg s ft)
+    mkNext s { s with fpCondFlag := flag }
+  | .cLeD fs ft =>
+    let flag := (readDoubleReg s fs).le (readDoubleReg s ft)
+    mkNext s { s with fpCondFlag := flag }
+  | .sqrtD fd fs =>
+    mkNext s (writeDoubleReg s fd (readDoubleReg s fs).sqrt)
+  -- `abs.d`/`neg.d`: raw sign-bit operations on the **high** half only
+  -- (`Instruction.absD`/`negD`'s docstrings) -- a double's sign bit is bit
+  -- 63 of the 64-bit value, i.e. bit 31 of the high register; the low
+  -- register is copied unchanged, no `Float` arithmetic involved.
+  | .absD fd fs =>
+    let s' := writeFpReg s (regIdx fd) (readFpReg s (regIdx fs))
+    mkNext s (writeFpReg s' (regIdx (fd + 1#32)) (readFpReg s (regIdx (fs + 1#32)) &&& 0x7fffffff#32))
+  | .negD fd fs =>
+    let s' := writeFpReg s (regIdx fd) (readFpReg s (regIdx fs))
+    mkNext s (writeFpReg s' (regIdx (fd + 1#32)) (readFpReg s (regIdx (fs + 1#32)) ^^^ 0x80000000#32))
+  | .cFD _ _ =>
+    mkNext s { s with fpCondFlag := false }
+  | .cUnD fs ft =>
+    let a := readDoubleReg s fs
+    let b := readDoubleReg s ft
+    mkNext s { s with fpCondFlag := a.isNaN || b.isNaN }
+  | .cUeqD fs ft =>
+    let a := readDoubleReg s fs
+    let b := readDoubleReg s ft
+    mkNext s { s with fpCondFlag := a.beq b || a.isNaN || b.isNaN }
+  | .cOltD fs ft =>
+    let flag := (readDoubleReg s fs).lt (readDoubleReg s ft)
+    mkNext s { s with fpCondFlag := flag }
+  | .cUltD fs ft =>
+    let a := readDoubleReg s fs
+    let b := readDoubleReg s ft
+    mkNext s { s with fpCondFlag := a.lt b || a.isNaN || b.isNaN }
+  | .cOleD fs ft =>
+    let flag := (readDoubleReg s fs).le (readDoubleReg s ft)
+    mkNext s { s with fpCondFlag := flag }
+  | .cUleD fs ft =>
+    let a := readDoubleReg s fs
+    let b := readDoubleReg s ft
     mkNext s { s with fpCondFlag := a.le b || a.isNaN || b.isNaN }
   -- `bc1t`/`bc1f`: upgraded during dev/v2 integration to use the same
   -- `pendingBranch` delay-slot scheduling as `beq`/`bne`/etc. (real MIPS32
@@ -2263,6 +2429,117 @@ private def fpFlagState (b : Bool) : State := { regs0 with fpCondFlag := b }
 #guard nextPcEq (step (prog1 (.bc1t 3#32)) (fpFlagState false)) (textBase + 4#32)
 #guard stepThroughDelaySlot textBase (.bc1f 3#32) (fpFlagState false) = some (textBase + 4#32 + 12#32)
 #guard nextPcEq (step (prog1 (.bc1f 3#32)) (fpFlagState true)) (textBase + 4#32)
+
+-- ### Coprocessor 1 (FPU), double-precision: ldc1/sdc1 (register-pair doubleword load/store)
+
+-- Register-pair convention: `$fN` (low) / `$f(N+1)` (high). Memory is
+-- big-endian doubleword order: the word at the lower address is the *more*
+-- significant half (the high register), `addr + 4` is the low register --
+-- same convention `readMemWord`/`writeMemWord` already use for single
+-- words, extended one level up.
+-- 1.0 (double) = hi 0x3ff00000, lo 0x00000000.
+private def dpMemTestState : State :=
+  { (setRegs regs0 [(8, 0x10010000#32)]) with
+      mem := (((∅ : Std.HashMap W32 UInt8).insert 0x10010004#32 0x3f).insert 0x10010005#32 0xf0)
+               |>.insert 0x10010006#32 0x00 |>.insert 0x10010007#32 0x00 }
+#guard nextFpRegEq (step (prog1 (.ldc1 8#32 9#32 4#32)) dpMemTestState) 9 0x00000000#32    -- $f9 (lo)
+#guard nextFpRegEq (step (prog1 (.ldc1 8#32 9#32 4#32)) dpMemTestState) 10 0x3ff00000#32   -- $f10 (hi)
+#guard (stepState (prog1 (.sdc1 8#32 9#32 4#32))
+          (setFpRegs (setRegs regs0 [(8, 0x10010000#32)]) [(9, 0x00000000#32), (10, 0x3ff00000#32)])).bind
+        (fun s' => readMemWord s' 0x10010004#32) = some 0x3ff00000#32   -- hi word at addr (low addr = high half)
+#guard (stepState (prog1 (.sdc1 8#32 9#32 4#32))
+          (setFpRegs (setRegs regs0 [(8, 0x10010000#32)]) [(9, 0x00000000#32), (10, 0x3ff00000#32)])).bind
+        (fun s' => readMemWord s' 0x10010008#32) = some 0x00000000#32   -- lo word at addr+4
+-- ldc1/sdc1 alignment rules match lwc1/swc1 exactly (each half independently)
+#guard isHaltAddr (step (prog1 (.ldc1 8#32 9#32 1#32)) (setRegs regs0 [(8, 0x10010000#32)]))
+  0x10010001#32
+
+-- ### Coprocessor 1 (FPU), double-precision: add.d/sub.d/mul.d/div.d/mov.d
+
+-- 1.0 = (lo 0, hi 0x3ff00000), 2.0 = (lo 0, hi 0x40000000),
+-- 3.0 = (lo 0, hi 0x40080000), 5.0 = (lo 0, hi 0x40140000),
+-- 6.0 = (lo 0, hi 0x40180000) (standard IEEE-754 binary64 bit patterns,
+-- hand-computed and cross-checked against Python's `struct.pack('>d', v)`).
+#guard nextFpRegEq (step (prog1 (.addD 10#32 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x40000000#32)])) 10 0#32
+#guard nextFpRegEq (step (prog1 (.addD 10#32 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x40000000#32)])) 11 0x40080000#32  -- 1.0+2.0=3.0
+#guard nextFpRegEq (step (prog1 (.subD 10#32 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40140000#32), (6, 0), (7, 0x40000000#32)])) 11 0x40080000#32  -- 5.0-2.0=3.0
+#guard nextFpRegEq (step (prog1 (.mulD 10#32 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40000000#32), (6, 0), (7, 0x40080000#32)])) 11 0x40180000#32  -- 2.0*3.0=6.0
+#guard nextFpRegEq (step (prog1 (.divD 10#32 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40180000#32), (6, 0), (7, 0x40000000#32)])) 11 0x40080000#32  -- 6.0/2.0=3.0
+-- div.d by zero: IEEE-754 Infinity, no trap (same as divS)
+#guard nextFpRegEq (step (prog1 (.divD 10#32 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0)])) 11 0x7ff00000#32  -- 1.0/0.0=+Inf
+#guard nextFpRegEq (step (prog1 (.movD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40080000#32)])) 10 0#32
+#guard nextFpRegEq (step (prog1 (.movD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40080000#32)])) 11 0x40080000#32
+
+-- ### Coprocessor 1 (FPU), double-precision: sqrt.d/abs.d/neg.d
+
+-- sqrt.d: 4.0 -> 2.0
+#guard nextFpRegEq (step (prog1 (.sqrtD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40100000#32)])) 11 0x40000000#32
+-- abs.d: -3.0 -> 3.0 (sign bit lives in the high half only)
+#guard nextFpRegEq (step (prog1 (.absD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0xc0080000#32)])) 11 0x40080000#32
+#guard nextFpRegEq (step (prog1 (.absD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0xc0080000#32)])) 10 0#32  -- low half copied unchanged
+-- neg.d: 3.0 -> -3.0; -3.0 -> 3.0
+#guard nextFpRegEq (step (prog1 (.negD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40080000#32)])) 11 0xc0080000#32
+#guard nextFpRegEq (step (prog1 (.negD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0xc0080000#32)])) 11 0x40080000#32
+
+-- ### Coprocessor 1 (FPU), double-precision: cvt.d.s/cvt.s.d/cvt.d.w/cvt.w.d
+
+-- cvt.d.s: single 1.0 (0x3f800000) -> double 1.0 (lo 0, hi 0x3ff00000)
+#guard nextFpRegEq (step (prog1 (.cvtDS 10#32 8#32)) (setFpRegs regs0 [(8, 0x3f800000#32)])) 10 0#32
+#guard nextFpRegEq (step (prog1 (.cvtDS 10#32 8#32)) (setFpRegs regs0 [(8, 0x3f800000#32)])) 11
+  0x3ff00000#32
+-- cvt.s.d: double 3.0 (lo 0, hi 0x40080000) -> single 3.0 (0x40400000)
+#guard nextFpRegEq (step (prog1 (.cvtSD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40080000#32)])) 10 0x40400000#32
+-- cvt.d.w: int bit pattern -> double value; 5 -> 5.0, -5 (0xfffffffb) -> -5.0
+#guard nextFpRegEq (step (prog1 (.cvtDW 10#32 8#32)) (setFpRegs regs0 [(8, 5#32)])) 11
+  0x40140000#32
+#guard nextFpRegEq (step (prog1 (.cvtDW 10#32 8#32)) (setFpRegs regs0 [(8, 0xfffffffb#32)])) 11
+  0xc0140000#32
+-- cvt.w.d: double value -> int bit pattern, truncating toward zero;
+-- 5.9 (lo 0x9999999a, hi 0x40179999) -> 5, -5.9 (lo 0x9999999a, hi 0xc0179999) -> -5
+#guard nextFpRegEq (step (prog1 (.cvtWD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0x9999999a#32), (9, 0x40179999#32)])) 10 0x00000005#32
+#guard nextFpRegEq (step (prog1 (.cvtWD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0x9999999a#32), (9, 0xc0179999#32)])) 10 0xfffffffb#32
+
+-- ### Coprocessor 1 (FPU), double-precision: c.eq.d/c.lt.d/c.le.d and the 7 extra predicates
+
+-- quiet double NaN = (lo 0, hi 0x7ff80000)
+#guard nextFpCondFlagEq (step (prog1 (.cEqD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- 1.0 == 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cEqD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x40000000#32)])) false  -- 1.0 != 2.0
+#guard nextFpCondFlagEq (step (prog1 (.cLtD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x40000000#32)])) true   -- 1.0 < 2.0
+#guard nextFpCondFlagEq (step (prog1 (.cLeD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- 1.0 <= 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cFD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x3ff00000#32)])) false  -- always false
+#guard nextFpCondFlagEq (step (prog1 (.cUnD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x7ff80000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- NaN vs 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cUeqD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x7ff80000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- NaN (unordered)
+#guard nextFpCondFlagEq (step (prog1 (.cOltD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x7ff80000#32), (6, 0), (7, 0x3ff00000#32)])) false  -- NaN < 1.0 is false
+#guard nextFpCondFlagEq (step (prog1 (.cUltD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x7ff80000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- NaN (unordered)
+#guard nextFpCondFlagEq (step (prog1 (.cOleD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- 1.0 <= 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cUleD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x7ff80000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- NaN (unordered)
 
 -- ### `run`: a short program that computes something and exits
 

@@ -1489,12 +1489,15 @@ consulted as ground truth for this section.
 
 ### Scope
 
-- **Single precision only.** All 32 FP registers `$f0`..`$f31` are modeled as
-  independent 32-bit registers holding a raw IEEE-754 binary32 bit pattern
-  (`State.fpRegs`). **Double precision (`.d`) is out of scope for this pass**
-  — real MIPS32 pairs adjacent `$f` registers for 64-bit doubles, which this
-  v1.x addition does not model at all. This is flagged as a documented
-  follow-up, not a silent gap.
+- **Single precision only, in this section.** All 32 FP registers
+  `$f0`..`$f31` are modeled as independent 32-bit registers holding a raw
+  IEEE-754 binary32 bit pattern (`State.fpRegs`). A v2 addition now also
+  implements a double-precision (`.d`) subset on top of this same register
+  file, pairing adjacent `$f` registers for 64-bit doubles per the classic
+  MIPS32 FR=0 convention — see the dedicated "Floating point (coprocessor 1,
+  double precision)" section immediately below this one for its scope and
+  encodings; everything in *this* section concerns the single-precision
+  instructions only.
 - **One FP condition flag, not eight.** Real MIPS32 has 8 FP condition-code
   registers (the 3-bit `cc` field in compare/branch encodings). This addition
   models only `cc = 0`, as a single `State.fpCondFlag : Bool`. Any encoding
@@ -1699,6 +1702,165 @@ internet access); they match this track's brief and are believed correct,
 but a future reader with ISA-reference access should double-check them
 before relying on this simulator's `cfc1`/`ctc1` encoding for anything
 beyond this project's own test suite.
+
+---
+
+## Floating point (coprocessor 1, double precision) — v2 addition
+
+This section documents a v2 addition: a double-precision (`.d`) subset of
+the coprocessor-1 (FPU) instruction set, built directly on top of the
+single-precision subset documented in the section immediately above (same
+`State.fpRegs` array, same `State.fpCondFlag`, same grounding note: this
+section's semantics come from the real MIPS32 architecture, not MARS).
+Ground truth: `docs/spec/MIPS-COVERAGE-GAPS.md` §3.9A, which identifies
+missing double precision as "the single biggest remaining FPU gap" (MIPS32
+compliance technically requires double precision if the FPU exists at all).
+
+### Register-pair convention (classic MIPS32 FR=0)
+
+This project's `fpRegs : Array W32` models the classic 32-bit-wide FPR file
+(FR=0 in real MIPS32's `Status.FR` terminology), the same convention the
+single-precision subset already uses. A double-precision value named `$fN`
+in assembly therefore occupies a **pair** of adjacent 32-bit FPRs:
+
+- `$fN` (the low register, the one written in assembly/encoding operand
+  position) holds the **low** 32 bits of the 64-bit IEEE-754 binary64 value.
+- `$f(N+1)` (the next register up) holds the **high** 32 bits.
+
+Real MIPS32 requires `N` to be even for double operands; this project does
+**not** check or enforce that (an odd `N` just means `$f(N+1)` is the next
+register up, same as any other register-pair arithmetic) — a documented
+simplification, not an oversight. `Step.lean`'s `doubleOfRegPair`/
+`regPairOfDouble` (public helpers) compose/decompose a `Float` to/from this
+register pair; mirrors `floatOfBits`/`bitsOfFloat`'s single-precision
+raw-bit-pattern round-trip but for Lean core's 64-bit `Float`
+(`Init.Data.Float.Float`, `Float.ofBits : UInt64 → Float` / `Float.toBits :
+Float → UInt64`, exact IEEE-754 binary64 bit-pattern round-trip — the
+64-bit analogue of `Float32.ofBits`/`Float32.toBits`).
+
+### Scope
+
+- **Implemented**: `ldc1`/`sdc1` (doubleword load/store), `add.d`/`sub.d`/
+  `mul.d`/`div.d` (arithmetic), `mov.d` (raw pair copy), `cvt.d.s`/`cvt.s.d`
+  (single↔double conversion), `cvt.d.w`/`cvt.w.d` (int↔double conversion),
+  `sqrt.d`/`abs.d`/`neg.d`, and the same 10 quiet `C.cond.d` predicates this
+  project already implements for `.s` (`c.eq.d`/`c.lt.d`/`c.le.d`/`c.f.d`/
+  `c.un.d`/`c.ueq.d`/`c.olt.d`/`c.ult.d`/`c.ole.d`/`c.ule.d`). That is every
+  instruction in this track's assigned priority list, priorities 1 through 7
+  — nothing was deliberately cut from the required/optional list itself.
+- **Not implemented** (same reasons as the single-precision section's
+  equivalent cuts, extended to `.d`):
+  - The 6 "signaling" `C.cond.D` predicates (`c.sf.d`/`c.ngle.d`/`c.seq.d`/
+    `c.ngl.d`/`c.nge.d`/`c.ngt.d`, cond numbers 8/9/10/11/13/15) — this model
+    has no FP-exception mechanism, so they would compute an identical
+    `fpCondFlag` result to their already-implemented quiet counterparts.
+  - `round.d`/`trunc.d`/`ceil.d`/`floor.d` (the directed-rounding-to-integer
+    family for doubles, the `.d` counterparts of `round.w.s`/`trunc.w.s`/
+    `ceil.w.s`/`floor.w.s`) — not in this track's assigned priority list;
+    `cvt.w.d` (truncating) is implemented, but the other three rounding
+    modes for double→int conversion are not.
+  - Multi-`cc` compares (only FP condition code 0 is modeled, same
+    simplification as the single-precision section).
+  - `cvt.l.d`/`cvt.d.l`/`cvt.l.s`/`cvt.s.l` (64-bit-integer `L` format) — out
+    of scope, no 64-bit GPR integer type exists in this project.
+  - `ldxc1`/`sdxc1`/`luxc1`/`suxc1` (indexed FPU load/store, MIPS32r2) — out
+    of scope, mirrors this project's scope for the integer side (no indexed
+    loads/stores at all).
+- **No doubleword-alignment check.** `ldc1`/`sdc1` are implemented as two
+  `readMemWord`/`writeMemWord` calls (at `addr` and `addr + 4`) rather than
+  dedicated 64-bit memory helpers, reusing `lw`/`sw`'s already-correct
+  big-endian byte-order and alignment logic. This means each 32-bit half is
+  checked for 4-byte alignment independently (`addr % 4 == 0`), **not** real
+  MIPS32's 8-byte doubleword alignment requirement (`addr % 8 == 0`) — an
+  `addr` that is a multiple of 4 but not 8 is accepted here but would fault
+  on real hardware. Documented simplification per this track's brief
+  ("prefer [two `readMemWord` calls] unless it proves awkward" — it did not
+  prove awkward, but the alignment relaxation is the direct consequence).
+- **No FP traps**, same precedent as the single-precision section:
+  divide-by-zero and invalid operations propagate IEEE-754 ±Infinity/NaN
+  naturally.
+- **`abs.d`/`neg.d` touch only the high register's sign bit.** A double's
+  sign bit is bit 63 of the 64-bit value, which lives in bit 31 of the
+  *high* register (`$fs+1`) under the register-pair convention; the low
+  register (`$fs`) is copied unchanged. Raw bit operations
+  (`&&& 0x7fffffff` / `^^^ 0x80000000` on the high half only), not `Float`
+  arithmetic, same rationale as `abs.s`/`neg.s`.
+
+### Encoding summary
+
+All double-precision instructions share opcode `0x11` (COP1); the key
+distinguishing detail is `fmt` = `D` = `0x11` for instructions whose
+*operand* is a double — **not** the same value as single-precision's
+`fmt` = `S` = `0x10`, and easy to confuse with the opcode itself (also
+`0x11`) since both happen to be the same bit pattern by coincidence.
+`cvt.d.s`/`cvt.d.w` are the one exception: per the existing `cvt.s.w`/
+`cvt.w.s` convention, a `CVT.dstfmt.srcfmt` instruction's `fmt` field names
+the *source* format, not the destination, so `cvt.d.s`'s `fmt` is `S`
+(0x10) and `cvt.d.w`'s `fmt` is `W` (0x14).
+
+| Mnemonic | Encoding | One-line semantics |
+|---|---|---|
+| `ldc1 $ft, off($rs)` | opcode 0x35 | `{$ft,$ft+1} = MEM64[$rs + off]`, raw bits |
+| `sdc1 $ft, off($rs)` | opcode 0x3d | `MEM64[$rs + off] = rawbits({$ft,$ft+1})` |
+| `add.d $fd, $fs, $ft` | opcode 0x11, fmt=`D`=0x11, funct=0x00 | `{$fd,$fd+1} = {$fs,$fs+1} + {$ft,$ft+1}` (IEEE-754) |
+| `sub.d $fd, $fs, $ft` | fmt=D, funct=0x01 | `{$fd,$fd+1} = {$fs,$fs+1} - {$ft,$ft+1}` |
+| `mul.d $fd, $fs, $ft` | fmt=D, funct=0x02 | `{$fd,$fd+1} = {$fs,$fs+1} * {$ft,$ft+1}` |
+| `div.d $fd, $fs, $ft` | fmt=D, funct=0x03 | `{$fd,$fd+1} = {$fs,$fs+1} / {$ft,$ft+1}`; `{$ft,..}=0` → ±Inf/NaN, no trap |
+| `mov.d $fd, $fs` | fmt=D, funct=0x06 | `{$fd,$fd+1} = {$fs,$fs+1}`, raw pair copy |
+| `sqrt.d $fd, $fs` | fmt=D, funct=0x04 | `{$fd,$fd+1} = sqrt({$fs,$fs+1})` (via `Float.sqrt`/`sqrt`) |
+| `abs.d $fd, $fs` | fmt=D, funct=0x05 | high half sign bit (31) cleared; low half copied; raw bit op |
+| `neg.d $fd, $fs` | fmt=D, funct=0x07 | high half sign bit (31) flipped; low half copied; raw bit op |
+| `cvt.d.s $fd, $fs` | fmt=`S`=0x10 (source fmt), funct=0x21 | `{$fd,$fd+1} = float64(float32bits($fs))`; exact |
+| `cvt.s.d $fd, $fs` | fmt=D, funct=0x20 | `$fd = float32(float64bits({$fs,$fs+1}))`; rounds, may overflow to ±Inf |
+| `cvt.d.w $fd, $fs` | fmt=`W`=0x14 (source fmt), funct=0x21 | `{$fd,$fd+1} = float64(int32bits($fs))`; exact |
+| `cvt.w.d $fd, $fs` | fmt=D, funct=0x24 | `$fd = int32bits(trunc({$fs,$fs+1}))` |
+| `c.f.d $fs, $ft` | fmt=D, funct=0x30, cc=0, cond=0 | `fpCondFlag := false` |
+| `c.un.d $fs, $ft` | fmt=D, funct=0x31, cc=0, cond=1 | `fpCondFlag := isNaN({$fs,..}) ∨ isNaN({$ft,..})` |
+| `c.eq.d $fs, $ft` | fmt=D, funct=0x32, cc=0, cond=2 | `fpCondFlag := ({$fs,..} == {$ft,..})` |
+| `c.ueq.d $fs, $ft` | fmt=D, funct=0x33, cc=0, cond=3 | `fpCondFlag := ({$fs,..} == {$ft,..}) ∨ unordered` |
+| `c.olt.d $fs, $ft` | fmt=D, funct=0x34, cc=0, cond=4 | `fpCondFlag := ¬unordered ∧ ({$fs,..} < {$ft,..})` |
+| `c.ult.d $fs, $ft` | fmt=D, funct=0x35, cc=0, cond=5 | `fpCondFlag := ({$fs,..} < {$ft,..}) ∨ unordered` |
+| `c.ole.d $fs, $ft` | fmt=D, funct=0x36, cc=0, cond=6 | `fpCondFlag := ¬unordered ∧ ({$fs,..} <= {$ft,..})` |
+| `c.ule.d $fs, $ft` | fmt=D, funct=0x37, cc=0, cond=7 | `fpCondFlag := ({$fs,..} <= {$ft,..}) ∨ unordered` |
+| `c.lt.d $fs, $ft` | fmt=D, funct=0x3c, cc=0, cond=12 | `fpCondFlag := ({$fs,..} < {$ft,..})` |
+| `c.le.d $fs, $ft` | fmt=D, funct=0x3e, cc=0, cond=14 | `fpCondFlag := ({$fs,..} <= {$ft,..})` |
+
+Field layout is identical in shape to the single-precision arithmetic/
+compare format documented in the section above (opcode(31-26)=0x11,
+`fmt`(25-21), `ft`(20-16), `fs`(15-11), `fd`(10-6), `funct`(5-0)) — only the
+`fmt` value and the register-pair interpretation of `fd`/`fs`/`ft` differ.
+`ldc1`/`sdc1` are ordinary I-type words, identical in shape to `lwc1`/
+`swc1` (opcode/`rs`=base/`rt`-position=`ft`/16-bit offset).
+
+### Worked example: `add.d` arithmetic, hand-verified against IEEE-754
+
+`Step.lean`'s test suite includes a concrete execution check verified
+against a hand-computed IEEE-754 double value (not just a round-trip): with
+`$f8/$f9` holding `1.0` (lo `0x00000000`, hi `0x3ff00000`) and `$f6/$f7`
+holding `2.0` (lo `0x00000000`, hi `0x40000000`), `add.d $f10, $f8, $f6`
+produces `$f10/$f11` = `0x00000000` / `0x40080000` — the IEEE-754 binary64
+bit pattern for `3.0` (sign 0, biased exponent `0x400` = 1024 → unbiased 1,
+mantissa `0x8...` → `1.5 × 2¹ = 3.0`), cross-checked against Python's
+`struct.pack('>d', 3.0)`.
+
+### Citation
+
+Standard MIPS32 instruction-set architecture (MD00086 §3.2, the same COP1/
+FPU chapter cited by the single-precision section above). All opcode/fmt/
+funct values above (`LDC1`/`SDC1` = 0x35/0x3d, `fmt` code `D`=0x11, and
+`funct` codes 0x00/0x01/0x02/0x03/0x04/0x05/0x06/0x07/0x20/0x21/0x24 and the
+`C.cond.D` family `0x30 | cond` with the same `cond` numbering as
+`C.cond.S` above) are the standard, invariant MIPS32 COP1 encodings. No
+internet access was used to write this section. **Explicit confidence
+notes, per this track's house rules**: the author is fully confident in
+every funct/fmt value in the table above (they follow directly from the
+well-established `C.cond.fmt`/arithmetic-format numbering already
+cross-checked for the single-precision section, with `fmt` swapped from
+`S`=0x10 to `D`=0x11, which is a standard, memorized MIPS32 ISA constant).
+The one area flagged for a future reader to double-check independently:
+the real-hardware 8-byte doubleword alignment requirement for `ldc1`/`sdc1`
+(this project only checks 4-byte alignment per half, a documented, explicit
+simplification, not an uncertain encoding value).
 
 ---
 
