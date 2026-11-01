@@ -34,6 +34,24 @@ structure State where
   `Step.lean`'s `advance`). `none` means no transfer is pending — the
   common case, and the only one `initialState` ever produces. -/
   pendingBranch : Option W32 := none
+  /-- Coprocessor 0 `Status` register. This minimal model only ever sets bit
+  1 (`EXL`, exception level) when an exception is taken (see `excCodeBp`/
+  `excCodeTr` and `exceptionVectorAddr` below); no interrupt-mask bits, mode
+  bits, or any other `Status` field are modeled. Out of scope: everything
+  else in real CP0 `Status` (IM7..IM0, BEV, ERL, KSU, UM, IE, ...). -/
+  cp0Status : W32
+  /-- Coprocessor 0 `Cause` register. This minimal model only ever writes the
+  `ExcCode` field (real MIPS32 bits 6..2) via `excCodeBp`/`excCodeTr` shifted
+  into position; all other `Cause` fields (`BD`, `CE`, `IV`, `WP`, the `IP`
+  pending-interrupt bits, ...) are out of scope and always read as whatever
+  was last written verbatim (i.e. this field is just "ExcCode << 2" with no
+  other bits ever set by this model). -/
+  cp0Cause : W32
+  /-- Coprocessor 0 `EPC` register: the address of the instruction that
+  caused the most recent exception, set on trap/`break` so a (hypothetical,
+  out-of-v1-scope) handler at `exceptionVectorAddr` could resume with `eret`.
+  `eret` itself is not modeled (no instruction reads this register back). -/
+  cp0Epc : W32
 
 /-- Reasons the simulator halts instead of producing a next state. -/
 inductive HaltReason where
@@ -87,6 +105,40 @@ def textBase : W32 := 0x00400000
 /-- Initial value of `$sp` (MARS default configuration). -/
 def spInit : W32 := 0x7fffeffc
 
+/-- MIPS32 general exception vector address, used when `Status.BEV = 0` (the
+normal, non-bootstrap case) for every exception other than TLB-refill/
+XTLB-refill/cache-error (which this v1 model has no notion of, having no
+TLB or cache) -- standard MIPS32 architecture constant (MIPS32 Architecture
+Reference Manual, Volume III: the System Control Coprocessor, "Exception
+Vector Locations" table). This is also the same v1-scope assumption already
+named in `docs/spec/INSTRUCTION-REF.md` Global rule 5's discussion of
+address-error halts ("no exception handler installed at `0x80000180`"); this
+definition makes that address a named, documented constant instead of a
+literal repeated at each exception site. -/
+def exceptionVectorAddr : W32 := 0x80000180
+
+/-- Coprocessor 0 `Cause` register `ExcCode` value for the `break`
+instruction's exception ("Bp" -- Breakpoint), per the standard MIPS32
+`Cause` register `ExcCode` field encoding (ExcCode 9). -/
+def excCodeBp : W32 := 9
+
+/-- Coprocessor 0 `Cause` register `ExcCode` value for the trap-on-condition
+family `teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu` ("Tr" -- Trap), per the standard
+MIPS32 `Cause` register `ExcCode` field encoding (ExcCode 13). All six trap
+instructions share this one `ExcCode`: real MIPS32 hardware does not
+distinguish *which* trap condition fired in `Cause` -- a handler would have
+to re-fetch and re-decode the faulting instruction word via `EPC` to tell
+them apart. That re-decoding is not modeled here (out of scope: no exception
+handler is installed in v1). -/
+def excCodeTr : W32 := 13
+
+/-- Coprocessor 0 `Status` register `EXL` (exception level) bit, as a mask
+ready to `|||` into `cp0Status`, per the standard MIPS32 `Status` register
+bit layout (bit 1). This minimal model sets it on every exception and never
+clears it (clearing is normally `eret`'s job; `eret` is out of scope for
+v1). -/
+def statusExlMask : W32 := 0x2
+
 -- ## Tests
 
 -- `mkRT`: rs=5, rt=6, rd=7, shamt=3, funct=0x20 (add)
@@ -118,7 +170,10 @@ def sampleState : State :=
     hi := 0#32
     lo := 0#32
     mem := ∅
-    out := "" }
+    out := ""
+    cp0Status := 0#32
+    cp0Cause := 0#32
+    cp0Epc := 0#32 }
 
 example : sampleState.pc = textBase := by decide
 example : sampleState.regs.size = 32 := by decide
@@ -136,3 +191,14 @@ example : (StepResult.halt HaltReason.exit) = (StepResult.halt HaltReason.exit) 
 -- `State.pendingBranch` defaults to `none` when omitted from a literal
 example : sampleState.pendingBranch = none := by decide
 #guard sampleState.pendingBranch = none
+-- CP0 fields: `sampleState` reads back the zero-initialized fields; the
+-- exception constants are distinct small values as documented.
+example : sampleState.cp0Status = 0#32 := by decide
+example : sampleState.cp0Cause = 0#32 := by decide
+example : sampleState.cp0Epc = 0#32 := by decide
+#guard sampleState.cp0Status = 0#32
+example : exceptionVectorAddr = 0x80000180#32 := by decide
+example : excCodeBp ≠ excCodeTr := by decide
+example : excCodeBp = 9#32 := by decide
+example : excCodeTr = 13#32 := by decide
+example : statusExlMask = 2#32 := by decide

@@ -17,7 +17,10 @@ MARS source diverges from the plain MIPS architecture, `docs/spec/SPEC-NOTES.md`
 §9 overrides (real MIPS32 one-delay-slot branch/jump semantics, not MARS's
 default no-delay-slot config; `div`/`divu` by zero leave `hi`/`lo` unchanged
 and do **not** halt; `lw`/`sw` offsets are sign-extended per the ISA, unlike
-MARS's latent zero-extension bug for raw-decoded binary).
+MARS's latent zero-extension bug for raw-decoded binary). The coprocessor-0
+trap/exception model (`teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu`/`break` and
+`takeException` below) is grounded in the real MIPS32 ISA instead, per
+INSTRUCTION-REF's dedicated "Coprocessor 0 / traps and exceptions" section.
 
 ## Design notes
 
@@ -127,6 +130,24 @@ private def countLeadingZeros (w : W32) : Nat :=
 exactly a run of `0`s in `~~~w`, so this reduces to `countLeadingZeros`. -/
 private def countLeadingOnes (w : W32) : Nat :=
   countLeadingZeros (~~~w)
+/-- Take a real MIPS32 exception from `s` with the given `Cause.ExcCode`
+(`excCodeBp` or `excCodeTr`; see `Types.lean`). This is the minimal
+coprocessor-0 trap model (see the module's new "## Traps / exceptions
+(coprocessor 0)" docs below and `docs/spec/INSTRUCTION-REF.md`): record the
+trapping instruction's own address in `EPC`, pack `excCode` into `Cause`'s
+`ExcCode` field (bits 6..2, i.e. `excCode <<< 2`), set `Status.EXL`, and jump
+`PC` directly to `exceptionVectorAddr`. This is a real state transition
+(`StepResult.next`), not a `HaltReason`; with no handler installed at the
+vector address in v1, the *next* `step` call will naturally hit the existing
+fetch-failure halt (`addressError`) there, giving real exception-vector
+semantics without inventing a synthetic "unhandled exception" halt reason. -/
+private def takeException (s : State) (excCode : W32) : StepResult :=
+  StepResult.next
+    { s with
+        cp0Epc := s.pc
+        cp0Cause := excCode <<< 2
+        cp0Status := s.cp0Status ||| statusExlMask
+        pc := exceptionVectorAddr }
 
 /-- Maximum number of bytes scanned by syscall 4 (`PrintString`) before
 giving up. This is a v1 simulator limitation (needed for `step` to remain a
@@ -390,6 +411,28 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
       -- no generic `ProcessingException`/`SYSCALL_EXCEPTION` halt reason, so
       -- we report it the same way as any other undecodable-in-context word.
       StepResult.halt (.illegalInstruction w)
+  -- Trap-on-condition (coprocessor-0 exception model, real MIPS32 ISA; see
+  -- `takeException` above and `docs/spec/INSTRUCTION-REF.md`). Trap-not-taken
+  -- behaves like an ordinary instruction: `mkNext s` falls through to
+  -- `pc + 4` with no CP0 state touched at all.
+  | .teq rs rt =>
+    if readReg s (regIdx rs) == readReg s (regIdx rt) then takeException s excCodeTr else mkNext s s
+  | .tne rs rt =>
+    if readReg s (regIdx rs) ≠ readReg s (regIdx rt) then takeException s excCodeTr else mkNext s s
+  | .tlt rs rt =>
+    if asSigned (readReg s (regIdx rs)) < asSigned (readReg s (regIdx rt))
+    then takeException s excCodeTr else mkNext s s
+  | .tge rs rt =>
+    if asSigned (readReg s (regIdx rs)) ≥ asSigned (readReg s (regIdx rt))
+    then takeException s excCodeTr else mkNext s s
+  | .tltu rs rt =>
+    if (readReg s (regIdx rs)).toNat < (readReg s (regIdx rt)).toNat
+    then takeException s excCodeTr else mkNext s s
+  | .tgeu rs rt =>
+    if (readReg s (regIdx rs)).toNat ≥ (readReg s (regIdx rt)).toNat
+    then takeException s excCodeTr else mkNext s s
+  -- break: unconditional trap (coprocessor-0 exception model).
+  | .break => takeException s excCodeBp
 
 /-- Execute a single instruction: fetch at `s.pc`, decode, and dispatch.
 Total: fetch/decode failure and syscall-dispatch failure all become defined
@@ -809,6 +852,79 @@ private def syscall4EmptyState : State :=
 #guard (stepState (prog1 .syscall) (setRegs regs0 [(2, 11#32), (4, 0x41#32)])).bind (fun s => some s.out)
   = some "A"
 #guard isHaltIllegal (step (prog1 .syscall) (setRegs regs0 [(2, 999#32)])) (encode .syscall)
+
+-- ### Traps / exceptions (coprocessor 0): teq/tne/tlt/tge/tltu/tgeu/break
+
+private def cp0Eq (r : StepResult) (epc cause status pc : W32) : Bool :=
+  match r with
+  | .next s => s.cp0Epc == epc && s.cp0Cause == cause && s.cp0Status == status && s.pc == pc
+  | .halt _ => false
+
+private def cp0Untouched (r : StepResult) (before : State) : Bool :=
+  match r with
+  | .next s => s.cp0Epc == before.cp0Epc && s.cp0Cause == before.cp0Cause
+                 && s.cp0Status == before.cp0Status
+  | .halt _ => false
+
+-- teq: trap-taken from `textBase` sets `EPC = textBase` (the trapping
+-- instruction's own address, not `pc + 4`), `Cause.ExcCode = excCodeTr`
+-- packed into bits 6..2 (`excCodeTr <<< 2`), `Status.EXL` (bit 1) set, and
+-- `pc = exceptionVectorAddr`.
+#guard cp0Eq (step (prog1 (.teq 8#32 9#32)) (setRegs regs0 [(8, 5#32), (9, 5#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+-- teq: trap-not-taken behaves like an ordinary instruction (falls through
+-- to `pc + 4`) and leaves all CP0 state untouched.
+#guard nextPcEq (step (prog1 (.teq 8#32 9#32)) (setRegs regs0 [(8, 5#32), (9, 6#32)]))
+  (textBase + 4#32)
+#guard cp0Untouched (step (prog1 (.teq 8#32 9#32)) (setRegs regs0 [(8, 5#32), (9, 6#32)])) regs0
+
+-- tne: trap on not-equal (opposite condition from teq)
+#guard cp0Eq (step (prog1 (.tne 8#32 9#32)) (setRegs regs0 [(8, 5#32), (9, 6#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+#guard isNext (step (prog1 (.tne 8#32 9#32)) (setRegs regs0 [(8, 5#32), (9, 5#32)]))
+
+-- tlt/tge: signed comparison (negative `$rs` is less than positive `$rt`)
+#guard cp0Eq (step (prog1 (.tlt 8#32 9#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 1#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr  -- -1 < 1
+#guard isNext (step (prog1 (.tlt 8#32 9#32)) (setRegs regs0 [(8, 1#32), (9, 0xffffffff#32)]))  -- 1 < -1 false
+#guard cp0Eq (step (prog1 (.tge 8#32 9#32)) (setRegs regs0 [(8, 1#32), (9, 0xffffffff#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr  -- 1 >= -1
+#guard isNext (step (prog1 (.tge 8#32 9#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 1#32)]))  -- -1 >= 1 false
+
+-- tltu/tgeu: unsigned comparison (0xffffffff is the largest unsigned value,
+-- so it is never `<u` anything and always `>=u` everything)
+#guard isNext (step (prog1 (.tltu 8#32 9#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 1#32)]))
+#guard cp0Eq (step (prog1 (.tgeu 8#32 9#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 1#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+
+-- break: unconditional trap, distinct `ExcCode` (`excCodeBp` ≠ `excCodeTr`)
+-- from the same starting state/address as the teq case above.
+#guard excCodeBp ≠ excCodeTr
+#guard cp0Eq (step (prog1 .break) regs0)
+  textBase (excCodeBp <<< 2) statusExlMask exceptionVectorAddr
+
+-- a second trap from a nonzero `pc` records that instruction's own address
+-- in `EPC`, not `textBase`/`pc + 4`.
+private def trapAtState : State := { regs0 with pc := textBase + 0x100#32 }
+#guard cp0Eq (step (progAt (textBase + 0x100#32) .break) trapAtState)
+  (textBase + 0x100#32) (excCodeBp <<< 2) statusExlMask exceptionVectorAddr
+
+-- exception-vector mechanism "for free": with no handler installed at
+-- `exceptionVectorAddr`, the *next* `step` call from the post-trap state
+-- naturally hits the existing fetch-failure halt (no instruction recorded
+-- there) -- this is `step`'s ordinary `addressError`, not a synthetic
+-- "unhandled exception" halt reason.
+#guard (match stepState (prog1 .break) regs0 with
+        | some s' => isHaltAddr (step (∅ : Program) s') exceptionVectorAddr
+        | none => false)
+
+-- if a real handler word *is* present at the vector address, it executes
+-- normally after the trap (e.g. an `addi` landing there).
+private def vectorHandlerProg : Program :=
+  (prog1 .break).insert exceptionVectorAddr (encode (.addi 0#32 8#32 42#32))
+#guard (match stepState vectorHandlerProg regs0 with
+        | some s' => nextRegEq (step vectorHandlerProg s') 8 42#32
+        | none => false)
 
 -- ### Undecodable word → illegalInstruction
 

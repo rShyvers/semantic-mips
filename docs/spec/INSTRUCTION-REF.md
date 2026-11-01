@@ -12,6 +12,12 @@ near the end of this document) adds six more real MIPS32/MIPS32r2 integer
 instructions (`movn`, `movz`, `clo`, `clz`, `seb`, `seh`) beyond the original
 v1 subset. Those six are grounded directly in the standard MIPS32 ISA rather
 than the MARS source (see that section's header note for why).
+On top of that MARS-grounded v1 set, a minimal coprocessor-0 trap/exception
+model has since been added (`teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu`/`break`,
+plus `cp0Status`/`cp0Cause`/`cp0Epc`). That addition is grounded in the real
+MIPS32 ISA, not MARS — see the dedicated
+["Coprocessor 0 / traps and exceptions"](#coprocessor-0--traps-and-exceptions-real-mips32-isa)
+section below, which is explicit about this difference in sourcing.
 
 Conventions pinned elsewhere and assumed here (see
 [`SPEC-NOTES.md`](SPEC-NOTES.md)): one real-MIPS32 branch delay slot per
@@ -75,6 +81,13 @@ execution logic (method `populate()`, lines 77–3236).
 | syscall 4 | — | print null-terminated byte string starting at address `$a0` |
 | syscall 10 | — | terminate program normally |
 | syscall 11 | — | print low byte of `$a0` as a character |
+| `teq` | R | `if ($rs == $rt) trap` |
+| `tne` | R | `if ($rs != $rt) trap` |
+| `tlt` | R | `if ($rs < $rt) trap`, signed |
+| `tge` | R | `if ($rs >= $rt) trap`, signed |
+| `tltu` | R | `if ($rs < $rt) trap`, unsigned |
+| `tgeu` | R | `if ($rs >= $rt) trap`, unsigned |
+| `break` | R | unconditional trap |
 
 `PC_next` denotes the program counter value *after* the fetched instruction
 has been accounted for, i.e. `PC_at_fetch + 4` — see Global rule 1.
@@ -907,6 +920,135 @@ convention: `$v0` = service number, `$a0` = register 4 (first argument).
   (entire file, ~15 lines of logic).
 
 ---
+
+## Coprocessor 0 / traps and exceptions (real MIPS32 ISA)
+
+Everything above this section is grounded in the vendored MARS 4.5 source
+(`vendor/mars-src/`), per the module header. This section is different: it
+documents a small, deliberately minimal **addition** on top of the v1 set —
+`teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu` (trap-on-condition) and `break`
+(unconditional trap), plus the coprocessor-0 state and exception-vector
+mechanism they use. Per this track's process requirements, these are
+ground-truthed against the **real MIPS32 architecture** (the actual ISA, as
+commonly documented in "MIPS32 Architecture For Programmers, Volume II-A:
+The MIPS32 Instruction Set" and "Volume III: The MIPS32 Privileged Resource
+Architecture" / System Control Coprocessor), not against MARS, which was
+only ever meant as a differential-testing oracle for this project and does
+not model exceptions realistically (MARS's own exception handling is a
+Java-exception-based simulation shortcut, not a model of real CP0 register
+state). No internet access was available while writing this section; every
+encoding/field value below is the standard, commonly documented MIPS32
+value, called out explicitly rather than silently guessed. If any value
+here is later found to disagree with the written ISA spec, this paragraph
+is the place to correct it.
+
+### Coprocessor 0 state modeled (and what is deliberately out of scope)
+
+This is a **minimal** CP0 model: three registers, not the full coprocessor.
+
+| Field (on `State`) | Real MIPS32 register | Modeled behavior |
+|---|---|---|
+| `cp0Status` | `Status` (CP0 register 12) | Only bit 1 (`EXL`, exception level) is ever set, on any exception; no other bit (`IE`, `ERL`, `KSU`, `UM`, `BEV`, `IM7..IM0`, ...) is modeled. Initialized to `0`. |
+| `cp0Cause` | `Cause` (CP0 register 13) | Only the `ExcCode` field (bits 6..2) is ever written, as `excCode <<< 2`; no other field (`BD`, `CE`, `IV`, `WP`, the `IP` pending-interrupt bits, ...) is modeled. Initialized to `0`. |
+| `cp0Epc` | `EPC` (CP0 register 14) | Set to the trapping instruction's own address (`pc` at the time of the trap/`break`, *not* `pc + 4`) on every exception. Initialized to `0`. |
+
+**Explicitly out of scope** (documented here rather than silently omitted,
+per this track's process requirements): every other CP0 register (`Index`,
+`Random`, `EntryLo0/1`, `Context`, `PageMask`, `Wired`, `BadVAddr`, `Count`,
+`EntryHi`, `Compare`, `Config0-7`, `PRId`, `EBase`, ...), the full `Status`/
+`Cause` bitfields beyond `EXL`/`ExcCode`, interrupts (hardware or software),
+TLB/MMU behavior, `eret` (there is no way to leave exception level once
+entered — `EXL` is set and never cleared), and any notion of kernel/user
+mode. This model answers exactly one question: "did a trap/`break` fire,
+and where did control transfer to" — nothing more.
+
+### Exception mechanism (shared by all seven new instructions)
+
+On any trap condition being met, or on executing `break` (always): this is
+a **real state transition**, not a `HaltReason` — `step` returns
+`StepResult.next`, matching real MIPS32 hardware's exception-taken behavior
+(control transfers to the handler; the machine keeps running). Concretely,
+from the trapping/`break` instruction's state `s`:
+
+1. `cp0Epc := s.pc` — the address of the trapping instruction *itself*.
+   Real MIPS32 hardware would instead write `PC - 4` if the faulting
+   instruction were in a branch delay slot (and set `Cause.BD`); this v1
+   dialect has no delay slots at all (`SPEC-NOTES.md` §3/§9.1), so that
+   case cannot arise and `EPC = s.pc` unconditionally is exactly correct.
+2. `cp0Cause := excCode <<< 2` — `excCode` packed into the `ExcCode` field
+   position (bits 6..2 of the real `Cause` register). Two `excCode` values
+   are used, one per exception type as required: `excCodeBp = 9` ("Bp" —
+   Breakpoint, for `break`) and `excCodeTr = 13` ("Tr" — Trap, for all six
+   `t*` instructions). Both are the standard MIPS32 `Cause.ExcCode` encoding
+   values for these exception classes. Note real MIPS32 hardware does
+   *not* distinguish *which* of the six trap conditions fired in `Cause` —
+   a handler would have to re-decode the instruction word at `EPC` for
+   that, which this model does not need since it has no handler.
+3. `cp0Status := s.cp0Status ||| statusExlMask` — bit 1 (`EXL`) set,
+   preserving (OR-ing into) whatever was already there, matching real
+   hardware's behavior of never clearing unrelated `Status` bits on
+   exception entry.
+4. `pc := exceptionVectorAddr`, defined as `0x80000180` — the MIPS32
+   **general exception vector** (used whenever `Status.BEV = 0`, i.e. the
+   normal non-bootstrap case, for every exception other than TLB-refill/
+   XTLB-refill/cache-error, none of which this model has any notion of).
+   This same address is already referenced informally in Global rule 5
+   above ("no exception handler installed at `0x80000180`"); this track
+   promotes it to a named, documented constant (`Types.lean`) shared by
+   every exception site instead of a repeated literal.
+
+Deliberately **not** added: a synthetic "unhandled exception"/"no handler
+installed" `HaltReason`. Since this v1 dialect never installs anything at
+`exceptionVectorAddr`, the very next `step` call after a trap/`break`
+naturally re-enters the existing fetch path at that address and hits one of
+`step`'s pre-existing, already-documented halts: `addressError` (no
+instruction recorded there — the expected case for every test program that
+doesn't deliberately install a handler) or `illegalInstruction` (if some
+word happens to be recorded there but doesn't decode). This gives real
+exception-vector semantics for free, without inventing a new halt variant —
+and conversely, if a test program *does* install a real handler at
+`exceptionVectorAddr`, that handler executes completely normally, since it
+is just ordinary code at an ordinary (if high) address.
+
+### teq / tne / tlt / tge / tltu / tgeu (R, trap-on-condition)
+
+- **Encoding**: `opcode=000000`. Fields: `000000 sssss ttttt ----- ----- ffffff`
+  → `rs=sssss`, `rt=ttttt`; `rd`/`shamt` unused (always 0), same shape as
+  `mult`/`div`. `funct` per mnemonic, the standard MIPS32 SPECIAL-opcode trap
+  family: `teq` = `0x34`, `tne` = `0x36`, `tlt` = `0x32`, `tge` = `0x30`,
+  `tltu` = `0x33`, `tgeu` = `0x31`. (Funct `0x35`, between `teq` and `tne`,
+  is reserved/unused in the real ISA — no mnemonic maps to it.) These are
+  the standard MIPS32 values as commonly documented; cited here per this
+  track's requirement to state the source plainly rather than guess
+  silently.
+- **Semantics**: evaluate the named condition on `$rs`/`$rt` — `teq`:
+  `$rs == $rt`; `tne`: `$rs != $rt`; `tlt`: `$rs <s $rt` (signed); `tge`:
+  `$rs >=s $rt` (signed); `tltu`: `$rs <u $rt` (unsigned); `tgeu`:
+  `$rs >=u $rt` (unsigned). If the condition holds, take the exception
+  described above with `excCode = excCodeTr`. If the condition does not
+  hold, the instruction is a complete no-op other than the ordinary
+  fall-through to `pc + 4` — no CP0 state is touched at all.
+- **Errors/halts**: none beyond the exception transition itself (which is
+  `StepResult.next`, not a halt).
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  MARS does implement this family in its own `InstructionSet.java`, but per
+  this track's process requirements the ground truth cited here is the real
+  MIPS32 ISA, not MARS's implementation of it.
+
+### break (R, unconditional trap)
+
+- **Encoding**: `opcode=000000`, `funct=001101` (0x0d) — the funct value
+  immediately after `syscall`'s `0x0c`. Fields: all zero in this model
+  (`000000 00000 00000 00000 00000 001101`). Real MIPS32 `break` has an
+  optional 20-bit "code" field packed into bits 25..6, purely a
+  software-visible hint (e.g. distinguishing different breakpoint call
+  sites) with no architecturally-defined effect on the exception itself —
+  deliberately out of scope here, so `break`'s only field-level difference
+  from `syscall` is its `funct` value.
+- **Semantics**: unconditionally takes the exception described above, with
+  `excCode = excCodeBp`.
+- **Errors/halts**: none beyond the exception transition itself.
+- **MARS note**: not applicable, as for the trap family above.
 
 ## Flagged MARS deviations (summary)
 

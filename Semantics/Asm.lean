@@ -24,6 +24,12 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   `movn`/`movz` (fit the `rd, rs, rt` R-type shape exactly, table-driven like
   `add`), and `clo`/`clz`/`seb`/`seh` (SPECIAL2/SPECIAL3 opcodes, hand-encoded
   below since they don't fit any existing `RForm`).
+  funct = 0x0c, i.e. word `0x0000000C`).
+- The coprocessor-0 trap/exception family (real MIPS32 ISA, added on top of
+  the original v1 set — see `docs/spec/INSTRUCTION-REF.md`): `teq`/`tne`/
+  `tlt`/`tge`/`tltu`/`tgeu` (`rs, rt` operands, same shape as `mult`/`div`),
+  and `break` (zero operands, like `syscall`; funct = 0x0d, word
+  `0x0000000D`).
 - Pseudo-ops: `li`, `la` (label only — see deviation note below), `move`,
   `nop`, expanded per `vendor/mars-src/PseudoOps.txt`.
 - Register names `$zero,$at,$v0,$v1,$a0..$a3,$t0..$t7,$s0..$s7,$t8,$t9,
@@ -296,7 +302,12 @@ private def rTable : List (String × Nat × RForm) :=
    ("movn", 0x0b, .arith3), ("movz", 0x0a, .arith3),  -- MIPS32r2; same opcode-0 `rd, rs, rt` shape as `add`
    ("sll", 0x00, .shift), ("srl", 0x02, .shift), ("sra", 0x03, .shift),
    ("mult", 0x18, .multdiv), ("multu", 0x19, .multdiv), ("div", 0x1a, .multdiv), ("divu", 0x1b, .multdiv),
-   ("mfhi", 0x10, .hilo), ("mflo", 0x12, .hilo)]
+   ("mfhi", 0x10, .hilo), ("mflo", 0x12, .hilo),
+   -- Trap-on-condition family (same `rs, rt` shape as `mult`/`div`): real
+   -- MIPS32 SPECIAL-opcode funct values (see `Instruction.lean`/
+   -- `docs/spec/INSTRUCTION-REF.md`), not MARS-derived.
+   ("teq", 0x34, .multdiv), ("tne", 0x36, .multdiv), ("tlt", 0x32, .multdiv),
+   ("tge", 0x30, .multdiv), ("tltu", 0x33, .multdiv), ("tgeu", 0x31, .multdiv)]
 
 /-- Static table of I-type mnemonics: (name, opcode, form). -/
 private def iTable : List (String × Nat × IForm) :=
@@ -313,7 +324,11 @@ private def jTable : List (String × Nat) := [("j", 0x02), ("jal", 0x03)]
 private def bTable : List (String × Nat × BForm) :=
   [("beq", 0x04, .two), ("bne", 0x05, .two), ("blez", 0x06, .one), ("bgtz", 0x07, .one)]
 
-private def pseudoSet : List String := ["li", "la", "move", "nop", "syscall"]
+-- `break` is a real instruction, not a pseudo-op, but it is zero-operand
+-- (like `syscall`) rather than fitting any `RForm` with register operands,
+-- so it is special-cased alongside `syscall` the same way throughout this
+-- file (`isKnownMnemonic`, `wordsForMnemonic`, `encodeInstruction`).
+private def pseudoSet : List String := ["li", "la", "move", "nop", "syscall", "break"]
 private def directiveSet : List String := [".text", ".data", ".word", ".half", ".byte", ".asciiz", ".space"]
 
 /-- SPECIAL2/SPECIAL3 mnemonics with an opcode-bearing R-type-like shape that
@@ -450,6 +465,10 @@ private def wordsForMnemonic (mnemonic : String) (operands : List String) (lineN
     match operands with
     | [] => pure 1
     | _ => throw (.badOperand s!"syscall takes no operands" lineNo)
+  | "break" =>
+    match operands with
+    | [] => pure 1
+    | _ => throw (.badOperand s!"break takes no operands" lineNo)
   | _ => pure 1
 
 private def layoutLine (s : LState) (pl : ParsedLine) : Except AsmError LState := do
@@ -704,6 +723,10 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
         let rt ← parseRegister rtT item.lineNo
         pure [opRtWord 0x1f 0 rt rd 0x18 0x20]
     | _ => throw (.badOperand s!"seh expects 'rd, rt'" item.lineNo)
+  | "break" =>
+    match item.operands with
+    | [] => pure [0x0000000D#32]              -- all fields zero except funct = 0x0d
+    | _ => throw (.badOperand s!"break takes no operands" item.lineNo)
   | _ => throw (.unknownMnemonic s!"unknown mnemonic '{name}'" item.lineNo)
 
 private def applyItem (labels : Std.HashMap String W32) (prog : Program) (item : RawItem) :
@@ -913,6 +936,39 @@ def sebSehProg : Program :=
 #guard sebSehProg.getD (textBase + 4#32) 0 = (natToW32 0x1f <<< 26) ||| mkRT (0#32) (9#32) (8#32) (0x18#32) (0x20#32)
 #guard decode (sebSehProg.getD textBase 0) = some (.seb 8#32 9#32)
 #guard decode (sebSehProg.getD (textBase + 4#32) 0) = some (.seh 8#32 9#32)
+-- `break`: zero operands, all fields zero except funct = 0x0d (0x0000000D);
+-- real MIPS32 encoding (the funct value immediately after `syscall`'s
+-- 0x0c) -- see `Instruction.lean`'s `encode .break`.
+def breakSrc : String := "break\n"
+def breakProg : Program :=
+  match assemble breakSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard breakProg.getD textBase 0 = 0x0000000D#32
+#guard decode (breakProg.getD textBase 0) = some .break
+#guard (assemble "break $t0\n").isOk = false
+
+-- trap-on-condition family: `rs, rt` operands, same shape as `mult`/`div`.
+def trapSrc : String := "teq $t0, $t1\ntne $t0, $t1\ntlt $t0, $t1\ntge $t0, $t1\ntltu $t0, $t1\ntgeu $t0, $t1\n"
+def trapProg : Program :=
+  match assemble trapSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard trapProg.getD textBase 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x34#32)
+#guard decode (trapProg.getD textBase 0) = some (.teq 8#32 9#32)
+#guard trapProg.getD (textBase + 4#32) 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x36#32)
+#guard decode (trapProg.getD (textBase + 4#32) 0) = some (.tne 8#32 9#32)
+#guard trapProg.getD (textBase + 8#32) 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x32#32)
+#guard decode (trapProg.getD (textBase + 8#32) 0) = some (.tlt 8#32 9#32)
+#guard trapProg.getD (textBase + 12#32) 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x30#32)
+#guard decode (trapProg.getD (textBase + 12#32) 0) = some (.tge 8#32 9#32)
+#guard trapProg.getD (textBase + 16#32) 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x33#32)
+#guard decode (trapProg.getD (textBase + 16#32) 0) = some (.tltu 8#32 9#32)
+#guard trapProg.getD (textBase + 20#32) 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x31#32)
+#guard decode (trapProg.getD (textBase + 20#32) 0) = some (.tgeu 8#32 9#32)
+#guard (assemble "teq $t0\n").isOk = false
 
 -- One error case per major `AsmError` kind.
 #guard (assemble "frobnicate $t0, $t1\n").isOk = false

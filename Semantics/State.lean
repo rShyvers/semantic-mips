@@ -15,7 +15,9 @@ Depends only on the foundation (`Word`, `Types`); read-only there.
 
 /-- The initial machine state at program counter `pc`: all general-purpose
 registers are `0` except `$sp` (register 29), which is seeded with `spInit`;
-`hi`/`lo` are `0`; memory is empty; accumulated output is empty. -/
+`hi`/`lo` are `0`; memory is empty; accumulated output is empty; the three
+modeled coprocessor-0 registers (`cp0Status`, `cp0Cause`, `cp0Epc`) are all
+`0` (no exception has occurred yet). -/
 def initialState (pc : W32) : State :=
   { pc := pc
     regs := (Array.replicate 32 (0#32)).set! 29 spInit
@@ -23,7 +25,10 @@ def initialState (pc : W32) : State :=
     lo := 0#32
     mem := ∅
     out := ""
-    pendingBranch := none }
+    pendingBranch := none
+    cp0Status := 0#32
+    cp0Cause := 0#32
+    cp0Epc := 0#32 }
 
 /-- Read general-purpose register `i`. Register `0` (`$zero`) always reads as
 `0` by construction of `initialState`/`writeReg`, but this also tolerates any
@@ -200,3 +205,9 @@ example : writeMemHalf (initialState textBase) 0x10010001#32 0x1234#32 = none :=
 example : writeMemWord (initialState textBase) 0x10010001#32 0x12345678#32 = none := by decide
 #guard writeMemHalf (initialState textBase) 0x10010001#32 0x1234#32 = none
 #guard writeMemWord (initialState textBase) 0x10010001#32 0x12345678#32 = none
+
+-- `initialState`: CP0 registers all start zero (no exception has occurred)
+example : (initialState textBase).cp0Status = 0#32 := by decide
+example : (initialState textBase).cp0Cause = 0#32 := by decide
+example : (initialState textBase).cp0Epc = 0#32 := by decide
+#guard (initialState textBase).cp0Status = 0#32
