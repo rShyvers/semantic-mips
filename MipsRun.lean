@@ -114,13 +114,21 @@ def renderAsmError (e : AsmError) : String :=
   | .duplicateLabel msg line => s!"duplicate label: {msg} (line {line})"
 
 /-- Render a `HaltReason` as the `halt_reason` string: the two payload-carrying
-cases append the word/address in hex, per the issue's output contract. -/
+cases append the word/address in hex, per the issue's output contract.
+
+`branchInDelaySlot` is a MipsRun-specific extension beyond the issue's
+enumerated `halt_reason` list (`"exit" | "illegal_instruction" |
+"address_error" | "arithmetic_overflow"`): the issue was written before the
+real MIPS32 branch-delay-slot work (and its `HaltReason.branchInDelaySlot`
+constructor) landed. It carries no payload, so — like `exit`/
+`arithmeticOverflow` — it renders as a plain string with no hex suffix. -/
 def renderHaltReason (r : HaltReason) : String :=
   match r with
   | .exit => "exit"
   | .illegalInstruction w => s!"illegal_instruction:0x{toHexDigits w}"
   | .addressError a => s!"address_error:0x{toHexDigits a}"
   | .arithmeticOverflow => "arithmetic_overflow"
+  | .branchInDelaySlot => "branch_in_delay_slot"
 
 /-- The full success-path JSON object (`assembled: true`), for either a
 `halted` or `limitReached` `RunResult`. -/
@@ -228,10 +236,24 @@ private def illegalInstrResult : RunResult :=
 
 /-- Step-limit-exhausted: an unconditional self-jump never halts, so a small
 fuel budget is exhausted (kept small here for test speed; `main` itself
-uses the full `1_000_000`-step budget). -/
+uses the full `1_000_000`-step budget).
+
+Includes an explicit `nop` delay-slot instruction after the `j`: real MIPS32
+branches/jumps never transfer control immediately (SPEC-NOTES §9 item 1) --
+`j main`'s own step falls through to `pc + 4` and only *schedules* `main` as
+the target (`State.pendingBranch`), which is committed by whichever
+instruction retires next. Without a delay-slot instruction physically
+present at `pc + 4`, that next fetch has nothing to read (this program's
+only assembled word is the `j` itself) and the run halts on `addressError`
+after 2 steps instead of ever reaching the step limit. The `nop` fills that
+slot so the loop is genuinely infinite (2 steps per iteration: the `j`, then
+its delay slot, which is where the jump actually lands), matching this
+test's intent of exercising the step-limit/`"halted": false` path -- it
+still runs for exactly `maxSteps` steps since it never halts on its own. -/
 private def infiniteLoopSrc : String :=
 "main:\n" ++
-"    j main\n"
+"    j main\n" ++
+"    nop\n"
 
 private def infiniteLoopResult : RunResult :=
   match assemble infiniteLoopSrc with
