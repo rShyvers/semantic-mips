@@ -45,9 +45,11 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   `rt, offset(rs)` shape and parsing to `lw`/`sw`, table-driven the same way
   (opcodes 0x30/0x38).
 - Coprocessor-1 (FPU) single-precision subset (docs/spec/INSTRUCTION-REF.md's
-  floating-point section): `mtc1`/`mfc1`, `lwc1`/`swc1`, `add.s`/`sub.s`/
-  `mul.s`/`div.s`, `mov.s`, `cvt.s.w`/`cvt.w.s`, `c.eq.s`/`c.lt.s`/`c.le.s`,
-  `bc1t`/`bc1f`.
+  floating-point section): `mtc1`/`mfc1`, `cfc1`/`ctc1`, `lwc1`/`swc1`,
+  `add.s`/`sub.s`/`mul.s`/`div.s`, `mov.s`, `sqrt.s`/`abs.s`/`neg.s`,
+  `round.w.s`/`trunc.w.s`/`ceil.w.s`/`floor.w.s`, `cvt.s.w`/`cvt.w.s`,
+  `c.eq.s`/`c.lt.s`/`c.le.s`/`c.f.s`/`c.un.s`/`c.ueq.s`/`c.olt.s`/`c.ult.s`/
+  `c.ole.s`/`c.ule.s`, `bc1t`/`bc1f`.
 - Pseudo-ops: `li`, `la` (label only — see deviation note below), `move`,
   `nop`, expanded per `vendor/mars-src/PseudoOps.txt`.
 - Register names `$zero,$at,$v0,$v1,$a0..$a3,$t0..$t7,$s0..$s7,$t8,$t9,
@@ -380,22 +382,32 @@ carried directly in the constructor — see `cop1Table` and
 `docs/spec/INSTRUCTION-REF.md`'s floating-point section for the exact
 encodings (same values as `Instruction.lean`'s `encode`). -/
 private inductive Cop1Form
-  | moveGpFp (fmt : Nat)        -- mtc1 ($rt,$fs; fmt=4) / mfc1 ($rt,$fs; fmt=0)
+  | moveGpFp (fmt : Nat)        -- mtc1 ($rt,$fs; fmt=4) / mfc1 ($rt,$fs; fmt=0) /
+                                -- ctc1 ($rt,$fs; fmt=CT=6) / cfc1 ($rt,$fs; fmt=CF=2)
   | mem (opcode : Nat)          -- lwc1 ($ft, offset($rs); 0x31) / swc1 (0x39)
   | arith3 (fmt funct : Nat)    -- add.s/sub.s/mul.s/div.s: $fd, $fs, $ft
-  | unary (fmt funct : Nat)     -- mov.s/cvt.s.w/cvt.w.s: $fd, $fs
-  | compare (funct : Nat)       -- c.eq.s/c.lt.s/c.le.s: $fs, $ft (fmt always S)
+  | unary (fmt funct : Nat)     -- mov.s/cvt.s.w/cvt.w.s/sqrt.s/abs.s/neg.s/
+                                -- round.w.s/trunc.w.s/ceil.w.s/floor.w.s: $fd, $fs
+  | compare (funct : Nat)       -- c.eq.s/c.lt.s/c.le.s/c.f.s/c.un.s/c.ueq.s/
+                                -- c.olt.s/c.ult.s/c.ole.s/c.ule.s: $fs, $ft (fmt always S)
   | branch (tf : Nat)           -- bc1t (tf=1) / bc1f (tf=0): target
 
 /-- Static table of coprocessor-1 (FPU) mnemonics: (name, form). -/
 private def cop1Table : List (String × Cop1Form) :=
   [("mtc1", .moveGpFp 4), ("mfc1", .moveGpFp 0),
+   ("cfc1", .moveGpFp 2), ("ctc1", .moveGpFp 6),
    ("lwc1", .mem 0x31), ("swc1", .mem 0x39),
    ("add.s", .arith3 0x10 0x00), ("sub.s", .arith3 0x10 0x01),
    ("mul.s", .arith3 0x10 0x02), ("div.s", .arith3 0x10 0x03),
    ("mov.s", .unary 0x10 0x06),
+   ("sqrt.s", .unary 0x10 0x04), ("abs.s", .unary 0x10 0x05), ("neg.s", .unary 0x10 0x07),
+   ("round.w.s", .unary 0x10 0x0c), ("trunc.w.s", .unary 0x10 0x0d),
+   ("ceil.w.s", .unary 0x10 0x0e), ("floor.w.s", .unary 0x10 0x0f),
    ("cvt.s.w", .unary 0x14 0x20), ("cvt.w.s", .unary 0x10 0x24),
    ("c.eq.s", .compare 0x32), ("c.lt.s", .compare 0x3c), ("c.le.s", .compare 0x3e),
+   ("c.f.s", .compare 0x30), ("c.un.s", .compare 0x31), ("c.ueq.s", .compare 0x33),
+   ("c.olt.s", .compare 0x34), ("c.ult.s", .compare 0x35),
+   ("c.ole.s", .compare 0x36), ("c.ule.s", .compare 0x37),
    ("bc1t", .branch 1), ("bc1f", .branch 0)]
 
 -- `break` is a real instruction, not a pseudo-op, but it is zero-operand
@@ -1258,7 +1270,23 @@ def cop1Src : String :=
 "c.lt.s $f7, $f6\n" ++
 "c.le.s $f7, $f6\n" ++
 "loop: bc1t loop\n" ++
-"bc1f loop\n"
+"bc1f loop\n" ++
+"cfc1 $t0, $f31\n" ++
+"ctc1 $t0, $f31\n" ++
+"sqrt.s $f8, $f7\n" ++
+"abs.s $f8, $f7\n" ++
+"neg.s $f8, $f7\n" ++
+"round.w.s $f8, $f7\n" ++
+"trunc.w.s $f8, $f7\n" ++
+"ceil.w.s $f8, $f7\n" ++
+"floor.w.s $f8, $f7\n" ++
+"c.f.s $f7, $f6\n" ++
+"c.un.s $f7, $f6\n" ++
+"c.ueq.s $f7, $f6\n" ++
+"c.olt.s $f7, $f6\n" ++
+"c.ult.s $f7, $f6\n" ++
+"c.ole.s $f7, $f6\n" ++
+"c.ule.s $f7, $f6\n"
 
 def cop1Prog : Program :=
   match assemble cop1Src with
@@ -1292,6 +1320,29 @@ def cop1Prog : Program :=
 -- sign-extended offset value, per `Instruction.lean`'s "raw field" convention
 -- (same as `beq`/`bne`'s `imm`); -1 as that raw 16-bit field is 0xffff.
 #guard decode (cop1Prog.getD (textBase + 56#32) 0) = some (.bc1t 0xffff#32)
+-- v1.x addition mnemonics appended after `bc1f loop` (textBase+64 onward,
+-- unlabeled so earlier addresses/offsets above are unaffected)
+#guard cop1Prog.getD (textBase + 64#32) 0 = encode (.cfc1 8#32 31#32)
+#guard cop1Prog.getD (textBase + 68#32) 0 = encode (.ctc1 8#32 31#32)
+#guard cop1Prog.getD (textBase + 72#32) 0 = encode (.sqrtS 8#32 7#32)
+#guard cop1Prog.getD (textBase + 76#32) 0 = encode (.absS 8#32 7#32)
+#guard cop1Prog.getD (textBase + 80#32) 0 = encode (.negS 8#32 7#32)
+#guard cop1Prog.getD (textBase + 84#32) 0 = encode (.roundWS 8#32 7#32)
+#guard cop1Prog.getD (textBase + 88#32) 0 = encode (.truncWS 8#32 7#32)
+#guard cop1Prog.getD (textBase + 92#32) 0 = encode (.ceilWS 8#32 7#32)
+#guard cop1Prog.getD (textBase + 96#32) 0 = encode (.floorWS 8#32 7#32)
+#guard cop1Prog.getD (textBase + 100#32) 0 = encode (.cFS 7#32 6#32)
+#guard cop1Prog.getD (textBase + 104#32) 0 = encode (.cUnS 7#32 6#32)
+#guard cop1Prog.getD (textBase + 108#32) 0 = encode (.cUeqS 7#32 6#32)
+#guard cop1Prog.getD (textBase + 112#32) 0 = encode (.cOltS 7#32 6#32)
+#guard cop1Prog.getD (textBase + 116#32) 0 = encode (.cUltS 7#32 6#32)
+#guard cop1Prog.getD (textBase + 120#32) 0 = encode (.cOleS 7#32 6#32)
+#guard cop1Prog.getD (textBase + 124#32) 0 = encode (.cUleS 7#32 6#32)
+-- a couple of the new words also round-trip through `decode`
+#guard decode (cop1Prog.getD (textBase + 64#32) 0) = some (.cfc1 8#32 31#32)
+#guard decode (cop1Prog.getD (textBase + 72#32) 0) = some (.sqrtS 8#32 7#32)
+#guard decode (cop1Prog.getD (textBase + 100#32) 0) = some (.cFS 7#32 6#32)
+
 -- an unknown `$f` register is a `badRegister` error
 #guard (assemble "mov.s $f8, $f32\n").isOk = false
 

@@ -217,6 +217,23 @@ pins. -/
 private def intBitsOfFloatTrunc (f : Float32) : W32 :=
   f.toInt32.toBitVec
 
+/-- `round.w.s`'s numeric conversion: round `f` to the nearest integer via
+Lean core's `Float32.round` (`roundf`, ties away from zero \u2014 see
+`Instruction.roundWS`'s docstring for why this isn't ties-to-even), then
+clamp/convert to `Int32` the same way `intBitsOfFloatTrunc` does. -/
+private def intBitsOfFloatRound (f : Float32) : W32 :=
+  f.round.toInt32.toBitVec
+
+/-- `ceil.w.s`'s numeric conversion: round `f` toward +Infinity
+(`Float32.ceil`, `ceilf`), then clamp/convert to `Int32`. -/
+private def intBitsOfFloatCeil (f : Float32) : W32 :=
+  f.ceil.toInt32.toBitVec
+
+/-- `floor.w.s`'s numeric conversion: round `f` toward -Infinity
+(`Float32.floor`, `floorf`), then clamp/convert to `Int32`. -/
+private def intBitsOfFloatFloor (f : Float32) : W32 :=
+  f.floor.toInt32.toBitVec
+
 /-- Execute a single already-fetched-and-decoded instruction. `w` is the raw
 instruction word (needed only to report `illegalInstruction` for an unknown
 `syscall` service number, per the pinned syscall decision).
@@ -550,6 +567,14 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     mkNext s (writeReg s (regIdx rt) (readFpReg s (regIdx fs)))
   | .mtc1 rt fs =>
     mkNext s (writeFpReg s (regIdx fs) (readReg s (regIdx rt)))
+  -- `cfc1`/`ctc1`: no FCSR/FIR control-register state is modeled, so these
+  -- reuse the same `fpRegs` array as an addressable 32-bit scratch slot
+  -- (`Instruction.cfc1`'s docstring) -- same move shape as `mfc1`/`mtc1`,
+  -- just a different `rs`-position sub-opcode.
+  | .cfc1 rt fs =>
+    mkNext s (writeReg s (regIdx rt) (readFpReg s (regIdx fs)))
+  | .ctc1 rt fs =>
+    mkNext s (writeFpReg s (regIdx fs) (readReg s (regIdx rt)))
   | .lwc1 rs ft imm =>
     let addr := readReg s (regIdx rs) + signExt16 imm
     match readMemWord s addr with
@@ -589,6 +614,56 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
   | .cLeS fs ft =>
     let flag := (floatOfBits (readFpReg s (regIdx fs))).le (floatOfBits (readFpReg s (regIdx ft)))
     mkNext s { s with fpCondFlag := flag }
+  | .sqrtS fd fs =>
+    let v := (floatOfBits (readFpReg s (regIdx fs))).sqrt
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat v))
+  -- `abs.s`/`neg.s`: raw sign-bit operations, no `Float32` arithmetic
+  -- involved (`Instruction.absS`/`negS`'s docstrings).
+  | .absS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (readFpReg s (regIdx fs) &&& 0x7fffffff#32))
+  | .negS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (readFpReg s (regIdx fs) ^^^ 0x80000000#32))
+  | .roundWS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (intBitsOfFloatRound (floatOfBits (readFpReg s (regIdx fs)))))
+  -- `trunc.w.s`: numerically identical to `cvtWS` under this model
+  -- (`Instruction.truncWS`'s docstring) -- both truncate toward zero.
+  | .truncWS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (intBitsOfFloatTrunc (floatOfBits (readFpReg s (regIdx fs)))))
+  | .ceilWS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (intBitsOfFloatCeil (floatOfBits (readFpReg s (regIdx fs)))))
+  | .floorWS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (intBitsOfFloatFloor (floatOfBits (readFpReg s (regIdx fs)))))
+  | .cFS _ _ =>
+    mkNext s { s with fpCondFlag := false }
+  -- `c.un.s`/`c.ult.s`/`c.ule.s` are built from `Float32.isNaN` explicitly,
+  -- not derived from `<`/`<=` -- those operators already return `false` for
+  -- any NaN operand (IEEE-754-correct), so deriving "unordered" from them
+  -- would silently be wrong (`Instruction.cUnS`'s docstring).
+  | .cUnS fs ft =>
+    let a := floatOfBits (readFpReg s (regIdx fs))
+    let b := floatOfBits (readFpReg s (regIdx ft))
+    mkNext s { s with fpCondFlag := a.isNaN || b.isNaN }
+  | .cUeqS fs ft =>
+    let a := floatOfBits (readFpReg s (regIdx fs))
+    let b := floatOfBits (readFpReg s (regIdx ft))
+    mkNext s { s with fpCondFlag := a.beq b || a.isNaN || b.isNaN }
+  -- `c.olt.s`/`c.ole.s`: numerically identical to `cLtS`/`cLeS` under this
+  -- model (`Instruction.cOltS`/`cOleS`'s docstrings) -- kept as separate
+  -- constructors because they are distinct real-MIPS32 encodings.
+  | .cOltS fs ft =>
+    let flag := (floatOfBits (readFpReg s (regIdx fs))).lt (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s { s with fpCondFlag := flag }
+  | .cUltS fs ft =>
+    let a := floatOfBits (readFpReg s (regIdx fs))
+    let b := floatOfBits (readFpReg s (regIdx ft))
+    mkNext s { s with fpCondFlag := a.lt b || a.isNaN || b.isNaN }
+  | .cOleS fs ft =>
+    let flag := (floatOfBits (readFpReg s (regIdx fs))).le (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s { s with fpCondFlag := flag }
+  | .cUleS fs ft =>
+    let a := floatOfBits (readFpReg s (regIdx fs))
+    let b := floatOfBits (readFpReg s (regIdx ft))
+    mkNext s { s with fpCondFlag := a.le b || a.isNaN || b.isNaN }
   -- `bc1t`/`bc1f`: upgraded during dev/v2 integration to use the same
   -- `pendingBranch` delay-slot scheduling as `beq`/`bne`/etc. (real MIPS32
   -- gives every branch, including FP ones, exactly one delay slot) instead
@@ -1366,6 +1441,18 @@ private def badProg : Program := (∅ : Program).insert textBase badWord
             0x12345678#32
         | none => false)
 
+-- ### Coprocessor 1 (FPU): cfc1/ctc1 (control-register move, scratch-slot model)
+
+-- ctc1 then cfc1 round-trips an arbitrary bit pattern through the shared
+-- `fpRegs` scratch slot (register 31, standing in for FCSR) -- same shape
+-- as the mtc1/mfc1 round-trip above.
+#guard nextFpRegEq (step (prog1 (.ctc1 8#32 31#32)) (setRegs regs0 [(8, 0x00000003#32)])) 31
+  0x00000003#32
+#guard (match stepState (prog1 (.ctc1 8#32 31#32)) (setRegs regs0 [(8, 0x00000003#32)]) with
+        | some s' => nextRegEq (step (prog1 (.cfc1 9#32 31#32)) { s' with pc := textBase }) 9
+            0x00000003#32
+        | none => false)
+
 private def fpMemTestState : State :=
   { (setRegs regs0 [(8, 0x10010000#32)]) with
       mem := (((∅ : Std.HashMap W32 UInt8).insert 0x10010004#32 0x3f).insert 0x10010005#32 0x80)
@@ -1398,6 +1485,22 @@ private def fpMemTestState : State :=
 #guard nextFpRegEq (step (prog1 (.movS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40400000#32)])) 10
   0x40400000#32
 
+-- ### Coprocessor 1 (FPU): sqrt.s/abs.s/neg.s
+
+-- sqrt.s: 4.0 (0x40800000) -> 2.0 (0x40000000)
+#guard nextFpRegEq (step (prog1 (.sqrtS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40800000#32)])) 10
+  0x40000000#32
+-- abs.s: -3.0 (0xc0400000) -> 3.0 (0x40400000); 3.0 -> 3.0 (already positive)
+#guard nextFpRegEq (step (prog1 (.absS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0400000#32)])) 10
+  0x40400000#32
+#guard nextFpRegEq (step (prog1 (.absS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40400000#32)])) 10
+  0x40400000#32
+-- neg.s: 3.0 (0x40400000) -> -3.0 (0xc0400000); -3.0 -> 3.0
+#guard nextFpRegEq (step (prog1 (.negS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40400000#32)])) 10
+  0xc0400000#32
+#guard nextFpRegEq (step (prog1 (.negS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0400000#32)])) 10
+  0x40400000#32
+
 -- ### Coprocessor 1 (FPU): cvt.s.w / cvt.w.s numeric conversions
 
 -- cvt.s.w: int bit pattern -> float value; 5 -> 5.0, -5 (0xfffffffb) -> -5.0
@@ -1414,6 +1517,40 @@ private def fpMemTestState : State :=
 #guard nextFpRegEq (step (prog1 (.cvtWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0bccccd#32)])) 10
   0xfffffffb#32
 
+-- ### Coprocessor 1 (FPU): round.w.s/trunc.w.s/ceil.w.s/floor.w.s
+
+-- 5.9 = 0x40bccccd, -5.9 = 0xc0bccccd (reusing cvt.w.s's test values above)
+-- round.w.s: nearest integer, ties away from zero (`Float32.round`/`roundf`,
+-- not ties-to-even -- see `Instruction.roundWS`'s docstring); 5.9 -> 6,
+-- -5.9 -> -6
+#guard nextFpRegEq (step (prog1 (.roundWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40bccccd#32)])) 10
+  0x00000006#32
+#guard nextFpRegEq (step (prog1 (.roundWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0bccccd#32)])) 10
+  0xfffffffa#32
+-- round.w.s at an exact tie: 2.5 (0x40200000) -> 3, -2.5 (0xc0200000) -> -3
+-- (ties away from zero, not to even -- documented divergence from real
+-- MIPS32's ties-to-even default)
+#guard nextFpRegEq (step (prog1 (.roundWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40200000#32)])) 10
+  0x00000003#32
+#guard nextFpRegEq (step (prog1 (.roundWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0200000#32)])) 10
+  0xfffffffd#32
+-- trunc.w.s: truncate toward zero (identical to cvt.w.s under this model);
+-- 5.9 -> 5, -5.9 -> -5
+#guard nextFpRegEq (step (prog1 (.truncWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40bccccd#32)])) 10
+  0x00000005#32
+#guard nextFpRegEq (step (prog1 (.truncWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0bccccd#32)])) 10
+  0xfffffffb#32
+-- ceil.w.s: round toward +Infinity; 5.9 -> 6, -5.9 -> -5
+#guard nextFpRegEq (step (prog1 (.ceilWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40bccccd#32)])) 10
+  0x00000006#32
+#guard nextFpRegEq (step (prog1 (.ceilWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0bccccd#32)])) 10
+  0xfffffffb#32
+-- floor.w.s: round toward -Infinity; 5.9 -> 5, -5.9 -> -6
+#guard nextFpRegEq (step (prog1 (.floorWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40bccccd#32)])) 10
+  0x00000005#32
+#guard nextFpRegEq (step (prog1 (.floorWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0bccccd#32)])) 10
+  0xfffffffa#32
+
 -- ### Coprocessor 1 (FPU): c.eq.s/c.lt.s/c.le.s set `fpCondFlag`; bc1t/bc1f branch on it
 
 #guard nextFpCondFlagEq (step (prog1 (.cEqS 8#32 9#32))
@@ -1426,6 +1563,46 @@ private def fpMemTestState : State :=
   (setFpRegs regs0 [(8, 0x40000000#32), (9, 0x3f800000#32)])) false  -- 2.0 < 1.0 is false
 #guard nextFpCondFlagEq (step (prog1 (.cLeS 8#32 9#32))
   (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) true   -- 1.0 <= 1.0
+
+-- ### Coprocessor 1 (FPU): c.f.s/c.un.s/c.ueq.s/c.olt.s/c.ult.s/c.ole.s/c.ule.s
+
+-- quiet NaN = 0x7fc00000
+-- c.f.s: always false, regardless of operands (even equal, non-NaN ones)
+#guard nextFpCondFlagEq (step (prog1 (.cFS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) false  -- 1.0 vs 1.0
+-- c.un.s: true iff either operand is NaN ("unordered")
+#guard nextFpCondFlagEq (step (prog1 (.cUnS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x7fc00000#32), (9, 0x3f800000#32)])) true   -- NaN vs 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cUnS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) false  -- 1.0 vs 1.0
+-- c.ueq.s: equal, or unordered
+#guard nextFpCondFlagEq (step (prog1 (.cUeqS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) true   -- 1.0 == 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cUeqS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x7fc00000#32), (9, 0x3f800000#32)])) true   -- NaN vs 1.0 (unordered)
+#guard nextFpCondFlagEq (step (prog1 (.cUeqS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x40000000#32)])) false  -- 1.0 vs 2.0
+-- c.olt.s: ordered and less-than; false (not true!) when either operand is
+-- NaN, unlike a plain `<` applied carelessly to the "unordered" case
+#guard nextFpCondFlagEq (step (prog1 (.cOltS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x40000000#32)])) true   -- 1.0 < 2.0
+#guard nextFpCondFlagEq (step (prog1 (.cOltS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x7fc00000#32), (9, 0x3f800000#32)])) false  -- NaN < 1.0 is false
+-- c.ult.s: less-than, or unordered
+#guard nextFpCondFlagEq (step (prog1 (.cUltS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x7fc00000#32), (9, 0x3f800000#32)])) true   -- NaN vs 1.0 (unordered)
+#guard nextFpCondFlagEq (step (prog1 (.cUltS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x40000000#32), (9, 0x3f800000#32)])) false  -- 2.0 < 1.0 is false, not NaN
+-- c.ole.s: ordered and less-or-equal
+#guard nextFpCondFlagEq (step (prog1 (.cOleS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) true   -- 1.0 <= 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cOleS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x7fc00000#32), (9, 0x3f800000#32)])) false  -- NaN <= 1.0 is false
+-- c.ule.s: less-or-equal, or unordered
+#guard nextFpCondFlagEq (step (prog1 (.cUleS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x7fc00000#32), (9, 0x3f800000#32)])) true   -- NaN vs 1.0 (unordered)
+#guard nextFpCondFlagEq (step (prog1 (.cUleS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x40000000#32), (9, 0x3f800000#32)])) false  -- 2.0 <= 1.0 is false, not NaN
 
 -- `bc1t`/`bc1f` get the same delay slot as every other branch (dev/v2
 -- integration: upgraded from the fpu track's original immediate-jump
