@@ -2580,3 +2580,466 @@ concrete program/state with every hypothesis discharged, via `#guard`
           readReg s 31 == textBase + 8#32 && s.pc == textBase + 4#32 &&
             s.pendingBranch == some (textBase + 4#32 + 12#32)
         | .halt _ => false) = true
+
+/-! ## Group 5 — I-type immediate instructions (`addiu`, `slti`, `sltiu`,
+`andi`, `ori`, `xori`, `lui`)
+
+All seven are the remaining non-`addi` I-type arith/logic instructions
+(`docs/spec/INSTRUCTION-REF.md` "I-type immediate arithmetic / logic"
+section, right after `addi`). Every one of them is a straight-line
+`execInstr` case (no inner `match`/`if` on an abstract register value, no
+memory access, no branch scheduling), so each theorem below follows
+`addi_spec_raw`'s exact tactic recipe verbatim. -/
+
+/-- **`addiu` computes `$rs + sext16(imm)` with plain 32-bit wraparound and
+never traps** — unlike `addi`, there is no overflow check at all (same
+sign-extended immediate, but the "u" suffix removes the overflow test
+entirely; INSTRUCTION-REF "addiu" section, confirmed against `Step.lean`'s
+`.addiu` case, which has no `addOverflows`/halt branch whatsoever). -/
+theorem addiu_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.addiu rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) + signExt16 imm)) with
+          pc := (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) + signExt16 imm)).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`slti` writes `1` iff `$rs < sext16(imm)` under a signed comparison,
+else `0`** (INSTRUCTION-REF "slti" section). -/
+theorem slti_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.slti rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let v := if asSigned (readReg s (regIdxSpec rs)) < asSigned (signExt16 imm)
+               then 1#32 else 0#32
+      StepResult.next
+        { (writeReg s (regIdxSpec rt) v) with pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`sltiu` sign-extends the 16-bit immediate first, exactly like `slti`,
+then compares the resulting 32-bit values as unsigned** — the "u" affects
+only the comparison, not the immediate's extension (INSTRUCTION-REF
+"sltiu" section, same convention as this project's `sltu`; confirmed
+against `Step.lean`'s `.sltiu` case, which calls `signExt16 imm` and then
+compares `.toNat` values). -/
+theorem sltiu_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.sltiu rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let v := if (readReg s (regIdxSpec rs)).toNat < (signExt16 imm).toNat
+               then 1#32 else 0#32
+      StepResult.next
+        { (writeReg s (regIdxSpec rt) v) with pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`andi` zero-extends the 16-bit immediate, then bitwise-ANDs it with
+`$rs`** — unlike `addi`/`slti`, the immediate is zero-extended, not
+sign-extended (INSTRUCTION-REF "andi" section: "immediate is
+zero-extended... not sign-extended"). -/
+theorem andi_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.andi rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) &&& zeroExt16 imm)) with
+          pc := (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) &&& zeroExt16 imm)).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`ori` zero-extends the 16-bit immediate, then bitwise-ORs it with
+`$rs`** (INSTRUCTION-REF "ori" section — same zero-extension convention as
+`andi`). -/
+theorem ori_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.ori rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) ||| zeroExt16 imm)) with
+          pc := (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) ||| zeroExt16 imm)).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`xori` zero-extends the 16-bit immediate, then bitwise-XORs it with
+`$rs`** (INSTRUCTION-REF "xori" section — same zero-extension convention as
+`andi`). -/
+theorem xori_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.xori rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) ^^^ zeroExt16 imm)) with
+          pc := (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) ^^^ zeroExt16 imm)).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`lui` writes `imm << 16` into `$rt`, ignoring `$rs` entirely** — `$rs`
+is a fixed/unused field in the real encoding, and `Instruction.lui` itself
+has no `rs` operand at all (INSTRUCTION-REF "lui" section: "$rt = imm <<
+16", no sign extension needed since the low 16 bits are always discarded by
+the shift). -/
+theorem lui_spec_raw (p : Program) (s : State) (w rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.lui rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeReg s (regIdxSpec rt) (zeroExt16 imm <<< 16)) with
+          pc := (writeReg s (regIdxSpec rt) (zeroExt16 imm <<< 16)).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `addiu_spec_raw`: `0x7fffffff + 1` wraps to `0x80000000` instead of
+-- trapping (the one observable difference from `addi`).
+#guard (match step (prog1Spec (.addiu 8#32 9#32 1#32))
+          (setRegsSpec (initialState textBase) [(8, 0x7fffffff#32)]) with
+        | .next s => readReg s 9 == 0x80000000#32
+        | .halt _ => false) = true
+
+-- `slti_spec_raw`/`sltiu_spec_raw`: the same bit pattern (`-1` signed,
+-- `0xffffffff` unsigned) compares differently against `0` depending on
+-- signedness.
+#guard (match step (prog1Spec (.slti 8#32 9#32 0x0000#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32)]) with
+        | .next s => readReg s 9 == 1#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.sltiu 8#32 9#32 0x0000#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32)]) with
+        | .next s => readReg s 9 == 0#32
+        | .halt _ => false) = true
+
+-- `andi_spec_raw`/`ori_spec_raw`/`xori_spec_raw`: the immediate is
+-- zero-extended, not sign-extended — the high 16 bits of `$rs` are never
+-- pulled from the immediate's sign.
+#guard (match step (prog1Spec (.andi 8#32 9#32 0x8001#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32)]) with
+        | .next s => readReg s 9 == 0x00008001#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.ori 8#32 9#32 0x8001#32))
+          (setRegsSpec (initialState textBase) [(8, 0#32)]) with
+        | .next s => readReg s 9 == 0x00008001#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.xori 8#32 9#32 0x8001#32))
+          (setRegsSpec (initialState textBase) [(8, 0#32)]) with
+        | .next s => readReg s 9 == 0x00008001#32
+        | .halt _ => false) = true
+
+-- `lui_spec_raw`: the immediate lands in the high half-word, low half-word
+-- stays zero, and `$rs` (here nonzero garbage) is ignored since `lui` has
+-- no `rs` operand at all.
+#guard (match step (prog1Spec (.lui 9#32 0x8001#32)) (initialState textBase) with
+        | .next s => readReg s 9 == 0x80010000#32
+        | .halt _ => false) = true
+
+/-! ## Group 6 — register-register trap family (`teq`, `tne`, `tlt`, `tge`,
+`tltu`, `tgeu`, `break`)
+
+Ground truth: `docs/spec/INSTRUCTION-REF.md` "Coprocessor 0 / traps and
+exceptions" section (the shared exception mechanism) and its "teq / tne /
+tlt / tge / tltu / tgeu" / "break" subsections. These seven do **not** go
+through `Step.lean`'s `mkNext`/`advance` path at all when the trap fires;
+they go through the separate (private) `takeException` helper, which this
+file cannot name directly, so each theorem below inlines `takeException`'s
+body using the public names `excCodeTr`/`excCodeBp`/`statusExlMask`/
+`exceptionVectorAddr` (all public `def`s in `Types.lean`) — a genuinely
+different right-hand-side shape from every Group 2/5 theorem above
+(`cp0Epc`/`cp0Cause`/`cp0Status`/`pc` all change together, no `writeReg`
+involved at all). Every theorem below needs `hpb : s.pendingBranch = none`,
+even `break` (whose own semantics never consult `pendingBranch` at all):
+`Step.lean`'s `execInstr` opens with an unconditional `if
+s.pendingBranch.isSome && isBranchLike instr then halt else ...` check
+*before* dispatching to any instruction's own case, so `rfl` cannot reduce
+past that `if` without `s.pendingBranch` pinned to a concrete value, no
+matter which instruction follows. The six comparison-based theorems need
+`hpb` a second time, for their *non-trapping* branch, which still falls
+through via the ordinary `mkNext`/`advance` path (so its exact shape —
+plain `pc + 4#32`, no `pendingBranch` left dangling — depends on `s` not
+already being mid-delay-slot, exactly as for `beq_spec_raw`). -/
+
+/-- **`break` unconditionally takes a coprocessor-0 exception**: no
+condition to evaluate, `EPC` records `break`'s own address, `Cause.ExcCode`
+is set to `excCodeBp`, `Status.EXL` is OR'd in, and `pc` jumps straight to
+the general exception vector (INSTRUCTION-REF "break" section: "evaluate
+no condition; unconditionally takes the exception... with excCode =
+excCodeBp"). -/
+theorem break_spec_raw (p : Program) (s : State) (w : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some .break)
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { s with
+            cp0Epc := s.pc
+            cp0Cause := excCodeBp <<< 2
+            cp0Status := s.cp0Status ||| statusExlMask
+            pc := exceptionVectorAddr } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `break_spec_raw`: a concrete `break` lands exactly on the exception
+-- vector with the `Bp` exception code packed into `Cause`.
+#guard (match step (prog1Spec .break) (initialState textBase) with
+        | .next s =>
+          s.cp0Epc == textBase && s.cp0Cause == (excCodeBp <<< 2) &&
+            s.cp0Status == statusExlMask && s.pc == exceptionVectorAddr
+        | .halt _ => false) = true
+
+/-- **`teq` traps iff `$rs == $rt`**, taking the shared coprocessor-0
+exception with `excCode = excCodeTr`; otherwise it is a complete no-op
+beyond the ordinary fallthrough to `pc + 4#32` — no CP0 state touched at
+all (INSTRUCTION-REF "teq / tne / tlt / tge / tltu / tgeu" section). -/
+theorem teq_spec_raw (p : Program) (s : State) (w rs rt : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.teq rs rt))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if readReg s (regIdxSpec rs) == readReg s (regIdxSpec rt) then
+        StepResult.next
+          { s with
+              cp0Epc := s.pc
+              cp0Cause := excCodeTr <<< 2
+              cp0Status := s.cp0Status ||| statusExlMask
+              pc := exceptionVectorAddr }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`tne` traps iff `$rs ≠ $rt`** — the mirror image of `teq`
+(INSTRUCTION-REF "teq / tne / tlt / tge / tltu / tgeu" section). -/
+theorem tne_spec_raw (p : Program) (s : State) (w rs rt : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.tne rs rt))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if readReg s (regIdxSpec rs) ≠ readReg s (regIdxSpec rt) then
+        StepResult.next
+          { s with
+              cp0Epc := s.pc
+              cp0Cause := excCodeTr <<< 2
+              cp0Status := s.cp0Status ||| statusExlMask
+              pc := exceptionVectorAddr }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`tlt` traps iff `$rs <s $rt`**, a *signed* comparison
+(INSTRUCTION-REF "teq / tne / tlt / tge / tltu / tgeu" section: "`tlt`:
+`$rs <s $rt` (signed)"). -/
+theorem tlt_spec_raw (p : Program) (s : State) (w rs rt : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.tlt rs rt))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if asSigned (readReg s (regIdxSpec rs)) < asSigned (readReg s (regIdxSpec rt)) then
+        StepResult.next
+          { s with
+              cp0Epc := s.pc
+              cp0Cause := excCodeTr <<< 2
+              cp0Status := s.cp0Status ||| statusExlMask
+              pc := exceptionVectorAddr }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`tge` traps iff `$rs ≥s $rt`**, a *signed* comparison — the mirror
+image of `tlt` (INSTRUCTION-REF "teq / tne / tlt / tge / tltu / tgeu"
+section). -/
+theorem tge_spec_raw (p : Program) (s : State) (w rs rt : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.tge rs rt))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if asSigned (readReg s (regIdxSpec rs)) ≥ asSigned (readReg s (regIdxSpec rt)) then
+        StepResult.next
+          { s with
+              cp0Epc := s.pc
+              cp0Cause := excCodeTr <<< 2
+              cp0Status := s.cp0Status ||| statusExlMask
+              pc := exceptionVectorAddr }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`tltu` traps iff `$rs <u $rt`**, an *unsigned* comparison on the raw
+bit patterns (INSTRUCTION-REF "teq / tne / tlt / tge / tltu / tgeu"
+section: "`tltu`: `$rs <u $rt` (unsigned)"). -/
+theorem tltu_spec_raw (p : Program) (s : State) (w rs rt : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.tltu rs rt))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if (readReg s (regIdxSpec rs)).toNat < (readReg s (regIdxSpec rt)).toNat then
+        StepResult.next
+          { s with
+              cp0Epc := s.pc
+              cp0Cause := excCodeTr <<< 2
+              cp0Status := s.cp0Status ||| statusExlMask
+              pc := exceptionVectorAddr }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`tgeu` traps iff `$rs ≥u $rt`**, an *unsigned* comparison — the
+mirror image of `tltu` (INSTRUCTION-REF "teq / tne / tlt / tge / tltu /
+tgeu" section). -/
+theorem tgeu_spec_raw (p : Program) (s : State) (w rs rt : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.tgeu rs rt))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if (readReg s (regIdxSpec rs)).toNat ≥ (readReg s (regIdxSpec rt)).toNat then
+        StepResult.next
+          { s with
+              cp0Epc := s.pc
+              cp0Cause := excCodeTr <<< 2
+              cp0Status := s.cp0Status ||| statusExlMask
+              pc := exceptionVectorAddr }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `teq_spec_raw`/`tne_spec_raw`: equal registers trap under `teq` (and are
+-- a no-op under `tne`); unequal registers are the mirror image. One
+-- `#guard` per instruction per branch, matching the house style used for
+-- `beq`/`bne` above.
+#guard (match step (prog1Spec (.teq 8#32 9#32))
+          (setRegsSpec (initialState textBase) [(8, 5#32), (9, 5#32)]) with
+        | .next s =>
+          s.cp0Epc == textBase && s.cp0Cause == (excCodeTr <<< 2) &&
+            s.cp0Status == statusExlMask && s.pc == exceptionVectorAddr
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.teq 8#32 9#32))
+          (setRegsSpec (initialState textBase) [(8, 5#32), (9, 6#32)]) with
+        | .next s => s.pc == textBase + 4#32 && s.cp0Status == 0#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.tne 8#32 9#32))
+          (setRegsSpec (initialState textBase) [(8, 5#32), (9, 6#32)]) with
+        | .next s =>
+          s.cp0Epc == textBase && s.cp0Cause == (excCodeTr <<< 2) &&
+            s.cp0Status == statusExlMask && s.pc == exceptionVectorAddr
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.tne 8#32 9#32))
+          (setRegsSpec (initialState textBase) [(8, 5#32), (9, 5#32)]) with
+        | .next s => s.pc == textBase + 4#32 && s.cp0Status == 0#32
+        | .halt _ => false) = true
+
+-- `tlt_spec_raw`/`tge_spec_raw`: `-1` (as `0xffffffff`) is signed-less-than
+-- `1`, so `tlt` traps and `tge` does not; swapping the operands flips both.
+#guard (match step (prog1Spec (.tlt 8#32 9#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32), (9, 1#32)]) with
+        | .next s => s.pc == exceptionVectorAddr
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.tge 8#32 9#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32), (9, 1#32)]) with
+        | .next s => s.pc == textBase + 4#32
+        | .halt _ => false) = true
+
+-- `tltu_spec_raw`/`tgeu_spec_raw`: the same bit pattern `0xffffffff` is the
+-- *largest* unsigned value, so it is never `<u 1` but always `≥u 1`.
+#guard (match step (prog1Spec (.tltu 8#32 9#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32), (9, 1#32)]) with
+        | .next s => s.pc == textBase + 4#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.tgeu 8#32 9#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32), (9, 1#32)]) with
+        | .next s => s.pc == exceptionVectorAddr
+        | .halt _ => false) = true
