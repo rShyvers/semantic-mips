@@ -30,3 +30,15 @@ root = "DiffHarness"
 name = "EquivHarness"
 root = "EquivHarness"
 
+# Deliberately *not* in `defaultTargets`, same as `EquivHarness` above: `lake
+# check` combines every default-target exe's root module into one
+# `Lean.importModules` call (see `Lake/CLI/Main.lean`'s `checkExport`), and
+# since every `lean_exe` root must define a top-level `def main` (Lake's
+# literal entry-point convention), a second default-target exe collides with
+# `DiffHarness`'s `main` ("environment already contains 'main' from
+# DiffHarness") and fails `lake check` outright. Build this one explicitly:
+# `lake build MipsRun` (or `lake exe MipsRun`).
+[[lean_exe]]
+name = "MipsRun"
+root = "MipsRun"
+
