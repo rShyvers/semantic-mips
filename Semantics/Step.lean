@@ -752,6 +752,44 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     then takeException s excCodeTr else mkNext s s
   -- break: unconditional trap (coprocessor-0 exception model).
   | .break => takeException s excCodeBp
+  -- Coprocessor 0 (CP0) register move and execution-control instructions
+  -- (v1.x addition; `docs/spec/MIPS-COVERAGE-GAPS.md` \u00a73.10A). Scoped to
+  -- exactly the three CP0 registers this project models: `rd = 12/13/14`
+  -- maps to `cp0Status`/`cp0Cause`/`cp0Epc` (the real MIPS32 register
+  -- numbers for `Status`/`Cause`/`EPC`). Any other `rd` has no backing
+  -- register in this minimal model; rather than silently fabricate a `0`
+  -- read or silently drop a write, this halts with
+  -- `HaltReason.illegalInstruction` \u2014 a documented, honest choice (real
+  -- hardware would read garbage or trap depending on the specific
+  -- register; since every other CP0 register is architecturally
+  -- out-of-scope here, a clean halt is more defensible than inventing
+  -- behavior for registers this model doesn't have).
+  | .mfc0 rt rd =>
+    match rd.toNat with
+    | 12 => mkNext s (writeReg s (regIdx rt) s.cp0Status)
+    | 13 => mkNext s (writeReg s (regIdx rt) s.cp0Cause)
+    | 14 => mkNext s (writeReg s (regIdx rt) s.cp0Epc)
+    | _ => StepResult.halt (.illegalInstruction w)
+  | .mtc0 rt rd =>
+    match rd.toNat with
+    | 12 => mkNext s { s with cp0Status := readReg s (regIdx rt) }
+    | 13 => mkNext s { s with cp0Cause := readReg s (regIdx rt) }
+    | 14 => mkNext s { s with cp0Epc := readReg s (regIdx rt) }
+    | _ => StepResult.halt (.illegalInstruction w)
+  -- `eret`: exception return (MD00086 Rev 2.50 \u00a73.2, Table 3-23). Sets
+  -- `PC := cp0Epc` and clears `Status.EXL` (the same bit `takeException`
+  -- sets, cleared here via `&&& ~~~statusExlMask`). Real MIPS32: `eret` is
+  -- NOT delay-slotted \u2014 it takes effect immediately, an explicit
+  -- architectural exception to the general branch/jump delay-slot rule, so
+  -- (unlike every control-flow instruction above) this bypasses
+  -- `mkNext`/`pendingBranch` entirely and sets `pc` directly.
+  | .eret =>
+    StepResult.next { s with pc := s.cp0Epc, cp0Status := s.cp0Status &&& ~~~statusExlMask }
+  -- `wait`: real hardware halts the pipeline until an interrupt arrives;
+  -- this simulator has no interrupt/timer model at all, so the only
+  -- sensible behavior is a documented no-op that falls through to `pc + 4`
+  -- via `mkNext`, the same as any other non-control-flow instruction.
+  | .wait => mkNext s s
 
 /-- Execute a single instruction: fetch at `s.pc`, decode, and dispatch.
 Total: fetch/decode failure and syscall-dispatch failure all become defined
@@ -1604,6 +1642,82 @@ private def vectorHandlerProg : Program :=
   (prog1 .break).insert exceptionVectorAddr (encode (.addi 0#32 8#32 42#32))
 #guard (match stepState vectorHandlerProg regs0 with
         | some s' => nextRegEq (step vectorHandlerProg s') 8 42#32
+        | none => false)
+
+-- ### Coprocessor 0 (CP0): mfc0/mtc0/eret/wait (docs/spec/MIPS-COVERAGE-GAPS.md
+-- §3.10A)
+
+-- mfc0 reads back each of the three real CP0 registers, selected by `rd`
+-- (12/13/14 = Status/Cause/EPC).
+#guard nextRegEq (step (prog1 (.mfc0 8#32 12#32)) { regs0 with cp0Status := 0x2#32 }) 8 0x2#32
+#guard nextRegEq (step (prog1 (.mfc0 8#32 13#32)) { regs0 with cp0Cause := 0x34#32 }) 8 0x34#32
+#guard nextRegEq (step (prog1 (.mfc0 8#32 14#32)) { regs0 with cp0Epc := 0x3000#32 }) 8 0x3000#32
+
+-- mtc0 writes each of the three real CP0 registers from a GPR.
+#guard (match stepState (prog1 (.mtc0 8#32 12#32)) (setRegs regs0 [(8, 0x2#32)]) with
+        | some s' => s'.cp0Status == 0x2#32
+        | none => false)
+#guard (match stepState (prog1 (.mtc0 8#32 13#32)) (setRegs regs0 [(8, 0x34#32)]) with
+        | some s' => s'.cp0Cause == 0x34#32
+        | none => false)
+#guard (match stepState (prog1 (.mtc0 8#32 14#32)) (setRegs regs0 [(8, 0x3000#32)]) with
+        | some s' => s'.cp0Epc == 0x3000#32
+        | none => false)
+
+-- mtc0 then mfc0 round-trips an arbitrary value through each of the three
+-- registers (Status/Cause/EPC in turn).
+#guard (match stepState (prog1 (.mtc0 8#32 12#32)) (setRegs regs0 [(8, 0xabcd#32)]) with
+        | some s' => nextRegEq (step (prog1 (.mfc0 9#32 12#32)) { s' with pc := textBase }) 9
+            0xabcd#32
+        | none => false)
+#guard (match stepState (prog1 (.mtc0 8#32 13#32)) (setRegs regs0 [(8, 0xabcd#32)]) with
+        | some s' => nextRegEq (step (prog1 (.mfc0 9#32 13#32)) { s' with pc := textBase }) 9
+            0xabcd#32
+        | none => false)
+#guard (match stepState (prog1 (.mtc0 8#32 14#32)) (setRegs regs0 [(8, 0xabcd#32)]) with
+        | some s' => nextRegEq (step (prog1 (.mfc0 9#32 14#32)) { s' with pc := textBase }) 9
+            0xabcd#32
+        | none => false)
+
+-- mfc0/mtc0 with an out-of-scope `rd` (this model has no CP0 register other
+-- than 12/13/14) halt with `illegalInstruction`, the documented choice over
+-- silently reading back `0` or silently dropping the write.
+#guard isHaltIllegal (step (prog1 (.mfc0 8#32 0#32)) regs0) (encode (.mfc0 8#32 0#32))
+#guard isHaltIllegal (step (prog1 (.mtc0 8#32 0#32)) (setRegs regs0 [(8, 1#32)]))
+  (encode (.mtc0 8#32 0#32))
+
+-- eret: restores `pc` from `cp0Epc` and clears `Status.EXL` (bit 1, the same
+-- bit `takeException` sets) in a *single* `step` call -- no delay-slot
+-- scheduling (`pendingBranch` stays `none`, confirming `eret` bypasses
+-- `mkNext` entirely rather than landing one instruction later).
+private def eretReadyState : State :=
+  { regs0 with cp0Epc := 0x3000#32, cp0Status := statusExlMask, pendingBranch := none }
+#guard nextPcEq (step (prog1 .eret) eretReadyState) 0x3000#32
+#guard (match stepState (prog1 .eret) eretReadyState with
+        | some s' => s'.cp0Status == 0#32 && s'.pendingBranch == none
+        | none => false)
+
+-- full round trip: `teq` traps from `textBase` to `exceptionVectorAddr`
+-- (confirming `cp0Epc`/`pc` land at the expected places, same as the
+-- existing teq tests above), then `eret` placed at the vector returns
+-- `pc` exactly to the original trapping instruction's address and clears
+-- `Status.EXL`.
+private def teqEretProg : Program :=
+  ((∅ : Program).insert textBase (encode (.teq 8#32 9#32))).insert exceptionVectorAddr (encode .eret)
+#guard (match stepState teqEretProg (setRegs regs0 [(8, 5#32), (9, 5#32)]) with
+        | some s1 =>
+          s1.cp0Epc == textBase && s1.pc == exceptionVectorAddr && s1.cp0Status == statusExlMask &&
+            (match stepState teqEretProg s1 with
+             | some s2 => s2.pc == textBase && s2.cp0Status == 0#32
+             | none => false)
+        | none => false)
+
+-- wait: a documented no-op (no interrupt/timer model exists to wait for),
+-- falls through to `pc + 4` with all state otherwise untouched.
+#guard nextPcEq (step (prog1 .wait) regs0) (textBase + 4#32)
+#guard (match stepState (prog1 .wait) regs0 with
+        | some s' => s'.cp0Status == regs0.cp0Status && s'.cp0Cause == regs0.cp0Cause
+                       && s'.cp0Epc == regs0.cp0Epc
         | none => false)
 
 -- ### Undecodable word → illegalInstruction
