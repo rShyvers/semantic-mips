@@ -83,15 +83,15 @@ it). -/
 private def mkNext (orig result : State) : StepResult :=
   StepResult.next (advance orig result)
 
-/-- Whether `instr` is one of the six branch/jump instructions that
-schedule a delay-slot transfer (`beq`,`bne`,`blez`,`bgtz`,`j`,`jal`). Used
-to detect a branch/jump occurring itself inside another's delay slot (real
-MIPS32 leaves this architecturally discouraged/implementation-defined), so
-`execInstr` can halt with `HaltReason.branchInDelaySlot` instead of
-guessing. -/
+/-- Whether `instr` is one of the eight branch/jump instructions that
+schedule a delay-slot transfer (`beq`,`bne`,`blez`,`bgtz`,`j`,`jal`,`jr`,
+`jalr`). Used to detect a branch/jump occurring itself inside another's
+delay slot (real MIPS32 leaves this architecturally discouraged/
+implementation-defined), so `execInstr` can halt with
+`HaltReason.branchInDelaySlot` instead of guessing. -/
 private def isBranchLike (instr : Instruction) : Bool :=
   match instr with
-  | .beq _ _ _ | .bne _ _ _ | .blez _ _ | .bgtz _ _ | .j _ | .jal _ => true
+  | .beq _ _ _ | .bne _ _ _ | .blez _ _ | .bgtz _ _ | .j _ | .jal _ | .jr _ | .jalr _ _ => true
   | _ => false
 
 /-- Signed-overflow predicate for `add`/`addi`, following INSTRUCTION-REF's
@@ -210,7 +210,7 @@ instruction word (needed only to report `illegalInstruction` for an unknown
 
 Before dispatching, checks whether `s` already has a branch/jump delay-slot
 transfer pending (`s.pendingBranch = some _`) *and* `instr` is itself one of
-the six branch/jump instructions (`isBranchLike`) — i.e. a branch/jump
+the eight branch/jump instructions (`isBranchLike`) — i.e. a branch/jump
 occurring in another's delay slot. Real MIPS32 leaves that
 architecturally discouraged/implementation-defined, so rather than pick an
 arbitrary behavior this halts with `HaltReason.branchInDelaySlot`, keeping
@@ -452,6 +452,25 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     let s' := writeReg s 31 linkVal
     StepResult.next
       { s' with pc := pcNext, pendingBranch := some ((pcNext &&& 0xf0000000#32) ||| (target <<< 2)) }
+  -- Register-indirect jump/call (real MIPS32 `jr`/`jalr`, MD00086 §3.2):
+  -- same one-instruction delay-slot scheduling as `j`/`jal` above, but the
+  -- target is the raw 32-bit value read from `$rs` instead of composed from
+  -- the 26-bit `target` field. A misaligned `$rs` value is not special-cased
+  -- here: it becomes an ordinary `addressError` halt the next time `step`
+  -- tries to fetch from it (`fetchWord`'s existing alignment check), exactly
+  -- like any other misaligned `pc`.
+  | .jr rs =>
+    let pcNext := s.pc + 4#32
+    StepResult.next { s with pc := pcNext, pendingBranch := some (readReg s (regIdx rs)) }
+  | .jalr rs rd =>
+    -- `$rd` links to `pc + 8` — past the delay slot — the same `jal` link-value
+    -- convention as above. The link target is read before `$rd` is written,
+    -- so `jalr $rs, $rs` (rd = rs) still reads the pre-write `$rs` value.
+    let pcNext := s.pc + 4#32
+    let linkVal := pcNext + 4#32
+    let target := readReg s (regIdx rs)
+    let s' := writeReg s (regIdx rd) linkVal
+    StepResult.next { s' with pc := pcNext, pendingBranch := some target }
   -- Coprocessor 1 (FPU), single-precision subset (docs/spec/INSTRUCTION-REF.md
   -- floating-point section). `mtc1`/`mfc1`/`lwc1`/`swc1` move/transfer raw
   -- bit patterns with no numeric conversion; arithmetic/compare/convert go
@@ -982,6 +1001,50 @@ private def crossRegionState : State := { regs0 with pc := 0x90400000#32 }
 -- the delay slot.
 #guard nextRegEq (step (progAt 0x90400000#32 (.jal 0x1000#32)) crossRegionState) 31 0x90400008#32
 #guard stepThroughDelaySlot 0x90400000#32 (.jal 0x1000#32) crossRegionState = some 0x90004000#32
+
+-- ### jr/jalr: register-indirect jump/call, same one-delay-slot scheduling
+-- as j/jal, but the target comes from a register read. `jr $ra` is the
+-- canonical function-return idiom; `jalr $rd, $rs` additionally links `$rd`
+-- to `pc + 8`, exactly like `jal`'s link-value convention.
+
+-- `jr`'s own step falls through to the delay slot, scheduling `$rs`'s raw
+-- value as the target (no top-4-bit composition, unlike `j`).
+#guard (match step (progAt 0x90400000#32 (.jr 8#32)) (setRegs crossRegionState [(8, 0x80020000#32)]) with
+        | .next s => s.pc == 0x90400004#32 && s.pendingBranch == some 0x80020000#32
+        | .halt _ => false)
+#guard stepThroughDelaySlot 0x90400000#32 (.jr 8#32) (setRegs crossRegionState [(8, 0x80020000#32)])
+  = some 0x80020000#32
+-- the classic `jr $ra` function-return idiom: landing on whatever address
+-- was previously linked into `$ra`.
+#guard stepThroughDelaySlot textBase (.jr 31#32) (setRegs regs0 [(31, 0x00400040#32)])
+  = some 0x00400040#32
+
+-- `jalr $rd, $rs`: `$rd` is `pc + 8` (past the delay slot, same convention
+-- as `jal`), and the target lands the same way as `jr` after the delay slot.
+#guard nextRegEq (step (progAt 0x90400000#32 (.jalr 8#32 9#32)) (setRegs crossRegionState [(8, 0x80020000#32)]))
+  9 0x90400008#32
+#guard stepThroughDelaySlot 0x90400000#32 (.jalr 8#32 9#32) (setRegs crossRegionState [(8, 0x80020000#32)])
+  = some 0x80020000#32
+-- `jalr $t9, $t9` (rd = rs): the link value overwrites `$rs` only *after*
+-- its pre-write value has been captured as the jump target.
+#guard nextRegEq (step (progAt 0x90400000#32 (.jalr 9#32 9#32)) (setRegs crossRegionState [(9, 0x80020000#32)]))
+  9 0x90400008#32
+#guard stepThroughDelaySlot 0x90400000#32 (.jalr 9#32 9#32) (setRegs crossRegionState [(9, 0x80020000#32)])
+  = some 0x80020000#32
+
+-- a `jr` target that isn't 4-byte-aligned is not special-cased: the branch
+-- step itself still schedules it as an ordinary `pendingBranch`, and the
+-- misalignment only surfaces as the existing `addressError` halt on the
+-- *next* fetch attempt, once `pc` actually becomes that value.
+#guard stepThroughDelaySlot 0x90400000#32 (.jr 8#32) (setRegs crossRegionState [(8, 0x80020001#32)])
+  = some 0x80020001#32
+#guard (match stepState (buildProg 0x90400000#32 [.jr 8#32, nopInstr])
+          (setRegs crossRegionState [(8, 0x80020001#32)]) with
+        | some s1 =>
+          (match stepState (buildProg 0x90400000#32 [.jr 8#32, nopInstr]) s1 with
+           | some s2 => isHaltAddr (step (buildProg 0x90400000#32 [.jr 8#32, nopInstr]) s2) 0x80020001#32
+           | none => false)
+        | none => false)
 
 -- ### branch/jump in a delay slot: diagnosable halt, not arbitrary behavior
 
