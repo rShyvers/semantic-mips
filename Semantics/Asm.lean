@@ -71,6 +71,15 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   `round.w.s`/`trunc.w.s`/`ceil.w.s`/`floor.w.s`, `cvt.s.w`/`cvt.w.s`,
   `c.eq.s`/`c.lt.s`/`c.le.s`/`c.f.s`/`c.un.s`/`c.ueq.s`/`c.olt.s`/`c.ult.s`/
   `c.ole.s`/`c.ule.s`, `bc1t`/`bc1f`.
+- Coprocessor-1 (FPU) double-precision subset (v2 addition,
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.9A; `docs/spec/INSTRUCTION-REF.md`'s
+  double-precision section): `ldc1`/`sdc1`, `add.d`/`sub.d`/`mul.d`/`div.d`,
+  `mov.d`, `sqrt.d`/`abs.d`/`neg.d`, `cvt.d.s`/`cvt.s.d`/`cvt.d.w`/`cvt.w.d`,
+  `c.eq.d`/`c.lt.d`/`c.le.d`/`c.f.d`/`c.un.d`/`c.ueq.d`/`c.olt.d`/`c.ult.d`/
+  `c.ole.d`/`c.ule.d`. `$fN` operands name the *low* register of the
+  register pair the double value occupies (same `$fN` parsing as the
+  single-precision instructions above, `parseFpRegister`); the assembler
+  does not check/enforce that `N` is even.
 - Coprocessor-0 (CP0) register move / execution control (real MIPS32 ISA,
   `docs/spec/MIPS-COVERAGE-GAPS.md` \u00a73.10A; see `Instruction.lean`/
   `Step.lean`): `mfc0 $rt, rd` / `mtc0 $rt, rd` (`rd` is a plain numeric CP0
@@ -441,8 +450,9 @@ private inductive Cop1Form
   | arith3 (fmt funct : Nat)    -- add.s/sub.s/mul.s/div.s: $fd, $fs, $ft
   | unary (fmt funct : Nat)     -- mov.s/cvt.s.w/cvt.w.s/sqrt.s/abs.s/neg.s/
                                 -- round.w.s/trunc.w.s/ceil.w.s/floor.w.s: $fd, $fs
-  | compare (funct : Nat)       -- c.eq.s/c.lt.s/c.le.s/c.f.s/c.un.s/c.ueq.s/
-                                -- c.olt.s/c.ult.s/c.ole.s/c.ule.s: $fs, $ft (fmt always S)
+  | compare (fmt funct : Nat)   -- c.eq.s/c.lt.s/c.le.s/c.f.s/c.un.s/c.ueq.s/
+                                -- c.olt.s/c.ult.s/c.ole.s/c.ule.s (fmt=S) and
+                                -- their c.cond.d counterparts (fmt=D): $fs, $ft
   | branch (tf : Nat)           -- bc1t (tf=1) / bc1f (tf=0): target
 
 /-- Static table of coprocessor-1 (FPU) mnemonics: (name, form). -/
@@ -457,11 +467,28 @@ private def cop1Table : List (String × Cop1Form) :=
    ("round.w.s", .unary 0x10 0x0c), ("trunc.w.s", .unary 0x10 0x0d),
    ("ceil.w.s", .unary 0x10 0x0e), ("floor.w.s", .unary 0x10 0x0f),
    ("cvt.s.w", .unary 0x14 0x20), ("cvt.w.s", .unary 0x10 0x24),
-   ("c.eq.s", .compare 0x32), ("c.lt.s", .compare 0x3c), ("c.le.s", .compare 0x3e),
-   ("c.f.s", .compare 0x30), ("c.un.s", .compare 0x31), ("c.ueq.s", .compare 0x33),
-   ("c.olt.s", .compare 0x34), ("c.ult.s", .compare 0x35),
-   ("c.ole.s", .compare 0x36), ("c.ule.s", .compare 0x37),
-   ("bc1t", .branch 1), ("bc1f", .branch 0)]
+   ("c.eq.s", .compare 0x10 0x32), ("c.lt.s", .compare 0x10 0x3c), ("c.le.s", .compare 0x10 0x3e),
+   ("c.f.s", .compare 0x10 0x30), ("c.un.s", .compare 0x10 0x31), ("c.ueq.s", .compare 0x10 0x33),
+   ("c.olt.s", .compare 0x10 0x34), ("c.ult.s", .compare 0x10 0x35),
+   ("c.ole.s", .compare 0x10 0x36), ("c.ule.s", .compare 0x10 0x37),
+   ("bc1t", .branch 1), ("bc1f", .branch 0),
+   -- Double-precision (`.d`) -- v2 addition, `docs/spec/MIPS-COVERAGE-GAPS.md`
+   -- §3.9A; `fmt` = `D` = 0x11 (see `Instruction.lean`'s double-precision
+   -- bullet for the register-pair convention `$fN` operands follow here).
+   ("ldc1", .mem 0x35), ("sdc1", .mem 0x3d),
+   ("add.d", .arith3 0x11 0x00), ("sub.d", .arith3 0x11 0x01),
+   ("mul.d", .arith3 0x11 0x02), ("div.d", .arith3 0x11 0x03),
+   ("mov.d", .unary 0x11 0x06),
+   ("sqrt.d", .unary 0x11 0x04), ("abs.d", .unary 0x11 0x05), ("neg.d", .unary 0x11 0x07),
+   -- `cvt.d.s`: source is single, so `fmt` = S = 0x10 (names the *source*
+   -- format, same convention as `cvt.s.w`/`cvt.w.s` above); `cvt.d.w`:
+   -- source is a word, `fmt` = W = 0x14.
+   ("cvt.d.s", .unary 0x10 0x21), ("cvt.s.d", .unary 0x11 0x20),
+   ("cvt.d.w", .unary 0x14 0x21), ("cvt.w.d", .unary 0x11 0x24),
+   ("c.eq.d", .compare 0x11 0x32), ("c.lt.d", .compare 0x11 0x3c), ("c.le.d", .compare 0x11 0x3e),
+   ("c.f.d", .compare 0x11 0x30), ("c.un.d", .compare 0x11 0x31), ("c.ueq.d", .compare 0x11 0x33),
+   ("c.olt.d", .compare 0x11 0x34), ("c.ult.d", .compare 0x11 0x35),
+   ("c.ole.d", .compare 0x11 0x36), ("c.ule.d", .compare 0x11 0x37)]
 
 -- `break` is a real instruction, not a pseudo-op, but it is zero-operand
 -- (like `syscall`) rather than fitting any `RForm` with register operands,
@@ -897,12 +924,12 @@ private def encodeCop1Form (labels : Std.HashMap String W32) (name : String) (fo
         let fs ← parseFpRegister fsT lineNo
         pure (cop1RtWord fmt 0 fs fd funct)
     | _ => throw (.badOperand s!"{name} expects '$fd, $fs'" lineNo)
-  | .compare funct =>
+  | .compare fmt funct =>
     match operands with
     | [fsT, ftT] => do
         let fs ← parseFpRegister fsT lineNo
         let ft ← parseFpRegister ftT lineNo
-        pure (cop1RtWord 0x10 ft fs 0 funct)
+        pure (cop1RtWord fmt ft fs 0 funct)
     | _ => throw (.badOperand s!"{name} expects '$fs, $ft'" lineNo)
   | .branch tf =>
     match operands with
@@ -1691,6 +1718,70 @@ def cop1Prog : Program :=
 
 -- an unknown `$f` register is a `badRegister` error
 #guard (assemble "mov.s $f8, $f32\n").isOk = false
+
+-- Coprocessor-1 (FPU) double-precision mnemonics (v2 addition): same
+-- cross-check style as `cop1Src` above -- every emitted word is checked
+-- word-for-word against `Instruction.encode`.
+def cop1DSrc : String :=
+"ldc1 $f5, 4($sp)\n" ++
+"sdc1 $f5, 4($sp)\n" ++
+"add.d $f8, $f7, $f6\n" ++
+"sub.d $f8, $f7, $f6\n" ++
+"mul.d $f8, $f7, $f6\n" ++
+"div.d $f8, $f7, $f6\n" ++
+"mov.d $f8, $f7\n" ++
+"sqrt.d $f8, $f7\n" ++
+"abs.d $f8, $f7\n" ++
+"neg.d $f8, $f7\n" ++
+"cvt.d.s $f8, $f7\n" ++
+"cvt.s.d $f8, $f7\n" ++
+"cvt.d.w $f8, $f7\n" ++
+"cvt.w.d $f8, $f7\n" ++
+"c.eq.d $f7, $f6\n" ++
+"c.lt.d $f7, $f6\n" ++
+"c.le.d $f7, $f6\n" ++
+"c.f.d $f7, $f6\n" ++
+"c.un.d $f7, $f6\n" ++
+"c.ueq.d $f7, $f6\n" ++
+"c.olt.d $f7, $f6\n" ++
+"c.ult.d $f7, $f6\n" ++
+"c.ole.d $f7, $f6\n" ++
+"c.ule.d $f7, $f6\n"
+
+def cop1DProg : Program :=
+  match assemble cop1DSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard cop1DProg.getD textBase 0 = encode (.ldc1 29#32 5#32 4#32)
+#guard cop1DProg.getD (textBase + 4#32) 0 = encode (.sdc1 29#32 5#32 4#32)
+#guard cop1DProg.getD (textBase + 8#32) 0 = encode (.addD 8#32 7#32 6#32)
+#guard cop1DProg.getD (textBase + 12#32) 0 = encode (.subD 8#32 7#32 6#32)
+#guard cop1DProg.getD (textBase + 16#32) 0 = encode (.mulD 8#32 7#32 6#32)
+#guard cop1DProg.getD (textBase + 20#32) 0 = encode (.divD 8#32 7#32 6#32)
+#guard cop1DProg.getD (textBase + 24#32) 0 = encode (.movD 8#32 7#32)
+#guard cop1DProg.getD (textBase + 28#32) 0 = encode (.sqrtD 8#32 7#32)
+#guard cop1DProg.getD (textBase + 32#32) 0 = encode (.absD 8#32 7#32)
+#guard cop1DProg.getD (textBase + 36#32) 0 = encode (.negD 8#32 7#32)
+#guard cop1DProg.getD (textBase + 40#32) 0 = encode (.cvtDS 8#32 7#32)
+#guard cop1DProg.getD (textBase + 44#32) 0 = encode (.cvtSD 8#32 7#32)
+#guard cop1DProg.getD (textBase + 48#32) 0 = encode (.cvtDW 8#32 7#32)
+#guard cop1DProg.getD (textBase + 52#32) 0 = encode (.cvtWD 8#32 7#32)
+#guard cop1DProg.getD (textBase + 56#32) 0 = encode (.cEqD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 60#32) 0 = encode (.cLtD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 64#32) 0 = encode (.cLeD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 68#32) 0 = encode (.cFD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 72#32) 0 = encode (.cUnD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 76#32) 0 = encode (.cUeqD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 80#32) 0 = encode (.cOltD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 84#32) 0 = encode (.cUltD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 88#32) 0 = encode (.cOleD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 92#32) 0 = encode (.cUleD 7#32 6#32)
+-- every emitted double-precision word also round-trips through `decode`
+#guard decode (cop1DProg.getD textBase 0) = some (.ldc1 29#32 5#32 4#32)
+#guard decode (cop1DProg.getD (textBase + 8#32) 0) = some (.addD 8#32 7#32 6#32)
+#guard decode (cop1DProg.getD (textBase + 40#32) 0) = some (.cvtDS 8#32 7#32)
+#guard decode (cop1DProg.getD (textBase + 56#32) 0) = some (.cEqD 7#32 6#32)
 
 -- `ll`/`sc`: identical `rt, offset(rs)` parsing to `lw`/`sw`, cross-checked
 -- against `Instruction.encode`.
