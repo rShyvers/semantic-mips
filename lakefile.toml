@@ -26,3 +26,7 @@ name = "Checked"
 name = "DiffHarness"
 root = "DiffHarness"
 
+[[lean_exe]]
+name = "EquivHarness"
+root = "EquivHarness"
+

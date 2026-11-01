@@ -27,6 +27,56 @@ dependency on anything else in that project.
   (`vendor/mars/Mars4_5.jar`) and compares the outputs — the check that the
   Lean model is the system it claims to model, not just an internally
   consistent one.
+- `EquivHarness.lean` is a second executable, with a different job: it runs
+  pairs of our own `tests/equiv/` programs (a direct-instruction "base" and a
+  bit-shift/bitwise "variant" computing the same arithmetic) through this
+  semantics only, no MARS, and checks whether they agree. See "Equivalence
+  corpus" below.
+
+## Equivalence corpus (`tests/equiv/`, `EquivHarness.lean`)
+
+The original plan was to unseal a real hand-written MIPS program, find a
+math bug in it with this semantics, and prove a fix. That program needs
+assembler macros, which `docs/spec/SPEC-NOTES.md` §9 puts explicitly out of
+v1 scope -- `Asm.lean` can't even assemble it. In its place: a small corpus
+we wrote ourselves, built around the same idea (use the semantics to catch a
+real arithmetic bug), but self-contained.
+
+Each pair is two `tests/equiv/*.asm` programs that are supposed to compute
+the same function: one using a direct instruction (`mult`, `div`, `sub`),
+the other using bit-shifting/bitwise instructions instead -- the kind of
+strength-reduction a compiler or a hand-optimizing assembly programmer would
+do. Every program takes its input(s) in `$a0` (and `$a1` for the one
+two-input pair), leaves its result in `$t9`, and halts cleanly. Two of the
+seven comparisons are **deliberately wrong** -- the classic "replace
+division/remainder by a power of two with a raw shift/bitmask" bug, which
+breaks on negative dividends -- specifically so the corpus has to catch a
+real divergence, not just confirm agreement everywhere:
+
+| Case | Base | Variant | Claim |
+|---|---|---|---|
+| `mul_pow2` | `mult`/`mflo` (x * 8) | `sll` by 3 | equivalent, every input |
+| `mul_const5` | `mult`/`mflo` (x * 5) | `sll`+`addu` ((x<<2)+x) | equivalent, every input |
+| `div_pow2_buggy` | `div`/`mflo` (/4) | plain `sra` by 2 | **wrong**: rounds toward negative infinity, not zero |
+| `div_pow2_correct` | `div`/`mflo` (/4) | bias-corrected `sra` | equivalent, every input |
+| `mod_pow2_buggy` | `div`/`mfhi` (%4) | plain `andi` mask | **wrong**: always non-negative |
+| `mod_pow2_correct` | `div`/`mfhi` (%4) | `a0 - quotient*4` | equivalent, every input |
+| `sub_twos_complement` | `subu` | `nor`+`addiu`+`addu` | equivalent, every input |
+
+**Why no MARS here:** `DiffHarness` answers "is this semantics the same
+language as the real simulator?", which needs an external oracle (real
+MARS). `EquivHarness` answers "do these two already-validated programs
+compute the same function?", a question entirely internal to the semantics
+-- so it runs both programs directly through our own `assemble`/`run`, no
+subprocess, no JVM, no per-case compilation. This is the "thin interpreter"
+approach: the semantics itself is the fast, native execution engine, and
+MARS is reserved for the one question that actually needs an external
+oracle.
+
+Run it with `lake exe EquivHarness`; exit code `0` iff every case's actual
+outcome (equivalent, or diverges) matches what it claims. Each pair's own
+`.asm` header comment explains the specific claim and, for the buggy ones,
+the exact arithmetic reason it's wrong.
 
 Scope (v1 dialect): ~24 machine instructions (R-type arith/logic/shifts,
 mult/div, I-type immediates, byte/halfword/word memory, branches, j/jal),
@@ -113,6 +163,7 @@ lake build           # builds the default targets: Checked, DiffHarness
 lake check           # kernel-replay gate
 lake comparator       # trusted-theorem gate (comparator.json)
 lake exe DiffHarness  # differential test vs real MARS 4.5 on tests/corpus/
+lake exe EquivHarness # arithmetic equivalence corpus, no MARS, on tests/equiv/
 ```
 
 Requires Lean/Lake via `elan` (toolchain pinned in `lean-toolchain`,
@@ -134,6 +185,8 @@ Semantics/Step.lean            — step (the semantics) + run (fuel-bounded iter
 Semantics/Specs/StepSpec.lean  — the reviewable specification + proofs
 DiffHarness.lean               — differential-testing executable (Step vs MARS)
 tests/corpus/                  — .asm programs used by DiffHarness
+EquivHarness.lean              — arithmetic equivalence-corpus executable (no MARS)
+tests/equiv/                   — .asm program pairs used by EquivHarness
 docs/spec/                     — human-written MIPS spec (ground truth for `step`)
 vendor/mars/                   — real MARS 4.5 jar, used only by DiffHarness
 DESIGN.md                      — module map, dependency graph, build waves

@@ -21,6 +21,7 @@ Word ─┬─ Types ─┬─ State      (Wave 1, parallel)
       │         └─ Asm           (Wave 1, parallel)
       └──────────── Step (+Sim run loop)   (Wave 2, after Wave 1 merges)
                      DiffHarness exe       (Wave 3, after Step)
+                     EquivHarness exe      (post-G1, no MARS: see README "Equivalence corpus")
 ```
 
 | File | Owns | Depends on |
@@ -31,7 +32,8 @@ Word ─┬─ Types ─┬─ State      (Wave 1, parallel)
 | `Semantics/Instruction.lean` | `Instruction` enum, `decode`, `encode` + tests vs INSTRUCTION-REF encodings | Word, Types |
 | `Semantics/Asm.lean` | assembler: v1 subset source text → Program + golden tests | Word, Types |
 | `Semantics/Step.lean` | `step` (small-step semantics) + `Sim.run` loop + per-instruction unit tests | all of the above |
-| `Semantics/DiffHarness.lean` | exe: run corpus through Sim, spawn MARS, compare outputs | Step, Asm, IO |
+| `DiffHarness.lean` (repo root) | exe: run corpus through Sim, spawn MARS, compare outputs | Step, Asm, IO |
+| `EquivHarness.lean` (repo root) | exe: run `tests/equiv/` program pairs through Sim only (no MARS), check arithmetic equivalence | Step, Asm, IO |
 
 Foundation = Word + Types (Wave 0: implemented by a worker against §3, reviewed
 and committed by the orchestrator; **read-only for all subsequent workers**).
