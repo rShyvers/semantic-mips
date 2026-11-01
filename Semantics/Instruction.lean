@@ -20,12 +20,21 @@ Field-shape summary (see each constructor's docstring for details):
   movn movz` — `movn`/`movz` share the exact add/sub field shape but write
   `$rd` only conditionally on `$rt`.
 - R-type shift (`rd rt shamt`): `sll srl sra` — note `rs` is unused/ignored.
+- R-type variable shift (`rd rt rs`), MIPS32 (opcode 0, funct 0x04/0x06/0x07):
+  `sllv srlv srav` — the shift amount is the *register* `$rs`'s low 5 bits
+  (masked at execution time by `Step`), not a fixed `shamt` field; `shamt`
+  itself is unused/fixed 0 in the encoding (v1.x addition; see
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.4).
 - R-type mult/div (`rs rt`): `mult multu div divu` — `rd`/`shamt` unused.
 - R-type move (`rd`): `mflo mfhi` — `rs`/`rt`/`shamt` unused.
 - R-type bit-count (`rs rd`), SPECIAL2 (opcode 0x1c): `clo clz` — the raw 32-bit
   encoding's `rt` field duplicates `rd` (a real MIPS32 hardware quirk; see each
   constructor's docstring), so it is not modeled as a separate `Instruction`
   field.
+- R-type GPR multiply (`rs rt rd`), SPECIAL2 (opcode 0x1c, funct 0x02): `mul`
+  — same `rs rt rd` field shape as `add`, but SPECIAL2-opcoded like `clo`/
+  `clz`; writes the low 32 bits of the signed product directly to `$rd`
+  (v1.x addition; see `docs/spec/MIPS-COVERAGE-GAPS.md` §3.5).
 - R-type sign-extend (`rd rt`), SPECIAL3 BSHFL (opcode 0x1f, funct 0x20):
   `seb seh` — `rs` unused/fixed 0; distinguished from each other (and from
   other BSHFL sub-ops, none of which are in scope here) by the
@@ -124,6 +133,19 @@ inductive Instruction where
   | srl  (rd rt shamt : W32)
   /-- `$rd = $rt >> shamt`, arithmetic/sign-fill (opcode 0, funct 0x03). -/
   | sra  (rd rt shamt : W32)
+  -- R-type variable shift (opcode 0; shamt field unused/fixed 0). MIPS32
+  -- v1.x addition: compilers emit these (not `sll`/`srl`/`sra`) whenever
+  -- the shift amount is a runtime value rather than a compile-time
+  -- constant (`docs/spec/MIPS-COVERAGE-GAPS.md` §3.4).
+  /-- `$rd = $rt << ($rs & 0x1f)`, logical, shift amount from a register's
+  low 5 bits (opcode 0, funct 0x04). MIPS32. -/
+  | sllv (rd rt rs : W32)
+  /-- `$rd = $rt >> ($rs & 0x1f)`, logical/zero-fill, shift amount from a
+  register's low 5 bits (opcode 0, funct 0x06). MIPS32. -/
+  | srlv (rd rt rs : W32)
+  /-- `$rd = $rt >> ($rs & 0x1f)`, arithmetic/sign-fill, shift amount from a
+  register's low 5 bits (opcode 0, funct 0x07). MIPS32. -/
+  | srav (rd rt rs : W32)
   -- R-type mult/div (rd, shamt unused)
   /-- `{hi,lo} = $rs * $rt`, signed 64-bit (opcode 0, funct 0x18). -/
   | mult   (rs rt : W32)
@@ -149,6 +171,14 @@ inductive Instruction where
   /-- `$rd = ` the number of leading zero bits in `$rs`, counted from the MSB
   (32 if `$rs` is all-zero) (SPECIAL2 opcode 0x1c, funct 0x20). MIPS32. -/
   | clz (rs rd : W32)
+  -- R-type GPR multiply, SPECIAL2 (MIPS32). Unlike `clo`/`clz`, this is a
+  -- plain `rs rt rd` shape with no duplicated-field quirk.
+  /-- `$rd = ` low 32 bits of `$rs * $rt`, signed (SPECIAL2 opcode 0x1c,
+  funct 0x02). `hi`/`lo` are left **unchanged** by this dialect (real
+  MIPS32 hardware leaves them architecturally unpredictable after `mul`;
+  see `docs/spec/INSTRUCTION-REF.md` for the documented dialect choice).
+  MIPS32. -/
+  | mul (rs rt rd : W32)
   -- R-type SPECIAL3 BSHFL sign-extend (MIPS32r2). `rs` is unused/fixed 0;
   -- `funct` is 0x20 for the whole BSHFL sub-op family, and the shamt-position
   -- 5-bit sub-field (not a real shift amount here) selects which one.
@@ -343,6 +373,9 @@ def decode (w : W32) : Option Instruction :=
     | 0x00 => some (.sll rd rt shamt)
     | 0x02 => some (.srl rd rt shamt)
     | 0x03 => some (.sra rd rt shamt)
+    | 0x04 => some (.sllv rd rt rs)
+    | 0x06 => some (.srlv rd rt rs)
+    | 0x07 => some (.srav rd rt rs)
     | 0x18 => some (.mult rs rt)
     | 0x19 => some (.multu rs rt)
     | 0x1a => some (.div rs rt)
@@ -362,6 +395,7 @@ def decode (w : W32) : Option Instruction :=
     match (functOf w).toNat with
     | 0x21 => some (.clo rs rd)
     | 0x20 => some (.clz rs rd)
+    | 0x02 => some (.mul rs rt rd)
     | _ => none
   | 0x1f =>  -- SPECIAL3: BSHFL sign-extend family, selected by the shamt sub-field
     match (functOf w).toNat with
@@ -447,6 +481,9 @@ def encode (i : Instruction) : W32 :=
   | .sll  rd rt shamt => mkRT 0#32 rt rd shamt 0x00#32
   | .srl  rd rt shamt => mkRT 0#32 rt rd shamt 0x02#32
   | .sra  rd rt shamt => mkRT 0#32 rt rd shamt 0x03#32
+  | .sllv rd rt rs => mkRT rs rt rd 0#32 0x04#32
+  | .srlv rd rt rs => mkRT rs rt rd 0#32 0x06#32
+  | .srav rd rt rs => mkRT rs rt rd 0#32 0x07#32
   | .mult  rs rt => mkRT rs rt 0#32 0#32 0x18#32
   | .multu rs rt => mkRT rs rt 0#32 0#32 0x19#32
   | .div   rs rt => mkRT rs rt 0#32 0#32 0x1a#32
@@ -456,6 +493,7 @@ def encode (i : Instruction) : W32 :=
   -- SPECIAL2: duplicate rd into the rt-position field per the real encoding.
   | .clo rs rd => (0x1c#32 <<< 26) ||| mkRT rs rd rd 0#32 0x21#32
   | .clz rs rd => (0x1c#32 <<< 26) ||| mkRT rs rd rd 0#32 0x20#32
+  | .mul rs rt rd => (0x1c#32 <<< 26) ||| mkRT rs rt rd 0#32 0x02#32
   -- SPECIAL3 BSHFL: rs fixed 0, shamt-position field selects seb/seh.
   | .seb rd rt => (0x1f#32 <<< 26) ||| mkRT 0#32 rt rd 0x10#32 0x20#32
   | .seh rd rt => (0x1f#32 <<< 26) ||| mkRT 0#32 rt rd 0x18#32 0x20#32
@@ -532,6 +570,11 @@ example : decode (mkRT 0#32 8#32 3#32 5#32 0x00#32) = some (.sll 3#32 8#32 5#32)
 example : decode (mkRT 0#32 8#32 3#32 5#32 0x02#32) = some (.srl 3#32 8#32 5#32) := by decide
 example : decode (mkRT 0#32 8#32 3#32 5#32 0x03#32) = some (.sra 3#32 8#32 5#32) := by decide
 
+-- R-type variable shift: rd=3, rt=8, rs=29 (shamt field unused/0)
+example : decode (mkRT 29#32 8#32 3#32 0#32 0x04#32) = some (.sllv 3#32 8#32 29#32) := by decide
+example : decode (mkRT 29#32 8#32 3#32 0#32 0x06#32) = some (.srlv 3#32 8#32 29#32) := by decide
+example : decode (mkRT 29#32 8#32 3#32 0#32 0x07#32) = some (.srav 3#32 8#32 29#32) := by decide
+
 -- R-type mult/div: rs=29, rt=8
 example : decode (mkRT 29#32 8#32 0#32 0#32 0x18#32) = some (.mult 29#32 8#32) := by decide
 example : decode (mkRT 29#32 8#32 0#32 0#32 0x19#32) = some (.multu 29#32 8#32) := by decide
@@ -551,6 +594,9 @@ example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 3#32 3#32 0#32 0x20#32) = some
 -- decode also accepts the (nonconforming but documented-as-ignored) case
 -- where the raw rt field does *not* match rd, since hardware doesn't read it.
 example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 17#32 3#32 0#32 0x21#32) = some (.clo 29#32 3#32) := by decide
+
+-- SPECIAL2 GPR multiply: rs=29, rt=8, rd=3 (plain rs/rt/rd shape, no duplication quirk)
+example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 8#32 3#32 0#32 0x02#32) = some (.mul 29#32 8#32 3#32) := by decide
 
 -- SPECIAL3 BSHFL sign-extend: rd=3, rt=8, sub-field selects seb vs seh
 example : decode ((0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x10#32 0x20#32) = some (.seb 3#32 8#32) := by decide
@@ -649,6 +695,8 @@ example : encode (.sll 3#32 8#32 5#32) = mkRT 0#32 8#32 3#32 5#32 0x00#32 := by 
 example : encode (.movn 29#32 8#32 3#32) = mkRT 29#32 8#32 3#32 0#32 0x0b#32 := by decide
 example : encode (.clo 29#32 3#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 3#32 3#32 0#32 0x21#32 := by decide
 example : encode (.seb 3#32 8#32) = (0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x10#32 0x20#32 := by decide
+example : encode (.sllv 3#32 8#32 29#32) = mkRT 29#32 8#32 3#32 0#32 0x04#32 := by decide
+example : encode (.mul 29#32 8#32 3#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 8#32 3#32 0#32 0x02#32 := by decide
 -- full round trip for every new instruction (decode ∘ encode = id on the field values we store)
 example : decode (encode (.movn 29#32 8#32 3#32)) = some (.movn 29#32 8#32 3#32) := by decide
 example : decode (encode (.movz 29#32 8#32 3#32)) = some (.movz 29#32 8#32 3#32) := by decide
@@ -656,6 +704,10 @@ example : decode (encode (.clo 29#32 3#32)) = some (.clo 29#32 3#32) := by decid
 example : decode (encode (.clz 29#32 3#32)) = some (.clz 29#32 3#32) := by decide
 example : decode (encode (.seb 3#32 8#32)) = some (.seb 3#32 8#32) := by decide
 example : decode (encode (.seh 3#32 8#32)) = some (.seh 3#32 8#32) := by decide
+example : decode (encode (.sllv 3#32 8#32 29#32)) = some (.sllv 3#32 8#32 29#32) := by decide
+example : decode (encode (.srlv 3#32 8#32 29#32)) = some (.srlv 3#32 8#32 29#32) := by decide
+example : decode (encode (.srav 3#32 8#32 29#32)) = some (.srav 3#32 8#32 29#32) := by decide
+example : decode (encode (.mul 29#32 8#32 3#32)) = some (.mul 29#32 8#32 3#32) := by decide
 example : encode .break = mkRT 0#32 0#32 0#32 0#32 0x0d#32 := by decide
 example : encode (.teq 29#32 8#32) = mkRT 29#32 8#32 0#32 0#32 0x34#32 := by decide
 

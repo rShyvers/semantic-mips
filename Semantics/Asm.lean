@@ -24,6 +24,11 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   `movn`/`movz` (fit the `rd, rs, rt` R-type shape exactly, table-driven like
   `add`), and `clo`/`clz`/`seb`/`seh` (SPECIAL2/SPECIAL3 opcodes, hand-encoded
   below since they don't fit any existing `RForm`).
+- Further MIPS32 additions (docs/spec/MIPS-COVERAGE-GAPS.md section 3.4/3.5):
+  `sllv`/`srlv`/`srav` (`rd, rt, rs` -- same opcode-0 shape as `shift` but the
+  shift amount is a register, table-driven via a new `.shiftv` `RForm`), and
+  `mul` (`rd, rs, rt` -- SPECIAL2-opcoded like `clo`/`clz`, hand-encoded
+  alongside them since `rTable` only handles opcode-0 forms).
 - The coprocessor-0 trap/exception family (real MIPS32 ISA, added on top of
   the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): `teq`/`tne`/
   `tlt`/`tge`/`tltu`/`tgeu` (`rs, rt` operands, same shape as `mult`/`div`),
@@ -301,6 +306,7 @@ private def parseMemOperand (tok : String) (line : Nat) : Except AsmError (Int �
 private inductive RForm
   | arith3   -- rd, rs, rt
   | shift    -- rd, rt, shamt
+  | shiftv   -- rd, rt, rs (variable shift; shamt field unused/0)
   | multdiv  -- rs, rt
   | hilo     -- rd
 
@@ -320,6 +326,10 @@ private def rTable : List (String × Nat × RForm) :=
    ("slt", 0x2a, .arith3), ("sltu", 0x2b, .arith3),
    ("movn", 0x0b, .arith3), ("movz", 0x0a, .arith3),  -- MIPS32r2; same opcode-0 `rd, rs, rt` shape as `add`
    ("sll", 0x00, .shift), ("srl", 0x02, .shift), ("sra", 0x03, .shift),
+   -- Variable shifts (MIPS32; docs/spec/MIPS-COVERAGE-GAPS.md section 3.4):
+   -- same opcode-0 `rd, rt, rs` shape as `shift`, but the third operand is a
+   -- register (the shift amount), not an immediate shamt.
+   ("sllv", 0x04, .shiftv), ("srlv", 0x06, .shiftv), ("srav", 0x07, .shiftv),
    ("mult", 0x18, .multdiv), ("multu", 0x19, .multdiv), ("div", 0x1a, .multdiv), ("divu", 0x1b, .multdiv),
    ("mfhi", 0x10, .hilo), ("mflo", 0x12, .hilo),
    -- Trap-on-condition family (same `rs, rt` shape as `mult`/`div`): real
@@ -376,9 +386,12 @@ private def directiveSet : List String := [".text", ".data", ".word", ".half", "
 
 /-- SPECIAL2/SPECIAL3 mnemonics with an opcode-bearing R-type-like shape that
 doesn't fit any existing `RForm` (nonzero opcode and/or an operand count
-that doesn't match `arith3`/`shift`/`multdiv`/`hilo`); hand-encoded directly
-in `encodeInstruction` below instead of via `rTable`. -/
-private def bshflMnemonics : List String := ["clo", "clz", "seb", "seh"]
+that doesn't match `arith3`/`shift`/`shiftv`/`multdiv`/`hilo`); hand-encoded
+directly in `encodeInstruction` below instead of via `rTable`. `mul` has the
+same `rd, rs, rt` operand shape as `arith3`, but is SPECIAL2-opcoded (0x1c)
+like `clo`/`clz` rather than plain SPECIAL (opcode 0), so it is hand-encoded
+here too rather than via `rTable`. -/
+private def bshflMnemonics : List String := ["clo", "clz", "seb", "seh", "mul"]
 
 private def isKnownMnemonic (m : String) : Bool :=
   rTable.any (·.1 == m) ∨ iTable.any (·.1 == m) ∨ jTable.any (·.1 == m) ∨
@@ -612,6 +625,14 @@ private def encodeRForm (name : String) (funct : Nat) (form : RForm) (operands :
         if sh < 0 ∨ sh > 31 then throw (.badImmediate s!"{name} shamt out of range (0-31)" lineNo)
         pure (rtWord 0 rt rd sh.toNat funct)
     | _ => throw (.badOperand s!"{name} expects 'rd, rt, shamt'" lineNo)
+  | .shiftv =>
+    match operands with
+    | [rdT, rtT, rsT] => do
+        let rd ← parseRegister rdT lineNo
+        let rt ← parseRegister rtT lineNo
+        let rs ← parseRegister rsT lineNo
+        pure (rtWord rs rt rd 0 funct)
+    | _ => throw (.badOperand s!"{name} expects 'rd, rt, rs'" lineNo)
   | .multdiv =>
     match operands with
     | [rsT, rtT] => do
@@ -806,6 +827,18 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
         let rs ← parseRegister rsT item.lineNo
         pure [opRtWord 0x1c rs rd rd 0 0x20]
     | _ => throw (.badOperand s!"clz expects 'rd, rs'" item.lineNo)
+  -- SPECIAL2 GPR multiply (MIPS32): `mul $rd, $rs, $rt`. Plain `rs, rt, rd`
+  -- shape, unlike `clo`/`clz` -- no duplicated-field quirk -- but still
+  -- SPECIAL2-opcoded (0x1c), so it needs `opRtWord` rather than plain
+  -- `rtWord`/`rTable` (docs/spec/MIPS-COVERAGE-GAPS.md §3.5).
+  | "mul" =>
+    match item.operands with
+    | [rdT, rsT, rtT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rs ← parseRegister rsT item.lineNo
+        let rt ← parseRegister rtT item.lineNo
+        pure [opRtWord 0x1c rs rt rd 0 0x02]
+    | _ => throw (.badOperand s!"mul expects 'rd, rs, rt'" item.lineNo)
   -- SPECIAL3 BSHFL sign-extend (MIPS32r2): `seb $rd, $rt` / `seh $rd, $rt`.
   -- `rs` is unused/fixed 0; the shamt-position field (0x10/0x18) selects
   -- which BSHFL sub-op this is.
@@ -1012,6 +1045,21 @@ def movProg : Program :=
 #guard decode (movProg.getD textBase 0) = some (.movn 9#32 10#32 8#32)
 #guard decode (movProg.getD (textBase + 4#32) 0) = some (.movz 9#32 10#32 8#32)
 
+-- `sllv`/`srlv`/`srav $rd, $rt, $rs`: table-driven like `shift`, but the
+-- third operand is a register (the shift amount), opcode 0.
+def shiftvSrc : String := "sllv $t0, $t1, $t2\nsrlv $t0, $t1, $t2\nsrav $t0, $t1, $t2\n"
+def shiftvProg : Program :=
+  match assemble shiftvSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard shiftvProg.getD textBase 0 = mkRT (10#32) (9#32) (8#32) (0#32) (0x04#32)
+#guard shiftvProg.getD (textBase + 4#32) 0 = mkRT (10#32) (9#32) (8#32) (0#32) (0x06#32)
+#guard shiftvProg.getD (textBase + 8#32) 0 = mkRT (10#32) (9#32) (8#32) (0#32) (0x07#32)
+#guard decode (shiftvProg.getD textBase 0) = some (.sllv 8#32 9#32 10#32)
+#guard decode (shiftvProg.getD (textBase + 4#32) 0) = some (.srlv 8#32 9#32 10#32)
+#guard decode (shiftvProg.getD (textBase + 8#32) 0) = some (.srav 8#32 9#32 10#32)
+
 -- `clo $rd, $rs` / `clz $rd, $rs`: SPECIAL2 opcode 0x1c, rt field duplicates rd.
 def cloClzSrc : String := "clo $t0, $t1\nclz $t0, $t1\n"
 def cloClzProg : Program :=
@@ -1023,6 +1071,17 @@ def cloClzProg : Program :=
 #guard cloClzProg.getD (textBase + 4#32) 0 = (natToW32 0x1c <<< 26) ||| mkRT (9#32) (8#32) (8#32) (0#32) (0x20#32)
 #guard decode (cloClzProg.getD textBase 0) = some (.clo 9#32 8#32)
 #guard decode (cloClzProg.getD (textBase + 4#32) 0) = some (.clz 9#32 8#32)
+
+-- `mul $rd, $rs, $rt`: SPECIAL2 opcode 0x1c, plain rs/rt/rd shape (no
+-- duplicated-field quirk, unlike clo/clz).
+def mulSrc : String := "mul $t0, $t1, $t2\n"
+def mulProg : Program :=
+  match assemble mulSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard mulProg.getD textBase 0 = (natToW32 0x1c <<< 26) ||| mkRT (9#32) (10#32) (8#32) (0#32) (0x02#32)
+#guard decode (mulProg.getD textBase 0) = some (.mul 9#32 10#32 8#32)
 
 -- `seb $rd, $rt` / `seh $rd, $rt`: SPECIAL3 opcode 0x1f, funct 0x20, the
 -- shamt-position sub-field (0x10/0x18) selects seb vs seh.

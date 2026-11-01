@@ -277,6 +277,19 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rt) >>> shamt.toNat))
   | .sra rd rt shamt =>
     mkNext s (writeReg s (regIdx rd) ((readReg s (regIdx rt)).sshiftRight shamt.toNat))
+  -- R-type variable shifts (MIPS32): the shift amount comes from `$rs`'s
+  -- low 5 bits (`extractLsb 4 0`), not a fixed `shamt` field \u2014 so e.g. a
+  -- shift-amount register holding 33 (0b100001) behaves identically to one
+  -- holding 1, per the real MIPS32 ISA (docs/spec/MIPS-COVERAGE-GAPS.md \u00a73.4).
+  | .sllv rd rt rs =>
+    let amt := ((readReg s (regIdx rs)).extractLsb 4 0).toNat
+    mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rt) <<< amt))
+  | .srlv rd rt rs =>
+    let amt := ((readReg s (regIdx rs)).extractLsb 4 0).toNat
+    mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rt) >>> amt))
+  | .srav rd rt rs =>
+    let amt := ((readReg s (regIdx rs)).extractLsb 4 0).toNat
+    mkNext s (writeReg s (regIdx rd) ((readReg s (regIdx rt)).sshiftRight amt))
   -- R-type mult/div
   | .mult rs rt =>
     let a := asSigned (readReg s (regIdx rs))
@@ -310,6 +323,17 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     mkNext s (writeReg s (regIdx rd) (BitVec.ofNat 32 (countLeadingOnes (readReg s (regIdx rs)))))
   | .clz rs rd =>
     mkNext s (writeReg s (regIdx rd) (BitVec.ofNat 32 (countLeadingZeros (readReg s (regIdx rs)))))
+  -- SPECIAL2 GPR multiply (MIPS32): `$rd` gets the low 32 bits of the
+  -- signed product, exactly the bits `mult`+`mflo` would leave in `lo`
+  -- (two's-complement multiplication's low bits don't depend on the sign
+  -- interpretation of the operands, so plain `W32` `*` already wraps
+  -- correctly here \u2014 no need to go through `asSigned`/`BitVec.ofInt` the
+  -- way `.mult` does). `hi`/`lo` are deliberately left **unchanged**: real
+  -- MIPS32 hardware leaves them unpredictable after `mul`, and this is the
+  -- simplest deterministic choice for this model (see `Instruction.mul`'s
+  -- docstring and `docs/spec/INSTRUCTION-REF.md`).
+  | .mul rs rt rd =>
+    mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rs) * readReg s (regIdx rt)))
   -- SPECIAL3 BSHFL sign-extend (MIPS32r2)
   | .seb rd rt =>
     mkNext s (writeReg s (regIdx rd) (signExtLowByte (readReg s (regIdx rt))))
@@ -809,6 +833,18 @@ private def seededHiLo : State := { regs0 with hi := 0xdeadbeef#32, lo := 0xcafe
 -- divu: zero divisor unchanged, no halt
 #guard isNext (step (prog1 (.divu 8#32 9#32)) (setRegs seededHiLo [(8, 10#32), (9, 0#32)]))
 
+-- ### mul (MIPS32 SPECIAL2 GPR multiply; docs/spec/MIPS-COVERAGE-GAPS.md §3.5)
+-- `mul`'s result must match the low 32 bits `mult`+`mflo` would produce, for
+-- the same operand pairs already exercised above -- including one whose
+-- 64-bit product overflows 32 bits signed, confirming the wraparound -- and
+-- `mul` must leave `hi`/`lo` unchanged (the pinned dialect choice).
+#guard nextRegEq (step (prog1 (.mul 8#32 9#32 10#32)) (setRegs regs0 [(8, 6#32), (9, 7#32)])) 10 42#32  -- matches mult/mflo's lo above (0#32 42#32)
+#guard nextRegEq (step (prog1 (.mul 8#32 9#32 10#32)) (setRegs regs0 [(8, 0x88ca6c00#32), (9, 0x88ca6c00#32)]))
+  10 0x9d900000#32  -- matches mult/mflo's lo above (overflows 32-bit signed: hi was nonzero, 0x3782dace)
+#guard nextHiLoEq (step (prog1 (.mul 8#32 9#32 10#32)) (setRegs seededHiLo [(8, 6#32), (9, 7#32)]))
+  0xdeadbeef#32 0xcafef00d#32  -- hi/lo unchanged by mul
+#guard nextRegEq (step (prog1 (.mul 8#32 9#32 10#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 2#32)])) 10 0xfffffffe#32  -- (-1) * 2 = -2, wraps
+
 -- ### clo/clz/movn/movz/seb/seh (MIPS32/MIPS32r2 additions; see
 -- docs/spec/INSTRUCTION-REF.md)
 
@@ -827,6 +863,33 @@ private def seededHiLo : State := { regs0 with hi := 0xdeadbeef#32, lo := 0xcafe
 -- seh: sign-extends only the low halfword of $rt
 #guard nextRegEq (step (prog1 (.seh 10#32 8#32)) (setRegs regs0 [(8, 0x1234ffff#32)])) 10 0xffffffff#32
 #guard nextRegEq (step (prog1 (.seh 10#32 8#32)) (setRegs regs0 [(8, 0x12347fff#32)])) 10 0x00007fff#32
+
+-- ### sllv/srlv/srav (MIPS32 variable shifts; docs/spec/MIPS-COVERAGE-GAPS.md
+-- §3.4): the shift amount is `$rs`'s low 5 bits, not a `shamt` field --
+-- these mirror the sll/srl/sra shamt-0/31 cases above but via a register,
+-- and a shift-amount register holding 33 (0x21, i.e. 32 + 1) must behave
+-- identically to one holding 1 (the masking test).
+#guard nextRegEq (step (prog1 (.sllv 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x12345678#32), (9, 0#32)]))
+  10 0x12345678#32
+#guard nextRegEq (step (prog1 (.sllv 10#32 8#32 9#32)) (setRegs regs0 [(8, 1#32), (9, 31#32)]))
+  10 0x80000000#32
+#guard nextRegEq (step (prog1 (.srlv 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 31#32)]))
+  10 1#32
+#guard nextRegEq (step (prog1 (.srav 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 31#32)]))
+  10 0xffffffff#32
+-- masking: shift-amount register holding 33 behaves identically to holding 1
+#guard nextRegEq (step (prog1 (.sllv 10#32 8#32 9#32)) (setRegs regs0 [(8, 1#32), (9, 33#32)]))
+  10 2#32
+#guard nextRegEq (step (prog1 (.sllv 10#32 8#32 9#32)) (setRegs regs0 [(8, 1#32), (9, 1#32)]))
+  10 2#32
+#guard nextRegEq (step (prog1 (.srlv 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 33#32)]))
+  10 0x40000000#32
+#guard nextRegEq (step (prog1 (.srlv 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 1#32)]))
+  10 0x40000000#32
+#guard nextRegEq (step (prog1 (.srav 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 33#32)]))
+  10 0xc0000000#32
+#guard nextRegEq (step (prog1 (.srav 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 1#32)]))
+  10 0xc0000000#32
 
 -- ### addi overflow trap vs addiu wrap; andi/ori/xori high-imm-bits; lui
 
