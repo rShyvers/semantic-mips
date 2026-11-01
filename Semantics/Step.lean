@@ -94,17 +94,29 @@ it). -/
 private def mkNext (orig result : State) : StepResult :=
   StepResult.next (advance orig result)
 
-/-- Whether `instr` is one of the twelve branch/jump instructions that
-schedule a delay-slot transfer (`beq`,`bne`,`blez`,`bgtz`,`bltz`,`bgez`,
-`bltzal`,`bgezal`,`j`,`jal`,`jr`,`jalr`). Used to detect a branch/jump
-occurring itself inside another's delay slot (real MIPS32 leaves this
-architecturally discouraged/implementation-defined), so `execInstr` can
-halt with `HaltReason.branchInDelaySlot` instead of guessing. -/
+/-- Whether `instr` is one of the twenty branch/jump instructions that
+schedule a delay-slot transfer when taken (`beq`,`bne`,`blez`,`bgtz`,
+`bltz`,`bgez`,`bltzal`,`bgezal`,`j`,`jal`,`jr`,`jalr`, plus the eight
+"branch likely" instructions `beql`,`bnel`,`blezl`,`bgtzl`,`bltzl`,`bgezl`,
+`bltzall`,`bgezall` -- real MIPS32, deprecated in MIPS32/removed in Release 6,
+MIPS-COVERAGE-GAPS.md §3.3). Used to detect a branch/jump occurring itself
+inside another's delay slot (real MIPS32 leaves this architecturally
+discouraged/implementation-defined), so `execInstr` can halt with
+`HaltReason.branchInDelaySlot` instead of guessing. The branch-likely
+instructions are included here on the same footing as every other branch:
+this check only ever fires when `s.pendingBranch.isSome`, i.e. when a
+previous *taken* branch/jump's delay slot is still pending -- exactly the
+same condition under which `beq` in a delay slot halts -- and is unrelated
+to `State.squashNext`/the not-taken-branch-likely squash mechanism (see its
+docstring in `Types.lean`), which is enforced separately by `run`, one
+level above `step`/`execInstr` entirely (see `run`'s docstring below). -/
 private def isBranchLike (instr : Instruction) : Bool :=
   match instr with
   | .beq _ _ _ | .bne _ _ _ | .blez _ _ | .bgtz _ _
   | .bltz _ _ | .bgez _ _ | .bltzal _ _ | .bgezal _ _
-  | .j _ | .jal _ | .jr _ | .jalr _ _ => true
+  | .j _ | .jal _ | .jr _ | .jalr _ _
+  | .beql _ _ _ | .bnel _ _ _ | .blezl _ _ | .bgtzl _ _
+  | .bltzl _ _ | .bgezl _ _ | .bltzall _ _ | .bgezall _ _ => true
   | _ => false
 
 /-- Signed-overflow predicate for `add`/`addi`, following INSTRUCTION-REF's
@@ -723,6 +735,77 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
       StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
     else
       mkNext s s'
+  -- "Branch likely" family (real MIPS32; deprecated in MIPS32, removed in
+  -- Release 6 -- MD00086 Rev 2.50 §3.2, Table 3-10, p. 28;
+  -- docs/spec/MIPS-COVERAGE-GAPS.md §3.3). Architecturally different from
+  -- every other branch/jump above: a **taken** branch-likely behaves
+  -- exactly like its non-likely counterpart (falls through to `pcNext`,
+  -- schedules the real target in `pendingBranch` -- the delay slot
+  -- executes normally). A **not-taken** branch-likely does *not* fall
+  -- through normally: it sets `State.squashNext := true` and leaves `pc`
+  -- at `pcNext` (the delay-slot instruction's own address) -- `run`'s `go`
+  -- loop (see its docstring below) is what actually skips that
+  -- instruction's fetch/decode/execution on the *next* iteration, advancing
+  -- `pc` one further word without ever calling `step` on it. `step` itself
+  -- is never told about `squashNext` (so this one `execInstr` case is the
+  -- only place in this file, other than `run`, that mentions the field at
+  -- all). No `mkNext`/`advance` call is used for the not-taken case (unlike the
+  -- non-likely branches' `mkNext s s`), since `advance`'s normal
+  -- `pendingBranch`-or-`pc+4` logic has no notion of squashing; incoming
+  -- `s.pendingBranch` is always `none` here regardless, since `execInstr`'s
+  -- `isBranchLike` check above already intercepts (and halts) any
+  -- branch-likely instruction reached with a pending transfer already
+  -- scheduled.
+  | .beql rs rt imm =>
+    let pcNext := s.pc + 4#32
+    if readReg s (regIdx rs) == readReg s (regIdx rt) then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s with pc := pcNext, squashNext := true }
+  | .bnel rs rt imm =>
+    let pcNext := s.pc + 4#32
+    if readReg s (regIdx rs) == readReg s (regIdx rt) then
+      StepResult.next { s with pc := pcNext, squashNext := true }
+    else
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+  | .blezl rs imm =>
+    let pcNext := s.pc + 4#32
+    if asSigned (readReg s (regIdx rs)) ≤ 0 then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s with pc := pcNext, squashNext := true }
+  | .bgtzl rs imm =>
+    let pcNext := s.pc + 4#32
+    if 0 < asSigned (readReg s (regIdx rs)) then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s with pc := pcNext, squashNext := true }
+  | .bltzl rs imm =>
+    let pcNext := s.pc + 4#32
+    if asSigned (readReg s (regIdx rs)) < 0 then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s with pc := pcNext, squashNext := true }
+  | .bgezl rs imm =>
+    let pcNext := s.pc + 4#32
+    if 0 ≤ asSigned (readReg s (regIdx rs)) then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s with pc := pcNext, squashNext := true }
+  | .bltzall rs imm =>
+    let pcNext := s.pc + 4#32
+    let s' := writeReg s 31 (pcNext + 4#32)
+    if asSigned (readReg s (regIdx rs)) < 0 then
+      StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s' with pc := pcNext, squashNext := true }
+  | .bgezall rs imm =>
+    let pcNext := s.pc + 4#32
+    let s' := writeReg s 31 (pcNext + 4#32)
+    if 0 ≤ asSigned (readReg s (regIdx rs)) then
+      StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s' with pc := pcNext, squashNext := true }
   | .j target =>
     let pcNext := s.pc + 4#32
     StepResult.next
@@ -982,7 +1065,19 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
 
 /-- Execute a single instruction: fetch at `s.pc`, decode, and dispatch.
 Total: fetch/decode failure and syscall-dispatch failure all become defined
-`HaltReason`s rather than partial behavior. -/
+`HaltReason`s rather than partial behavior.
+
+Deliberately does **not** inspect `s.squashNext` at all: `step` is otherwise
+unchanged from before the "branch likely" family existed (not touching this
+function's behavior keeps every pre-existing `Specs/StepSpec.lean` theorem
+about `step` valid with zero changes, since they all reason about a fully
+generic `State` with no constraint on `squashNext`). The actual squash
+enforcement -- skipping fetch/decode/execution of the instruction sitting
+at `pc` when `squashNext` is set -- lives one level up, in `run`'s `go`
+loop below, which checks the flag on the *incoming* state before ever
+calling `step`. `squashNext` still exists as a `State` field (so the
+not-taken branch-likely `execInstr` cases above can set it), `step` just
+never reads it back. -/
 def step (p : Program) (s : State) : StepResult :=
   match fetchWord p s.pc with
   | none => StepResult.halt (.addressError s.pc)
@@ -1002,14 +1097,31 @@ inductive RunResult where
 /-- Run `step` repeatedly from `s₀` until it halts or `maxSteps` instructions
 have been executed, whichever comes first. Total by structural recursion on
 the fuel parameter. `steps` counts every executed instruction, including the
-one that produces a halt (if any). -/
+one that produces a halt (if any).
+
+This is also where the "branch likely" family's not-taken squash is
+actually enforced (see `State.squashNext`'s docstring in `Types.lean`):
+before calling `step` at all, `go` checks the *incoming* state's
+`squashNext` flag. If set, the instruction sitting at `pc` is the
+nullified delay-slot instruction -- real MIPS32 hardware never fetches or
+decodes it -- so `go` skips `step` entirely for this iteration, directly
+advancing `pc` by one word, clearing the flag, and consuming one unit of
+the step budget (matching real hardware's instruction-issue timing: a
+squashed slot still occupies one pipeline cycle, it just has no effect).
+This holds even when the word at that address is undecodable garbage --
+`step`/`decode` are never even called on it, so no `illegalInstruction`
+halt is possible there. Only when `squashNext` is `false` does `go` fall
+through to the ordinary `step` call. -/
 def run (p : Program) (s₀ : State) (maxSteps : Nat) : RunResult :=
   let rec go : Nat → State → Nat → RunResult
     | 0, s, steps => .limitReached s steps
     | fuel + 1, s, steps =>
-      match step p s with
-      | .halt r => .halted r s (steps + 1)
-      | .next s' => go fuel s' (steps + 1)
+      if s.squashNext then
+        go fuel { s with pc := s.pc + 4#32, squashNext := false } (steps + 1)
+      else
+        match step p s with
+        | .halt r => .halted r s (steps + 1)
+        | .next s' => go fuel s' (steps + 1)
   go maxSteps s₀ 0
 
 -- ## Tests
@@ -1711,6 +1823,97 @@ private def swlSwrIdiomProg : Program :=
 #guard nextPcEq (step (prog1 (.bgezal 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)]))
   (textBase + 4#32)
 
+-- ### beql/bnel/blezl/bgtzl/bltzl/bgezl/bltzall/bgezall: "branch likely"
+-- family (real MIPS32; deprecated in MIPS32, removed in Release 6 --
+-- MIPS-COVERAGE-GAPS.md \u00a73.3). This is the one family in this file that is
+-- architecturally *not* a `pendingBranch` variant: a **taken** instance
+-- behaves exactly like its non-likely counterpart (`stepThroughDelaySlot`,
+-- same as `beq`/`bltz` above); a **not-taken** instance instead squashes
+-- (nullifies) its own delay-slot instruction -- `step` never fetches,
+-- decodes, or executes whatever word sits there, even if it is
+-- undecodable garbage.
+
+-- `beql` taken: identical two-step shape to `beq` taken.
+#guard stepThroughDelaySlot textBase (.beql 8#32 9#32 3#32) (setRegs regs0 [(8, 5#32), (9, 5#32)])
+  = some (textBase + 4#32 + 12#32)
+-- `beql` not taken: the branch's own step falls through to `pcNext` (the
+-- delay-slot instruction's own address) with `squashNext` set and *no*
+-- `pendingBranch` scheduled -- unlike the non-likely `beq`'s not-taken
+-- case (`mkNext s s`, an ordinary ignorable fallthrough), this flags the
+-- next instruction to be skipped rather than executed.
+#guard (match step (prog1 (.beql 8#32 9#32 3#32)) (setRegs regs0 [(8, 5#32), (9, 6#32)]) with
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true && s.pendingBranch == none
+        | .halt _ => false)
+
+-- The key behavioral difference from every other branch in this codebase:
+-- when not taken, the delay-slot instruction is skipped entirely -- *even
+-- when it is an undecodable garbage word that would otherwise halt with
+-- `illegalInstruction`* -- because real hardware never even looks at it.
+-- The actual skip is enforced by `run` (not a bare `step` call -- see
+-- `run`'s docstring), so this needs `run` with a 2-step budget: step 1 is
+-- the not-taken `beql` itself (sets `squashNext`), step 2 is `run`
+-- consuming the squashed slot directly without ever calling `step` on it.
+private def squashGarbageWord : W32 := (0x11#32 <<< 26) ||| (0x1f#32 <<< 21)  -- undecodable: COP1 fmt 0x1f is not MF/MT/BC1/S/W
+private def beqlNotTakenGarbageProg : Program :=
+  ((∅ : Program).insert textBase (encode (.beql 8#32 9#32 3#32))).insert (textBase + 4#32) squashGarbageWord
+#guard (match run beqlNotTakenGarbageProg (setRegs regs0 [(8, 5#32), (9, 6#32)]) 2 with
+        | .limitReached s2 steps => steps == 2 && s2.pc == textBase + 8#32 && s2.squashNext == false
+        | .halted _ _ _ => false)  -- must NOT halt (e.g. illegalInstruction) on the squashed garbage word
+
+-- `bnel`: opposite polarity to `beql`, same mechanism.
+#guard stepThroughDelaySlot textBase (.bnel 8#32 9#32 3#32) (setRegs regs0 [(8, 5#32), (9, 6#32)])
+  = some (textBase + 4#32 + 12#32)
+#guard (match step (prog1 (.bnel 8#32 9#32 3#32)) (setRegs regs0 [(8, 5#32), (9, 5#32)]) with
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true && s.pendingBranch == none
+        | .halt _ => false)
+
+-- `blezl`/`bgtzl`: same conditions as `blez`/`bgtz`, squash instead of
+-- ordinary fallthrough when not taken.
+#guard stepThroughDelaySlot textBase (.blezl 8#32 2#32) (setRegs regs0 [(8, 0xfffffffb#32)])  -- -5 \u2264 0
+  = some (textBase + 4#32 + 8#32)
+#guard (match step (prog1 (.blezl 8#32 2#32)) (setRegs regs0 [(8, 5#32)]) with  -- 5 \u2264 0 is false
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true
+        | .halt _ => false)
+#guard stepThroughDelaySlot textBase (.bgtzl 8#32 2#32) (setRegs regs0 [(8, 5#32)])  -- 5 > 0
+  = some (textBase + 4#32 + 8#32)
+#guard (match step (prog1 (.bgtzl 8#32 2#32)) (setRegs regs0 [(8, 0#32)]) with  -- 0 > 0 is false
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true
+        | .halt _ => false)
+
+-- `bltzl`/`bgezl` (REGIMM): same conditions as `bltz`/`bgez`.
+#guard stepThroughDelaySlot textBase (.bltzl 8#32 2#32) (setRegs regs0 [(8, 0xfffffffb#32)])  -- -5 < 0
+  = some (textBase + 4#32 + 8#32)
+#guard (match step (prog1 (.bltzl 8#32 2#32)) (setRegs regs0 [(8, 0#32)]) with  -- 0 < 0 is false
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true
+        | .halt _ => false)
+#guard stepThroughDelaySlot textBase (.bgezl 8#32 2#32) (setRegs regs0 [(8, 0#32)])  -- 0 >= 0
+  = some (textBase + 4#32 + 8#32)
+#guard (match step (prog1 (.bgezl 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)]) with  -- -5>=0 false
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true
+        | .halt _ => false)
+
+-- `bltzall`/`bgezall` (REGIMM): same unconditional-`$ra`-link convention as
+-- `bltzal`/`bgezal` -- the link happens whether the branch is taken or
+-- squashed.
+#guard nextRegEq (step (prog1 (.bltzall 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)])) 31
+  (textBase + 8#32)  -- taken: -5 < 0
+#guard nextRegEq (step (prog1 (.bltzall 8#32 2#32)) (setRegs regs0 [(8, 5#32)])) 31
+  (textBase + 8#32)  -- squashed: 5 < 0 is false, $ra still linked
+#guard stepThroughDelaySlot textBase (.bltzall 8#32 2#32) (setRegs regs0 [(8, 0xfffffffb#32)])
+  = some (textBase + 4#32 + 8#32)
+#guard (match step (prog1 (.bltzall 8#32 2#32)) (setRegs regs0 [(8, 5#32)]) with
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true
+        | .halt _ => false)
+#guard nextRegEq (step (prog1 (.bgezall 8#32 2#32)) (setRegs regs0 [(8, 5#32)])) 31
+  (textBase + 8#32)  -- taken: 5 >= 0
+#guard nextRegEq (step (prog1 (.bgezall 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)])) 31
+  (textBase + 8#32)  -- squashed: -5 >= 0 is false, $ra still linked
+#guard stepThroughDelaySlot textBase (.bgezall 8#32 2#32) (setRegs regs0 [(8, 5#32)])
+  = some (textBase + 4#32 + 8#32)
+#guard (match step (prog1 (.bgezall 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)]) with
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true
+        | .halt _ => false)
+
 -- ### j/jal: exact targets including top-4-bit preservation from `pc_next`;
 -- jal $ra links to `pc + 8` (past the delay slot), not `pc + 4`
 
@@ -1801,6 +2004,15 @@ private def crossRegionState : State := { regs0 with pc := 0x90400000#32 }
         | some s1 =>
           isHaltBranchInDelaySlot
             (step (buildProg textBase [.beq 8#32 9#32 1#32, .bltz 8#32 0#32]) s1)
+        | none => false)
+-- `beql` right after a taken `beq` halts the same way (confirms the
+-- branch-likely family is included in `isBranchLike`, same `pendingBranch`
+-- condition as every other branch/jump -- unrelated to `squashNext`).
+#guard (match stepState (buildProg textBase [.beq 8#32 9#32 1#32, .beql 8#32 8#32 0#32])
+          (setRegs regs0 [(8, 5#32), (9, 5#32)]) with
+        | some s1 =>
+          isHaltBranchInDelaySlot
+            (step (buildProg textBase [.beq 8#32 9#32 1#32, .beql 8#32 8#32 0#32]) s1)
         | none => false)
 
 -- ### syscalls

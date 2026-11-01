@@ -47,6 +47,33 @@ structure State where
   `Step.lean`'s `advance`). `none` means no transfer is pending — the
   common case, and the only one `initialState` ever produces. -/
   pendingBranch : Option W32 := none
+  /-- Set by a **not-taken** branch-likely instruction (`beql`/`bnel`/
+  `blezl`/`bgtzl`/`bltzl`/`bgezl`/`bltzall`/`bgezall`, MIPS32 "branch
+  likely" family -- real MIPS32, deprecated in MIPS32 and removed in
+  Release 6, MD00086 Rev 2.50 §3.2, Table 3-10, p. 28; see
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.3 and `docs/spec/INSTRUCTION-REF.md`).
+  This is an architecturally different mechanism from `pendingBranch`
+  above, not a variant of it: every other branch/jump in this document
+  always executes its delay-slot instruction, taken or not -- that is what
+  `pendingBranch` models. Branch-likely instructions do not: if *not*
+  taken, the delay-slot instruction is architecturally nullified
+  ("squashed") -- it is never fetched, decoded, or executed, and control
+  falls straight through to `pc + 8` (past both the branch and its
+  squashed delay slot). A not-taken branch-likely instruction sets this
+  flag and advances `pc` only to `pc + 4` (the squashed instruction's own
+  address); `Step.lean`'s `run` loop -- deliberately **not** `step` itself,
+  so every pre-existing `step`-level theorem in `Specs/StepSpec.lean`
+  stays valid unchanged -- checks this flag on the *incoming* state before
+  calling `step` on each iteration and, if set, skips fetch/decode/
+  execution of whatever word is sitting at `pc` entirely: it advances `pc`
+  by one more word and clears the flag directly, without ever calling
+  `step`/`decode` -- regardless of whether that word even decodes to a
+  valid instruction. A **taken** branch-likely instruction never touches
+  this field at all: it behaves exactly like an ordinary taken branch via
+  `pendingBranch` (the delay slot *does* execute in that case). Defaults
+  `false`, matching `initialState` (no branch-likely instruction has
+  executed yet). -/
+  squashNext : Bool := false
   /-- The link bit (`LLbit`) set by `ll` and tested/cleared by `sc` (real
   MIPS32 `ll`/`sc`, MD00086 Rev 2.50 §3.2; see `docs/spec/INSTRUCTION-REF.md`).
   Real hardware clears `LLbit` on `sc` execution (success or failure) and on
@@ -228,6 +255,9 @@ example : sampleState.pendingBranch = none := by decide
 -- `State.llBit` defaults to `false` when omitted from a literal
 example : sampleState.llBit = false := by decide
 #guard sampleState.llBit = false
+-- `State.squashNext` defaults to `false` when omitted from a literal
+example : sampleState.squashNext = false := by decide
+#guard sampleState.squashNext = false
 -- CP0 fields: `sampleState` reads back the zero-initialized fields; the
 -- exception constants are distinct small values as documented.
 example : sampleState.cp0Status = 0#32 := by decide

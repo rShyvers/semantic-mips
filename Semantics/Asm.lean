@@ -56,6 +56,14 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   (docs/spec/MIPS-COVERAGE-GAPS.md section 3.8): `teqi`/`tnei`/`tgei`/
   `tgeiu`/`tlti`/`tltiu` (`rs, imm` operands; REGIMM opcode 0x01, same
   opcode as `bltz`/`bgez`/etc. below, distinguished by the `rt` field).
+- The "branch likely" family (real MIPS32 ISA; deprecated in MIPS32,
+  removed in Release 6 -- see `docs/spec/MIPS-COVERAGE-GAPS.md` section 3.3
+  and `bTable`'s docstring below): `beql`/`bnel` (`rs, rt, target`,
+  identical shape to `beq`/`bne`), `blezl`/`bgtzl`/`bltzl`/`bgezl`/
+  `bltzall`/`bgezall` (`rs, target`, identical shape to `blez`/`bgtz`/
+  `bltz`/`bgez`/`bltzal`/`bgezal`). Same table-driven `bTable` encoding as
+  every other branch in this file -- the squash-on-not-taken semantics this
+  family adds is pure `Step.lean` behavior, invisible to the assembler.
 - `ll`/`sc` (real MIPS32 atomic synchronization primitives, added on top of
   the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): identical
   `rt, offset(rs)` shape and parsing to `lw`/`sw`, table-driven the same way
@@ -427,7 +435,17 @@ selects which one, per MD00086 Rev 2.50 §3.2, Table 3-2 (see
 private def bTable : List (String × Nat × BForm) :=
   [("beq", 0x04, .two), ("bne", 0x05, .two), ("blez", 0x06, .one), ("bgtz", 0x07, .one),
    ("bltz", 0x01, .regimm 0x00), ("bgez", 0x01, .regimm 0x01),
-   ("bltzal", 0x01, .regimm 0x10), ("bgezal", 0x01, .regimm 0x11)]
+   ("bltzal", 0x01, .regimm 0x10), ("bgezal", 0x01, .regimm 0x11),
+   -- "Branch likely" family (real MIPS32; deprecated in MIPS32, removed in
+   -- Release 6 -- MD00086 Rev 2.50 \u00a73.2, Table 3-10, p. 28; see
+   -- docs/spec/MIPS-COVERAGE-GAPS.md \u00a73.3 and `Instruction.lean`'s
+   -- `.beql`..`.bgezall` docstrings). Identical field shapes/operand syntax
+   -- to the non-likely branches directly above, so this table-driven
+   -- `encodeBForm` needs no changes at all -- the squash-on-not-taken
+   -- semantics is pure `Step.lean` behavior, invisible to the assembler.
+   ("beql", 0x14, .two), ("bnel", 0x15, .two), ("blezl", 0x16, .one), ("bgtzl", 0x17, .one),
+   ("bltzl", 0x01, .regimm 0x02), ("bgezl", 0x01, .regimm 0x03),
+   ("bltzall", 0x01, .regimm 0x12), ("bgezall", 0x01, .regimm 0x13)]
 
 /-- Coprocessor-1 (FPU) mnemonic operand shapes. The static parameters
 (`fmt`/`opcode`/`funct`/`tf`) needed to build each instruction's word are
@@ -1571,6 +1589,75 @@ def regimmProg : Program :=
 #guard regimmProg.getD (textBase + 12#32) 0 = mkIT (0x01#32) (8#32) (0x11#32) (ofInt32 (-4))
 #guard decode (regimmProg.getD (textBase + 12#32) 0) = some (.bgezal 8#32 0xfffc#32)
 #guard (assemble "bltz $t0\n").isOk = false
+
+-- "Branch likely" family (real MIPS32; deprecated in MIPS32, removed in
+-- Release 6 -- docs/spec/MIPS-COVERAGE-GAPS.md \u00a73.3): `beql`/`bnel` share
+-- `beq`/`bne`'s `rs, rt, target` shape; `blezl`/`bgtzl`/`bltzl`/`bgezl`/
+-- `bltzall`/`bgezall` share `blez`/`bgtz`/`bltz`/`bgez`/`bltzal`/`bgezal`'s
+-- `rs, target` shape -- same table-driven `bTable` encoding as every other
+-- branch in this file.
+def beqlBnelSrc : String := "beql $t0, $t1, loop\nbnel $t0, $t1, loop\nloop: nop\n"
+def beqlBnelProg : Program :=
+  match assemble beqlBnelSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+-- `beql $t0, $t1, loop`: instrAddr = textBase, nextPc = textBase+4,
+-- target = textBase+8 (loop); offset = (8 - 4)/4 = 1.
+#guard beqlBnelProg.getD textBase 0 = mkIT (0x14#32) (8#32) (9#32) (ofInt32 1)
+#guard decode (beqlBnelProg.getD textBase 0) = some (.beql 8#32 9#32 1#32)
+-- `bnel $t0, $t1, loop`: instrAddr = textBase+4, nextPc = textBase+8,
+-- target = textBase+8 (loop); offset = (8 - 8)/4 = 0.
+#guard beqlBnelProg.getD (textBase + 4#32) 0 = mkIT (0x15#32) (8#32) (9#32) (ofInt32 0)
+#guard decode (beqlBnelProg.getD (textBase + 4#32) 0) = some (.bnel 8#32 9#32 0#32)
+#guard (assemble "beql $t0, $t1\n").isOk = false
+
+def blezlBgtzlSrc : String := "loop: blezl $t0, loop\nbgtzl $t0, loop\n"
+def blezlBgtzlProg : Program :=
+  match assemble blezlBgtzlSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+-- `loop: blezl $t0, loop`: instrAddr = textBase = target; nextPc = +4;
+-- offset = (target - nextPc)/4 = -1.
+#guard blezlBgtzlProg.getD textBase 0 = mkIT (0x16#32) (8#32) (0#32) (ofInt32 (-1))
+#guard decode (blezlBgtzlProg.getD textBase 0) = some (.blezl 8#32 0xffff#32)
+-- `bgtzl $t0, loop`: instrAddr = textBase+4, nextPc = textBase+8,
+-- target = textBase (loop); offset = (0 - 8)/4 = -2.
+#guard blezlBgtzlProg.getD (textBase + 4#32) 0 = mkIT (0x17#32) (8#32) (0#32) (ofInt32 (-2))
+#guard decode (blezlBgtzlProg.getD (textBase + 4#32) 0) = some (.bgtzl 8#32 0xfffe#32)
+#guard (assemble "blezl $t0, $t1, loop\n").isOk = false
+
+-- REGIMM branch-likely zero-comparison family: `bltzl`/`bgezl`/`bltzall`/
+-- `bgezall` all share opcode 0x01 (distinguished by the `rt` field, same
+-- as `bltz`/`bgez`/`bltzal`/`bgezal` above); operand shape is `rs, target`.
+def regimmLikelySrc : String :=
+"loop: bltzl $t0, loop\n" ++
+"bgezl $t0, loop\n" ++
+"bltzall $t0, loop\n" ++
+"bgezall $t0, loop\n"
+def regimmLikelyProg : Program :=
+  match assemble regimmLikelySrc with
+  | .ok p => p
+  | .error _ => ∅
+
+-- `loop: bltzl $t0, loop`: instrAddr = textBase = target; nextPc = +4;
+-- offset = (target - nextPc)/4 = -1.
+#guard regimmLikelyProg.getD textBase 0 = mkIT (0x01#32) (8#32) (0x02#32) (ofInt32 (-1))
+#guard decode (regimmLikelyProg.getD textBase 0) = some (.bltzl 8#32 0xffff#32)
+-- `bgezl $t0, loop`: instrAddr = textBase+4, nextPc = textBase+8,
+-- target = textBase (loop); offset = (0 - 8)/4 = -2.
+#guard regimmLikelyProg.getD (textBase + 4#32) 0 = mkIT (0x01#32) (8#32) (0x03#32) (ofInt32 (-2))
+#guard decode (regimmLikelyProg.getD (textBase + 4#32) 0) = some (.bgezl 8#32 0xfffe#32)
+-- `bltzall $t0, loop`: instrAddr = textBase+8, nextPc = textBase+12;
+-- offset = (0 - 12)/4 = -3.
+#guard regimmLikelyProg.getD (textBase + 8#32) 0 = mkIT (0x01#32) (8#32) (0x12#32) (ofInt32 (-3))
+#guard decode (regimmLikelyProg.getD (textBase + 8#32) 0) = some (.bltzall 8#32 0xfffd#32)
+-- `bgezall $t0, loop`: instrAddr = textBase+12, nextPc = textBase+16;
+-- offset = (0 - 16)/4 = -4.
+#guard regimmLikelyProg.getD (textBase + 12#32) 0 = mkIT (0x01#32) (8#32) (0x13#32) (ofInt32 (-4))
+#guard decode (regimmLikelyProg.getD (textBase + 12#32) 0) = some (.bgezall 8#32 0xfffc#32)
+#guard (assemble "bltzl $t0\n").isOk = false
 
 -- Trap-immediate family: `rs, imm` operands (a plain immediate, not a
 -- branch target), same REGIMM opcode 0x01 as `bltz`/etc. above, selected

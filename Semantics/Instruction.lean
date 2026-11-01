@@ -74,6 +74,14 @@ Field-shape summary (see each constructor's docstring for details):
   requirement at all.
 - I-type branch reg/reg (`rs rt imm`): `beq bne`.
 - I-type branch reg-only (`rs imm`): `blez bgtz` — `rt` is unused/fixed 0.
+- I-type "branch likely" family (same field shapes as their non-likely
+  counterparts above): `beql bnel` (`rs rt imm`), `blezl bgtzl bltzl bgezl
+  bltzall bgezall` (`rs imm`) — real MIPS32, deprecated in MIPS32 and
+  removed in Release 6 (`docs/spec/MIPS-COVERAGE-GAPS.md` §3.3). `decode`/
+  `encode` treat these exactly like `beq`/`bltz`/etc.; the one thing that
+  actually makes them different (nullifying/squashing a not-taken delay
+  slot instead of executing it) is pure `Step.lean` behavior, invisible at
+  the field-shape level this module works at.
 - J-type (`target`): `j jal` — raw 26-bit target field (not yet shifted/combined
   with `PC_next`'s top 4 bits; that composition is `Step`'s job).
 - No fields: `syscall` — the syscall *number* lives in `$v0` at execution
@@ -459,6 +467,52 @@ inductive Instruction where
   `BGEZAL`). Same unconditional-link convention and `rs = $ra`
   UNPREDICTABLE-case resolution as `bltzal`. -/
   | bgezal (rs imm : W32)
+  -- I-type "branch likely" family (real MIPS32 ISA; deprecated in MIPS32,
+  -- removed in Release 6 -- MD00086 Rev 2.50 section 3.2, Table 3-10, p. 28;
+  -- see docs/spec/MIPS-COVERAGE-GAPS.md section 3.3). Field shapes are
+  -- identical to their non-likely counterparts directly above (beq/bne:
+  -- rs rt imm; blez/bgtz/bltz/bgez/bltzal/bgezal: rs imm). The one
+  -- architectural difference -- and the reason these are not just aliases
+  -- of the plain branches -- is the delay slot: a not-taken branch-likely
+  -- instruction nullifies (squashes) its own delay-slot instruction
+  -- instead of executing it. `Instruction.lean`/`Asm.lean` treat these as
+  -- ordinary field-shape-only mnemonics; the squash mechanism itself lives
+  -- entirely in `Step.lean` (`State.squashNext`), since decode/encode have
+  -- no notion of "what happens next". `beql`/`bnel`: opcode 0x14/0x15.
+  -- `blezl`/`bgtzl`: opcode 0x16/0x17. `bltzl`/`bgezl`/`bltzall`/`bgezall`:
+  -- REGIMM (opcode 0x01), rt field 0x02/0x03/0x12/0x13.
+  /-- `if $rs == $rt then PC = PC_next + (sext16(imm) << 2); else squash the
+  delay-slot instruction` (opcode 0x14, `BEQL`). See `Step.lean`'s
+  `.beql` case and `State.squashNext`'s docstring for the squash mechanism. -/
+  | beql (rs rt imm : W32)
+  /-- `if $rs != $rt then PC = PC_next + (sext16(imm) << 2); else squash`
+  (opcode 0x15, `BNEL`). Same shape/mechanism as `beql`. -/
+  | bnel (rs rt imm : W32)
+  /-- `if $rs <= 0 then PC = PC_next + (sext16(imm) << 2); else squash`,
+  signed (opcode 0x16, `BLEZL`; `rt` field fixed 0). Same mechanism as
+  `beql`. -/
+  | blezl (rs imm : W32)
+  /-- `if $rs > 0 then PC = PC_next + (sext16(imm) << 2); else squash`,
+  signed (opcode 0x17, `BGTZL`; `rt` field fixed 0). Same mechanism as
+  `beql`. -/
+  | bgtzl (rs imm : W32)
+  /-- `if $rs < 0 then PC = PC_next + (sext16(imm) << 2); else squash`,
+  signed (opcode 0x01, `rt` field = 0x02 `BLTZL`). Same mechanism as
+  `beql`. -/
+  | bltzl (rs imm : W32)
+  /-- `if $rs >= 0 then PC = PC_next + (sext16(imm) << 2); else squash`,
+  signed (opcode 0x01, `rt` field = 0x03 `BGEZL`). Same mechanism as
+  `beql`. -/
+  | bgezl (rs imm : W32)
+  /-- `$ra = PC_next + 4` unconditionally (same unconditional-link
+  convention as `bltzal`, including on the not-taken/squashed path),
+  **then** `if $rs < 0 then PC = PC_next + (sext16(imm) << 2); else squash`
+  (opcode 0x01, `rt` field = 0x12 `BLTZALL`). -/
+  | bltzall (rs imm : W32)
+  /-- `$ra = PC_next + 4` unconditionally, **then** `if $rs >= 0 then
+  PC = PC_next + (sext16(imm) << 2); else squash` (opcode 0x01, `rt` field
+  = 0x13 `BGEZALL`). Same unconditional-link convention as `bltzall`. -/
+  | bgezall (rs imm : W32)
   -- I-type REGIMM trap-immediate family (real MIPS32 ISA; opcode 0x01,
   -- same opcode as the zero-comparison branches above, selected by the
   -- same `rt`-field multiplexing). Not part of the original v1 instruction
@@ -835,13 +889,26 @@ def decode (w : W32) : Option Instruction :=
   | 0x05 => some (.bne rs rt imm)
   | 0x06 => some (.blez rs imm)
   | 0x07 => some (.bgtz rs imm)
+  -- "Branch likely" family (real MIPS32; deprecated in MIPS32, removed in
+  -- Release 6 -- see the `.beql`..`.bgezall` docstrings above): same
+  -- opcode positions as `beq`/`bne`/`blez`/`bgtz` would occupy one opcode
+  -- bit higher (0x14..0x17 vs. 0x04..0x07).
+  | 0x14 => some (.beql rs rt imm)
+  | 0x15 => some (.bnel rs rt imm)
+  | 0x16 => some (.blezl rs imm)
+  | 0x17 => some (.bgtzl rs imm)
   | 0x01 =>  -- REGIMM: rt field (not the opcode) selects
-             -- bltz/bgez/bltzal/bgezal/tgei/tgeiu/tlti/tltiu/teqi/tnei
+             -- bltz/bgez/bltzal/bgezal/bltzl/bgezl/bltzall/bgezall/
+             -- tgei/tgeiu/tlti/tltiu/teqi/tnei
     match rt.toNat with
     | 0x00 => some (.bltz rs imm)
     | 0x01 => some (.bgez rs imm)
     | 0x10 => some (.bltzal rs imm)
     | 0x11 => some (.bgezal rs imm)
+    | 0x02 => some (.bltzl rs imm)
+    | 0x03 => some (.bgezl rs imm)
+    | 0x12 => some (.bltzall rs imm)
+    | 0x13 => some (.bgezall rs imm)
     | 0x08 => some (.tgei rs imm)
     | 0x09 => some (.tgeiu rs imm)
     | 0x0a => some (.tlti rs imm)
@@ -998,6 +1065,14 @@ def encode (i : Instruction) : W32 :=
   | .bgez   rs imm => mkIT 0x01#32 rs 0x01#32 imm
   | .bltzal rs imm => mkIT 0x01#32 rs 0x10#32 imm
   | .bgezal rs imm => mkIT 0x01#32 rs 0x11#32 imm
+  | .beql rs rt imm => mkIT 0x14#32 rs rt imm
+  | .bnel rs rt imm => mkIT 0x15#32 rs rt imm
+  | .blezl rs imm => mkIT 0x16#32 rs 0#32 imm
+  | .bgtzl rs imm => mkIT 0x17#32 rs 0#32 imm
+  | .bltzl   rs imm => mkIT 0x01#32 rs 0x02#32 imm
+  | .bgezl   rs imm => mkIT 0x01#32 rs 0x03#32 imm
+  | .bltzall rs imm => mkIT 0x01#32 rs 0x12#32 imm
+  | .bgezall rs imm => mkIT 0x01#32 rs 0x13#32 imm
   | .teqi   rs imm => mkIT 0x01#32 rs 0x0c#32 imm
   | .tnei   rs imm => mkIT 0x01#32 rs 0x0e#32 imm
   | .tgei   rs imm => mkIT 0x01#32 rs 0x08#32 imm
@@ -1189,12 +1264,25 @@ example : decode (mkIT 0x05#32 29#32 8#32 0x1234#32) = some (.bne 29#32 8#32 0x1
 example : decode (mkIT 0x06#32 29#32 0#32 0x1234#32) = some (.blez 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x07#32 29#32 0#32 0x1234#32) = some (.bgtz 29#32 0x1234#32) := by decide
 
+-- "branch likely" family: same field shapes as beq/bne/blez/bgtz, opcodes
+-- 0x14..0x17 (MIPS-COVERAGE-GAPS.md \u00a73.3).
+example : decode (mkIT 0x14#32 29#32 8#32 0x1234#32) = some (.beql 29#32 8#32 0x1234#32) := by decide
+example : decode (mkIT 0x15#32 29#32 8#32 0x1234#32) = some (.bnel 29#32 8#32 0x1234#32) := by decide
+example : decode (mkIT 0x16#32 29#32 0#32 0x1234#32) = some (.blezl 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x17#32 29#32 0#32 0x1234#32) = some (.bgtzl 29#32 0x1234#32) := by decide
+
 -- REGIMM zero-comparison branches: opcode 0x01, rs=29, imm=0x1234, rt field
 -- selects bltz/bgez/bltzal/bgezal
 example : decode (mkIT 0x01#32 29#32 0x00#32 0x1234#32) = some (.bltz 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x01#32 29#32 0x01#32 0x1234#32) = some (.bgez 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x01#32 29#32 0x10#32 0x1234#32) = some (.bltzal 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x01#32 29#32 0x11#32 0x1234#32) = some (.bgezal 29#32 0x1234#32) := by decide
+-- REGIMM branch-likely zero-comparison family: same opcode 0x01, rt field
+-- 0x02/0x03/0x12/0x13 selects bltzl/bgezl/bltzall/bgezall.
+example : decode (mkIT 0x01#32 29#32 0x02#32 0x1234#32) = some (.bltzl 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x03#32 0x1234#32) = some (.bgezl 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x12#32 0x1234#32) = some (.bltzall 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x13#32 0x1234#32) = some (.bgezall 29#32 0x1234#32) := by decide
 -- REGIMM trap-immediate family: same opcode 0x01, `rt` field selects
 -- teqi/tnei/tgei/tgeiu/tlti/tltiu (real MIPS32 ISA, MD00086 Rev 2.50 §3.2,
 -- Table 3-2 -- see docs/spec/MIPS-COVERAGE-GAPS.md §3.8).
@@ -1381,6 +1469,24 @@ example : decode (encode (.bltz 29#32 0x1234#32)) = some (.bltz 29#32 0x1234#32)
 example : decode (encode (.bgez 29#32 0x1234#32)) = some (.bgez 29#32 0x1234#32) := by decide
 example : decode (encode (.bltzal 29#32 0x1234#32)) = some (.bltzal 29#32 0x1234#32) := by decide
 example : decode (encode (.bgezal 29#32 0x1234#32)) = some (.bgezal 29#32 0x1234#32) := by decide
+-- "Branch likely" family: encode matches the hand-computed opcode, and
+-- full decode(encode i) = some i round-trips (MIPS-COVERAGE-GAPS.md \u00a73.3).
+example : encode (.beql 29#32 8#32 0x1234#32) = mkIT 0x14#32 29#32 8#32 0x1234#32 := by decide
+example : encode (.bnel 29#32 8#32 0x1234#32) = mkIT 0x15#32 29#32 8#32 0x1234#32 := by decide
+example : encode (.blezl 29#32 0x1234#32) = mkIT 0x16#32 29#32 0#32 0x1234#32 := by decide
+example : encode (.bgtzl 29#32 0x1234#32) = mkIT 0x17#32 29#32 0#32 0x1234#32 := by decide
+example : encode (.bltzl 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x02#32 0x1234#32 := by decide
+example : encode (.bgezl 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x03#32 0x1234#32 := by decide
+example : encode (.bltzall 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x12#32 0x1234#32 := by decide
+example : encode (.bgezall 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x13#32 0x1234#32 := by decide
+example : decode (encode (.beql 29#32 8#32 0x1234#32)) = some (.beql 29#32 8#32 0x1234#32) := by decide
+example : decode (encode (.bnel 29#32 8#32 0x1234#32)) = some (.bnel 29#32 8#32 0x1234#32) := by decide
+example : decode (encode (.blezl 29#32 0x1234#32)) = some (.blezl 29#32 0x1234#32) := by decide
+example : decode (encode (.bgtzl 29#32 0x1234#32)) = some (.bgtzl 29#32 0x1234#32) := by decide
+example : decode (encode (.bltzl 29#32 0x1234#32)) = some (.bltzl 29#32 0x1234#32) := by decide
+example : decode (encode (.bgezl 29#32 0x1234#32)) = some (.bgezl 29#32 0x1234#32) := by decide
+example : decode (encode (.bltzall 29#32 0x1234#32)) = some (.bltzall 29#32 0x1234#32) := by decide
+example : decode (encode (.bgezall 29#32 0x1234#32)) = some (.bgezall 29#32 0x1234#32) := by decide
 -- REGIMM trap-immediate family: encode matches the hand-computed opcode,
 -- and full decode(encode i) = some i round-trips.
 example : encode (.teqi 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x0c#32 0x1234#32 := by decide
@@ -1416,8 +1522,11 @@ example : decode (encode (.swr 29#32 8#32 0x1234#32)) = some (.swr 29#32 8#32 0x
 -- opcode 0x11 (COP1) is implemented for the fmt/funct combinations below;
 -- an unrecognized fmt (not MF/MT/BC1/S/W) still decodes to `none`.
 #guard decode (mkIT 0x11#32 0x1f#32 0#32 0#32) = none
-#guard decode (mkIT 0x16#32 0#32 0#32 0#32) = none
-#guard decode (mkIT 0x17#32 0#32 0#32 0#32) = none
+-- opcodes 0x16/0x17 are now assigned to the branch-likely family
+-- (blezl/bgtzl, this track's addition); 0x12/0x13 (COP2, out of scope)
+-- remain unassigned instead.
+#guard decode (mkIT 0x12#32 0#32 0#32 0#32) = none
+#guard decode (mkIT 0x13#32 0#32 0#32 0#32) = none
 -- opcode 0x1c (SPECIAL2) funct 0x00/0x01/0x02/0x04/0x05/0x20/0x21 are now
 -- assigned (madd/maddu/mul/msub/msubu/clz/clo); funct 0x3f remains unassigned.
 #guard decode (mkIT 0x1c#32 0#32 0#32 0x3f#32) = none
