@@ -1518,12 +1518,25 @@ consulted as ground truth for this section.
   according to the current FCSR rounding mode (default: round-to-nearest,
   ties-to-even), since there is no `FCSR` in this project's scope. This is a
   deliberate, documented simplification, not an oversight.
-- **Only `ADD.S`/`SUB.S`/`MUL.S`/`DIV.S`/`MOV.S`** of the arithmetic-format
-  instructions are implemented; `SQRT.S`, `ABS.S`, `NEG.S`, and the
-  `ROUND`/`TRUNC`/`CEIL`/`FLOOR` family are out of scope for this pass.
-- **Only `C.EQ.S`/`C.LT.S`/`C.LE.S`** of the sixteen `C.cond.S` compares are
-  implemented (the three most common; the rest — `C.UN.S`, `C.OLE.S`, etc. —
-  are out of scope).
+- **`ADD.S`/`SUB.S`/`MUL.S`/`DIV.S`/`MOV.S`/`SQRT.S`/`ABS.S`/`NEG.S`** are all
+  implemented, along with the directed-rounding-to-integer family
+  (`ROUND.W.S`/`TRUNC.W.S`/`CEIL.W.S`/`FLOOR.W.S`; this pass — see the
+  "Encoding summary" table and its notes below). `ABS.S`/`NEG.S` are modeled
+  as raw sign-bit operations (clear/flip bit 31), not `Float32` arithmetic —
+  see `Instruction.absS`/`negS`'s docstrings.
+- **10 of the sixteen `C.cond.S` compares are implemented**: `C.EQ.S`/
+  `C.LT.S`/`C.LE.S` (original v1.x addition) plus `C.F.S`/`C.UN.S`/`C.UEQ.S`/
+  `C.OLT.S`/`C.ULT.S`/`C.OLE.S`/`C.ULE.S` (this pass, cond numbers 0/1/3/4/5/
+  6/7 — see "Encoding summary" and "Scope note: predicates not implemented"
+  below). The 6 remaining predicates are the
+  *signaling* counterparts of `C.UN.S`/`C.EQ.S`/`C.UEQ.S`/`C.ULT.S`/
+  `C.ULE.S` (`C.SF.S`/`C.SEQ.S`/`C.NGLE.S`/`C.NGL.S`/`C.NGE.S`/`C.NGT.S`,
+  cond numbers 8/9/10/11/13/15) — out of scope, since this model has no
+  FP-exception mechanism to distinguish a signaling predicate's behavior
+  from its already-implemented quiet counterpart's.
+- **`CFC1`/`CTC1`** (GPR↔FPU-control-register move; this pass, see the
+  "Encoding summary" notes below) are implemented with no actual FCSR/FIR
+  semantics behind them (documented simplification, not an oversight).
 
 ### Register/state model
 
@@ -1551,13 +1564,91 @@ consulted as ground truth for this section.
 | `mul.s $fd, $fs, $ft` | fmt=S, funct=0x02 | `$fd = $fs * $ft` |
 | `div.s $fd, $fs, $ft` | fmt=S, funct=0x03 | `$fd = $fs / $ft`; `$ft=0` → ±Inf/NaN, no trap |
 | `mov.s $fd, $fs` | fmt=S, funct=0x06 | `$fd = $fs`, raw copy |
+| `sqrt.s $fd, $fs` | fmt=S, funct=0x04 | `$fd = sqrt($fs)` (IEEE-754, via `Float32.sqrt`/`sqrtf`) |
+| `abs.s $fd, $fs` | fmt=S, funct=0x05 | `$fd = $fs` with sign bit (31) cleared; raw bit op |
+| `neg.s $fd, $fs` | fmt=S, funct=0x07 | `$fd = $fs` with sign bit (31) flipped; raw bit op |
 | `cvt.s.w $fd, $fs` | fmt=`W`=0x14, funct=0x20 | `$fd = float32(int32bits($fs))` |
 | `cvt.w.s $fd, $fs` | fmt=S, funct=0x24 | `$fd = int32bits(trunc($fs))` |
-| `c.eq.s $fs, $ft` | fmt=S, funct=0x32, cc=0 | `fpCondFlag := ($fs == $ft)` |
-| `c.lt.s $fs, $ft` | fmt=S, funct=0x3c, cc=0 | `fpCondFlag := ($fs < $ft)` |
-| `c.le.s $fs, $ft` | fmt=S, funct=0x3e, cc=0 | `fpCondFlag := ($fs <= $ft)` |
+| `round.w.s $fd, $fs` | fmt=S, funct=0x0c | `$fd = int32bits(round($fs))`; ties away from zero (`Float32.round`/`roundf`, **not** real MIPS32's ties-to-even — documented divergence) |
+| `trunc.w.s $fd, $fs` | fmt=S, funct=0x0d | `$fd = int32bits(trunc($fs))`; numerically identical to `cvt.w.s` under this model |
+| `ceil.w.s $fd, $fs` | fmt=S, funct=0x0e | `$fd = int32bits(ceil($fs))` (`Float32.ceil`/`ceilf`) |
+| `floor.w.s $fd, $fs` | fmt=S, funct=0x0f | `$fd = int32bits(floor($fs))` (`Float32.floor`/`floorf`) |
+| `c.f.s $fs, $ft` | fmt=S, funct=0x30, cc=0, cond=0 | `fpCondFlag := false` |
+| `c.un.s $fs, $ft` | fmt=S, funct=0x31, cc=0, cond=1 | `fpCondFlag := isNaN($fs) ∨ isNaN($ft)` ("unordered") |
+| `c.eq.s $fs, $ft` | fmt=S, funct=0x32, cc=0, cond=2 | `fpCondFlag := ($fs == $ft)` |
+| `c.ueq.s $fs, $ft` | fmt=S, funct=0x33, cc=0, cond=3 | `fpCondFlag := ($fs == $ft) ∨ unordered` |
+| `c.olt.s $fs, $ft` | fmt=S, funct=0x34, cc=0, cond=4 | `fpCondFlag := ¬unordered ∧ ($fs < $ft)` |
+| `c.ult.s $fs, $ft` | fmt=S, funct=0x35, cc=0, cond=5 | `fpCondFlag := ($fs < $ft) ∨ unordered` |
+| `c.ole.s $fs, $ft` | fmt=S, funct=0x36, cc=0, cond=6 | `fpCondFlag := ¬unordered ∧ ($fs <= $ft)` |
+| `c.ule.s $fs, $ft` | fmt=S, funct=0x37, cc=0, cond=7 | `fpCondFlag := ($fs <= $ft) ∨ unordered` |
+| `c.lt.s $fs, $ft` | fmt=S, funct=0x3c, cc=0, cond=12 | `fpCondFlag := ($fs < $ft)` |
+| `c.le.s $fs, $ft` | fmt=S, funct=0x3e, cc=0, cond=14 | `fpCondFlag := ($fs <= $ft)` |
+| `cfc1 $rt, $fs` | opcode 0x11, `rs`-position=`CF`=0x02 | `$rt = fpRegs[$fs]` (scratch-slot model, see below) |
+| `ctc1 $rt, $fs` | opcode 0x11, `rs`-position=`CT`=0x06 | `fpRegs[$fs] = $rt` (scratch-slot model, see below) |
 | `bc1t target` | opcode 0x11, fmt=`BC1`=0x08, tf=1 | `if fpCondFlag: PC = PC_next + (offset<<2)` |
 | `bc1f target` | fmt=BC1, tf=0 | `if !fpCondFlag: PC = PC_next + (offset<<2)` |
+
+Notes on the rows above:
+
+- **`sqrt.s`** is computed via Lean core's `Float32.sqrt` (`@[extern
+  "sqrtf"]`), correctly-rounded IEEE-754 single-precision square root.
+- **`abs.s`/`neg.s`** are implemented as raw bit operations (`&&& 0x7fffffff`
+  / `^^^ 0x80000000`) in `Step.lean`, not `Float32` arithmetic — clearing/
+  flipping the sign bit is exact for every bit pattern (including `NaN`),
+  so there is no rounding/NaN question to resolve.
+- **`round.w.s`** uses Lean core's `Float32.round` (`roundf`), which rounds
+  ties **away from zero**. Real MIPS32 always rounds `ROUND.W.fmt` to
+  nearest with **ties-to-even**, regardless of the FCSR rounding mode. Lean
+  core exposes no ties-to-even float-to-float rounding primitive, so this is
+  a documented divergence from the real hardware (only observable at exact
+  tie values like `2.5`), in the same spirit as `cvt.w.s`'s pre-existing
+  FCSR-rounding-mode simplification.
+- **`trunc.w.s`** is numerically **identical** to the pre-existing `cvt.w.s`
+  under this model: both truncate toward zero via `Float32.toInt32`
+  (`cvt.w.s`'s truncating behavior was already a documented simplification
+  of real MIPS32, where it would instead honor the current FCSR rounding
+  mode). Two constructors/mnemonics are kept because they are genuinely
+  distinct real-MIPS32 encodings, not because the model needs two separate
+  implementations.
+- **`c.olt.s`/`c.ole.s`** are numerically **identical** to the pre-existing
+  `c.lt.s`/`c.le.s` under this model: `Float32.lt`/`Float32.le` already
+  return `false` for any NaN operand (IEEE-754-correct), so they already
+  compute exactly the ordered-less-than/ordered-less-or-equal predicates.
+  The *only* real-hardware difference between `c.lt.s` (cond 12, the
+  signaling `LT` variant) and `c.olt.s` (cond 4, the quiet `OLT` variant) is
+  whether a quiet-NaN operand raises an Invalid Operation exception; since
+  this model has no FP-exception mechanism for either, both constructors
+  compute the same `fpCondFlag` value. Same relationship for `c.le.s`
+  (cond 14, `LE`) vs. `c.ole.s` (cond 6, `OLE`).
+- **`c.un.s`/`c.ult.s`/`c.ule.s`** are built from `Float32.isNaN` explicitly
+  in `Step.lean`, **not** derived from `<`/`<=` — Lean core's `Float32`
+  `<`/`<=` operators already return `false` for any NaN operand (the
+  IEEE-754-correct behavior for ordered comparisons), so naively deriving
+  "unordered" from them (e.g. `!(a < b) && !(b < a)`) would silently be
+  wrong; these three predicates instead read `isNaN` directly to get the
+  IEEE-754 "unordered" semantics exactly right.
+- **`cfc1`/`ctc1`** have **no FCSR/FIR control-register semantics** behind
+  them — this project models no FPU control/status register state at all.
+  Per this track's brief, the simplest available option was chosen: both
+  instructions read/write the *same* `State.fpRegs` array the data
+  instructions use (so `cfc1 $rt, $f31` / `ctc1 $rt, $f31` move `$rt`
+  to/from an ordinary addressable 32-bit scratch slot, register 31
+  conventionally standing in for `FCSR`), with no rounding-mode or
+  exception-sticky-bit behavior actually implemented behind it. This is a
+  deliberate simplification, not an oversight.
+
+### Scope note: predicates not implemented
+
+The 6 "signaling" `C.cond.S` predicates not implemented by this pass —
+`c.sf.s` (cond 8), `c.ngle.s` (cond 9), `c.seq.s` (cond 10), `c.ngl.s`
+(cond 11), `c.nge.s` (cond 13), `c.ngt.s` (cond 15) — are the signaling
+counterparts of `c.un.s`/`c.eq.s`/`c.ueq.s`/`c.ult.s`/`c.ule.s`. On real
+hardware they differ from their quiet counterparts only in raising an
+Invalid Operation exception on a quiet-NaN operand; since this model has no
+FP-exception mechanism, implementing them would require duplicating an
+already-implemented predicate's `fpCondFlag` formula under a new name with
+no observable behavioral difference. This is the one documented cut from
+this pass's assigned priority list.
 
 Field layout for the arithmetic/compare format (`add.s` etc.): opcode(31-26)
 = 0x11, `fmt`(25-21), `ft`(20-16), `fs`(15-11), `fd`(10-6), `funct`(5-0) — the
@@ -1571,22 +1662,37 @@ to `lw`/`sw`. `bc1t`/`bc1f` are also I-type-shaped: opcode 0x11, `rs`-position
 field = `BC1` sub-opcode `0x08`, `rt`-position field holds `cc`(bits 4-2,
 forced 0)/`nd`(bit 1, forced 0)/`tf`(bit 0) — so the whole `rt`-position field
 is exactly `0` (`bc1f`) or `1` (`bc1t`) in this subset — and a 16-bit
-sign-extended branch offset, exactly like `beq`/`bne`.
+sign-extended branch offset, exactly like `beq`/`bne`. `sqrt.s`/`abs.s`/
+`neg.s`/`round.w.s`/`trunc.w.s`/`ceil.w.s`/`floor.w.s` share `mov.s`'s
+unary layout (`fmt`/`fs`/`fd`/`funct` populated, `ft`-position fixed 0).
+`c.f.s`/`c.un.s`/`c.ueq.s`/`c.olt.s`/`c.ult.s`/`c.ole.s`/`c.ule.s` share
+`c.eq.s`/`c.lt.s`/`c.le.s`'s compare layout (`fd`-position holds `cc`, forced
+0). `cfc1`/`ctc1` share `mfc1`/`mtc1`'s exact field shape, differing only in
+the `rs`-position sub-opcode (`CF`=0x02/`CT`=0x06 vs `MF`=0x00/`MT`=0x04).
 
 ### Citation
 
 Standard MIPS32 instruction-set architecture (the public "MIPS32 Architecture
 For Programmers" reference manual family, Volume II-A, "The MIPS32
-Instruction Set" — the COP1/FPU chapter). All opcode/fmt/funct values above
-(COP1 = 0x11, `LWC1`/`SWC1` = 0x31/0x39, `fmt` codes `MF`=0, `MT`=4, `BC1`=8,
-`S`=0x10, `W`=0x14, and `funct` codes 0x00/0x01/0x02/0x03/0x06/0x20/0x24 and
-the `C.cond.fmt` family `0x30 | cond` with `cond(EQ)=2`, `cond(LT)=12`,
-`cond(LE)=14`) are the standard, invariant MIPS32 COP1 encodings, not
-MARS-specific or implementation-chosen values. No internet access was used to
-write this section; these are well-established, memorized ISA constants, and
-any single value a future reader doubts should be cross-checked against a
-primary MIPS32 ISA reference before relying on it for anything beyond this
-simulator.
+Instruction Set" — the COP1/FPU chapter, MD00086 §3.2). All opcode/fmt/funct
+values above (COP1 = 0x11, `LWC1`/`SWC1` = 0x31/0x39, `fmt` codes `MF`=0,
+`MT`=4, `CF`=2, `CT`=6, `BC1`=8, `S`=0x10, `W`=0x14, and `funct` codes
+0x00/0x01/0x02/0x03/0x04/0x05/0x06/0x07/0x0c/0x0d/0x0e/0x0f/0x20/0x24 and the
+`C.cond.fmt` family `0x30 | cond` with `cond(F)=0`, `cond(UN)=1`,
+`cond(EQ)=2`, `cond(UEQ)=3`, `cond(OLT)=4`, `cond(ULT)=5`, `cond(OLE)=6`,
+`cond(ULE)=7`, `cond(LT)=12`, `cond(LE)=14`) are the standard, invariant
+MIPS32 COP1 encodings, not MARS-specific or implementation-chosen values. No
+internet access was used to write this section; these are well-established,
+memorized ISA constants, and any single value a future reader doubts should
+be cross-checked against a primary MIPS32 ISA reference before relying on it
+for anything beyond this simulator. The one genuine uncertainty flagged in
+this pass: `cfc1`/`ctc1`'s `rs`-position sub-opcode values (`CF`=0x02,
+`CT`=0x06) are memorized from the standard MIPS32 COP1 field layout and were
+not independently re-derived from a primary source during this pass (no
+internet access); they match this track's brief and are believed correct,
+but a future reader with ISA-reference access should double-check them
+before relying on this simulator's `cfc1`/`ctc1` encoding for anything
+beyond this project's own test suite.
 
 ---
 
