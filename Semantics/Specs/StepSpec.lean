@@ -5384,6 +5384,23 @@ theorem writeMemHalf_regs (s stored : State) (addr v : W32)
   · injection h with h'
     rw [← h']
 
+/-- `writeMemByte` never changes `regs` — the byte-write counterpart of
+`writeMemWord_regs`/`writeMemHalf_regs`, completing the trio. Unlike
+`writeMemWord`/`writeMemHalf` it has no alignment check at all
+(`writeMemByte`'s own docstring: "always succeeds"), so this is even
+simpler to prove: no `split`, just unfold-and-read-off the `{ s with
+mem := ... }` field. (The `swl`/`swr` cases of
+`step_preserves_zero_register_nontrivial` below end up not needing this
+lemma by name — `writeMemByte`'s unconditional-`some` shape lets their
+chained calls reduce by `rfl` directly — but the fact is recorded here
+for the same reason `writeMemWord_regs`/`writeMemHalf_regs` are: it is the
+honest, general statement of what `writeMemByte` does and does not touch.) -/
+theorem writeMemByte_regs (s stored : State) (addr : W32) (v : UInt8)
+    (h : writeMemByte s addr v = some stored) : stored.regs = s.regs := by
+  unfold writeMemByte at h
+  injection h with h'
+  rw [← h']
+
 /-- Single-instruction restatement of `lb_lbu_spec_raw`'s first conjunct,
 for `lb` alone — proved the same way (`obtain`/`subst`/`unfold step`/`rw`/
 `rfl`), since the combined theorem's bundled `wb`/`wbu` signature cannot be
@@ -5998,36 +6015,74 @@ theorem step_preserves_zero_register_nontrivial (p : Program) (s s' : State) (w 
     rw [wait_spec_raw p s w hfetch hdecode hpb] at hstep
     try dsimp only at hstep
     injection hstep with hs; rw [← hs]; rfl
+  case lwl rs rt imm =>
+    rw [lwl_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;>
+      (injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _)
+  case lwr rs rt imm =>
+    rw [lwr_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;>
+      (injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _)
+  case swl rs rt imm =>
+    rw [swl_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case swr rs rt imm =>
+    rw [swr_spec_raw p s w rs rt imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case mfc0 rt rd =>
+    rw [mfc0_spec_raw p s w rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+    · injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+    · cases hstep
+  case mtc0 rt rd =>
+    rw [mtc0_spec_raw p s w rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · injection hstep with hs; rw [← hs]; rfl
+    · injection hstep with hs; rw [← hs]; rfl
+    · injection hstep with hs; rw [← hs]; rfl
+    · cases hstep
   all_goals sorry
 
 /-! STALL NOTE on `step_preserves_zero_register_nontrivial`'s remaining
-`all_goals sorry` (updated after the proof-bitops/proof-imm-traps/
-proof-fpu-rest/impl-branch-likely/impl-sync/impl-fp-double integration):
-most of the instruction families the previous version of this note listed
-now have `_spec_raw` theorems and have been added as `case` branches above
-(`clo clz mul seb seh wsbh ext ins`, `teqi tnei tgei tgeiu tlti tltiu`,
-`mfc1 mtc1 lwc1 swc1 addS subS mulS divS movS cvtSW cvtWS sqrtS absS negS
-roundWS truncWS ceilWS floorWS` and all ten compare predicates `cEqS cLtS
-cLeS cFS cUnS cUeqS cOltS cUltS cOleS cUleS`, `cfc1 ctc1`, and `eret`/
-`wait`). What's left open by the `cases instr` dispatch above is a smaller,
-genuinely harder-to-close remainder:
-- `lwl lwr swl swr` (unaligned load/store) and `mfc0`/`mtc0` (CP0 register
-  move) all have `_spec_raw` theorems too, but each one's right-hand side
-  is a multi-branch `match` (on the unaligned byte offset `0..3`, or on the
-  CP0 register-select field `12/13/14/_`) rather than the simple shape
-  every closed case above reduces with a single `rfl`/`writeReg_preserves_
-  zero_slot` call; closing these needs a `split at hstep` with one sub-
-  proof per match arm (4 arms each), which is real additional proof work
-  deferred to a future pass, not a stall — every arm, by inspection of
-  `Step.lean`, still only ever writes `regs`/`mem`/`cp0Status`/`cp0Cause`/
-  `cp0Epc`, never leaves the GPR file in a state where `readReg _ 0 ≠ 0`.
+`all_goals sorry` (updated after the proof-zero-reg-splits pass that closed
+the `lwl`/`lwr`/`swl`/`swr`/`mfc0`/`mtc0` cases): most of the instruction
+families earlier versions of this note listed now have `_spec_raw`
+theorems and have been added as `case` branches above (`clo clz mul seb
+seh wsbh ext ins`, `teqi tnei tgei tgeiu tlti tltiu`, `mfc1 mtc1 lwc1 swc1
+addS subS mulS divS movS cvtSW cvtWS sqrtS absS negS roundWS truncWS
+ceilWS floorWS` and all ten compare predicates `cEqS cLtS cLeS cFS cUnS
+cUeqS cOltS cUltS cOleS cUleS`, `cfc1 ctc1`, `eret`/`wait`, and now also
+`lwl lwr swl swr mfc0 mtc0`: each one's `_spec_raw` right-hand side is a
+multi-branch `match` (on the unaligned byte offset `0..3`, or on the CP0
+register-select field `12/13/14/_`) rather than the single-`rfl`/
+`writeReg_preserves_zero_slot` shape most other cases reduce with, but
+`split at hstep` handles all four arms uniformly for `lwl`/`lwr` (every
+arm only ever calls `writeReg`, so `<;> writeReg_preserves_zero_slot`
+closes all of them at once) and for `swl`/`swr` (every arm only ever
+chains `writeMemByte` calls, which are unconditional `some`s — no
+alignment check, unlike `writeMemWord`/`writeMemHalf` — so each arm's
+final state is `regs`-identical to `s` by `rfl`, no lemma needed); `mfc0`/
+`mtc0` needed one bullet per arm instead of `<;>` (three `writeReg_
+preserves_zero_slot`/`rfl` arms plus one `illegalInstruction`-halt arm
+that contradicts `hstep : _ = StepResult.next s'` via `cases hstep`), since
+their match scrutinee is `rd.toNat` rather than a plain `off`.
+
+What's left open by the `cases instr` dispatch above is now just three
+genuinely harder-to-close instructions:
 - `syscall` — see the dedicated STALL NOTE below (`syscall1_spec`/
   `syscall10_spec`): genuinely blocked on the same private-`execInstr`-
   dispatch chicken-and-egg issue, not just unattempted.
 - `bc1t`/`bc1f` (FP-conditional branch) have no `_spec_raw` theorem at all
-  yet (unlike every other instruction this note used to list, which all
-  gained one this wave) — real net-new specification work, not a stall.
+  yet — real net-new specification work, not a stall.
 
-Left `sorry` here for these seven remaining families rather than force
-through four more multi-branch `match`-split proofs and two new branch-
-instruction specs in what is meant to be a closing/consolidation pass. -/
+Left `sorry` here for these three remaining instructions rather than
+re-derive `syscall`'s private dispatch or write two new branch-instruction
+specs in what is meant to be a closing/consolidation pass. -/
