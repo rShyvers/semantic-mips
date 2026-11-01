@@ -32,6 +32,11 @@ been added, likewise grounded in the real MIPS32 ISA rather than MARS — see
 the dedicated
 ["Register-indirect jump/call"](#register-indirect-jumpcall-real-mips32-isa)
 section below.
+Likewise, the real MIPS32 atomic synchronization primitives `ll`/`sc` (load-
+linked/store-conditional) have since been added on top of the v1 set, along
+with a new `State.llBit` field; see the dedicated
+["Atomic synchronization (`ll`/`sc`)"](#atomic-synchronization-llsc--v1x-addition)
+section near the end of this document.
 
 Conventions pinned elsewhere and assumed here (see
 [`SPEC-NOTES.md`](SPEC-NOTES.md)): one real-MIPS32 branch delay slot per
@@ -106,6 +111,8 @@ execution logic (method `populate()`, lines 77–3236).
 | `tltu` | R | `if ($rs < $rt) trap`, unsigned |
 | `tgeu` | R | `if ($rs >= $rt) trap`, unsigned |
 | `break` | R | unconditional trap |
+| `ll` | I | `$rt = MEM32[$rs + offset]`, word-aligned; sets `llBit` |
+| `sc` | I | if `llBit`: `MEM32[$rs + offset] = $rt`, `$rt := 1`; else `$rt := 0`; clears `llBit` either way |
 
 `PC_next` denotes the program counter value *after* the fetched instruction
 has been accounted for, i.e. `PC_at_fetch + 4` — see Global rule 1.
@@ -1503,3 +1510,106 @@ mask documented above). No internet access was used to write this section;
 these are well-established, memorized ISA constants, cross-referenced against
 `docs/spec/MIPS-COVERAGE-GAPS.md`'s independent research pass (§§3.4-3.5,
 which cites the same table/page/entry numbers) before being relied upon here.
+## Atomic synchronization (`ll`/`sc`) — v1.x addition
+
+This section documents a v1.x addition: the real MIPS32 load-linked/store-
+conditional pair (`ll`/`sc`), the standard MIPS mechanism for lock-free
+algorithms, spinlocks, and mutexes (identified as a coverage gap in
+`docs/spec/MIPS-COVERAGE-GAPS.md` §3.7). **Grounding note**: like the
+Coprocessor 0 and floating-point additions above, this section is grounded
+directly in the **real MIPS32 architecture** — specifically "MIPS32
+Architecture For Programmers, Volume II-A: The MIPS32 Instruction Set"
+(MD00086, Rev 2.50, §3.2, Table 3-4, pp. 25–26, entries 167 (`LL`) and 253
+(`SC`)) — not against MARS, which was only ever this project's
+differential-testing oracle and (per `MIPS-COVERAGE-GAPS.md` §3.7) does not
+implement `ll`/`sc` at all.
+
+### The `LLbit` single-hart simplification
+
+Real MIPS32 hardware tracks a global "link bit" (`LLbit`) that is set by
+`ll` and cleared by `sc` or by several events this single-threaded simulator
+has no notion of at all: context switches, and cache-coherence traffic
+arriving from other cores in a multiprocessor system (MD00086 §3.2's own
+`LL`/`SC` pseudocode describes `LLbit` as cleared by "any other processor's
+execution of a `SC` to the same block of physical memory", among other
+implementation-defined events). None of that exists in a single-hart
+simulator with no other execution context, so this v1.x addition makes one
+deliberate simplification, modeled as a new `State.llBit : Bool` field
+(`Types.lean`, defaulting to `false` in `initialState`):
+
+- **`llBit` is cleared by any store-class instruction that executes after
+  `ll`** — `sw`, `sh`, and `swc1` (this project's v1 set has no `sb`; see
+  `Instruction.lean`'s module docstring for the full store inventory), to
+  *any* address, not just the `ll`'s own address. This is the one part of
+  the real multi-event `LLbit`-clearing rule that is both architecturally
+  mandated and observable without real concurrency: on real hardware, an
+  intervening store from *this* core to memory between a matching `ll`/`sc`
+  pair is exactly what `sc` is supposed to detect and fail on, even with
+  only one core running. The other real clearing events (context switches,
+  other cores' cache-coherence traffic) have no counterpart in a single-hart
+  model with no OS/scheduler and no other cores, so they are out of scope by
+  construction rather than by oversight.
+- **`sc` itself always clears `llBit`**, whether it succeeds or fails (real
+  MIPS32 architectural behavior, not a simplification) — see the `sc` entry
+  below for the exact order of operations.
+
+### ll (I)
+- **Encoding**: `opcode=110000` (0x30). Same field layout as `lw`:
+  `base=rs` (operand index 2 in this assembler's convention), `rt`
+  (destination, operand index 0), `offset` (operand index 1, sign-extended
+  exactly like `lw`'s offset).
+- **Semantics**: `addr = $base + sext16(offset)`; `$rt = MEM32[addr]`
+  (4 bytes, big-endian — identical to `lw`'s load); additionally,
+  `State.llBit := true`.
+- **Errors/halts**: `addr % 4 != 0` → the same `addressError` halt as `lw`
+  (word-aligned access required).
+- **ISA note**: standard MIPS32 instruction (MD00086 §3.2, Table 3-4, p. 25,
+  entry 167). Real hardware additionally records the physical address
+  range covered by the link for coherence-snooping purposes; this model has
+  no cache/coherence layer, so only the single global `llBit` flag is kept
+  (see the `LLbit` simplification note above).
+
+### sc (I)
+- **Encoding**: `opcode=111000` (0x38). Same field layout as `sw`:
+  `base=rs`, `rt` (source register to conditionally store *and* the
+  destination for the success/failure result), `offset` (sign-extended
+  exactly like `sw`'s offset).
+- **Semantics**: `addr = $base + sext16(offset)`. The effective address is
+  computed and alignment-checked unconditionally (exactly like `sw`), even
+  if the store ends up not committing. Then:
+  1. If `State.llBit` is `true`: perform the store, `MEM32[addr] = $rt`
+     (identical to `sw`'s store), using `$rt`'s value *before* it is
+     overwritten by the next step; then write `$rt := 1` (success).
+  2. If `State.llBit` is `false`: do **not** perform the store; write
+     `$rt := 0` (failure).
+  3. **Either way**, clear `State.llBit := false` afterward — this check
+     happens *before* the clear, not after (clearing first would make every
+     `sc` unconditionally fail).
+- **Errors/halts**: `addr % 4 != 0` → the same `addressError` halt as `sw`,
+  regardless of `llBit` (see above — the address check is unconditional).
+- **ISA note**: standard MIPS32 instruction (MD00086 §3.2, Table 3-4, p. 26,
+  entry 253). Real hardware's success/failure value is written to `rt` as
+  the full ISA-defined "1 = success, 0 = failure" encoding; this model
+  matches that exactly. The real ISA also describes additional
+  implementation-defined conditions under which `sc` may spuriously fail
+  (an "exclusive access" granularity coarser than the one word read by
+  `ll`, for instance); this model never fails spuriously — `llBit` is the
+  only condition checked, matching the simplification note above.
+
+### Encoding summary
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `ll $rt, offset($rs)` | I, opcode 0x30 | `$rt = MEM32[$rs + offset]`; `llBit := true` |
+| `sc $rt, offset($rs)` | I, opcode 0x38 | if `llBit`: `MEM32[$rs + offset] = $rt`, `$rt := 1`; else `$rt := 0`; either way `llBit := false` |
+
+### Citation
+
+"MIPS32 Architecture For Programmers, Volume II-A: The MIPS32 Instruction
+Set" (MD00086, Rev 2.50), §3.2, Table 3-4 (p. 25–26): `LL` (entry 167,
+opcode 0x30) and `SC` (entry 253, opcode 0x38). No internet access was used
+to write this section; these are well-established, memorized ISA constants
+(the same citation already used by `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7),
+and any single value a future reader doubts should be cross-checked against
+a primary MIPS32 ISA reference before relying on it for anything beyond this
+simulator.

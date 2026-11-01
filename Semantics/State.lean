@@ -16,9 +16,10 @@ Depends only on the foundation (`Word`, `Types`); read-only there.
 /-- The initial machine state at program counter `pc`: all general-purpose
 registers are `0` except `$sp` (register 29), which is seeded with `spInit`;
 `hi`/`lo` are `0`; all 32 FP registers (`fpRegs`) are `0`; `fpCondFlag` is
-`false`; memory is empty; accumulated output is empty; the three modeled
-coprocessor-0 registers (`cp0Status`, `cp0Cause`, `cp0Epc`) are all `0` (no
-exception has occurred yet). -/
+`false`; memory is empty; accumulated output is empty; `llBit` is `false`
+(no `ll` has executed yet); the three modeled coprocessor-0 registers
+(`cp0Status`, `cp0Cause`, `cp0Epc`) are all `0` (no exception has occurred
+yet). -/
 def initialState (pc : W32) : State :=
   { pc := pc
     regs := (Array.replicate 32 (0#32)).set! 29 spInit
@@ -29,6 +30,7 @@ def initialState (pc : W32) : State :=
     mem := ∅
     out := ""
     pendingBranch := none
+    llBit := false
     cp0Status := 0#32
     cp0Cause := 0#32
     cp0Epc := 0#32 }
@@ -142,6 +144,7 @@ example : (initialState textBase).fpRegs[31]! = 0#32 := by decide
 example : (initialState textBase).fpCondFlag = false := by decide
 example : (initialState textBase).out = "" := by decide
 example : (initialState textBase).pendingBranch = none := by decide
+example : (initialState textBase).llBit = false := by decide
 -- `Std.HashMap` has no `DecidableEq`, and its operations are not kernel-reducible
 -- (`decide`/`rfl`); check emptiness via a lookup checked with `#guard` instead.
 #guard (initialState textBase).regs[29]! = spInit
