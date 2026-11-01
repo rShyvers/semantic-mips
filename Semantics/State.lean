@@ -22,7 +22,8 @@ def initialState (pc : W32) : State :=
     hi := 0#32
     lo := 0#32
     mem := ∅
-    out := "" }
+    out := ""
+    pendingBranch := none }
 
 /-- Read general-purpose register `i`. Register `0` (`$zero`) always reads as
 `0` by construction of `initialState`/`writeReg`, but this also tolerates any
@@ -114,6 +115,7 @@ example : (initialState textBase).regs[31]! = 0#32 := by decide
 example : (initialState textBase).hi = 0#32 := by decide
 example : (initialState textBase).lo = 0#32 := by decide
 example : (initialState textBase).out = "" := by decide
+example : (initialState textBase).pendingBranch = none := by decide
 -- `Std.HashMap` has no `DecidableEq`, and its operations are not kernel-reducible
 -- (`decide`/`rfl`); check emptiness via a lookup checked with `#guard` instead.
 #guard (initialState textBase).regs[29]! = spInit

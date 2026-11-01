@@ -25,6 +25,15 @@ structure State where
   mem : Std.HashMap W32 UInt8
   /-- Accumulated syscall output. -/
   out : String
+  /-- A branch/jump target scheduled by a taken branch or jump
+  (`beq`/`bne`/`blez`/`bgtz`/`j`/`jal`) but not yet applied to `pc`. Models
+  real MIPS32's architecturally-mandated one-instruction branch delay slot
+  (SPEC-NOTES §9 item 1; INSTRUCTION-REF Global rule 3): a taken
+  branch/jump leaves `pc` at the delay-slot instruction (`pc + 4`) and
+  records its real target here; the *next* step applies it (see
+  `Step.lean`'s `advance`). `none` means no transfer is pending — the
+  common case, and the only one `initialState` ever produces. -/
+  pendingBranch : Option W32 := none
 
 /-- Reasons the simulator halts instead of producing a next state. -/
 inductive HaltReason where
@@ -36,6 +45,14 @@ inductive HaltReason where
   | addressError (addr : W32)
   /-- An add/sub overflow trap fired (no handler installed in v1). -/
   | arithmeticOverflow
+  /-- A branch/jump instruction (`beq`/`bne`/`blez`/`bgtz`/`j`/`jal`) was
+  fetched while a previous branch/jump's delay-slot transfer was still
+  pending (`State.pendingBranch = some _`) — i.e. a branch/jump occurring
+  itself in another's delay slot. Real MIPS32 leaves this
+  architecturally discouraged/implementation-defined; rather than pick an
+  arbitrary behavior, `step` halts with this reason so the condition stays
+  diagnosable (SPEC-NOTES §9 item 1; INSTRUCTION-REF Global rule 3). -/
+  | branchInDelaySlot
   deriving Repr, DecidableEq
 
 /-- Result of a single simulation step: either a new state, or a halt. -/
@@ -113,4 +130,9 @@ example : sampleState.out = "" := by decide
 
 -- `HaltReason` / `StepResult` sanity
 example : HaltReason.exit ≠ HaltReason.arithmeticOverflow := by decide
+example : HaltReason.branchInDelaySlot ≠ HaltReason.arithmeticOverflow := by decide
 example : (StepResult.halt HaltReason.exit) = (StepResult.halt HaltReason.exit) := by rfl
+
+-- `State.pendingBranch` defaults to `none` when omitted from a literal
+example : sampleState.pendingBranch = none := by decide
+#guard sampleState.pendingBranch = none
