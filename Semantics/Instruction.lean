@@ -63,6 +63,15 @@ Field-shape summary (see each constructor's docstring for details):
   0x30/0x38); not part of the original v1 instruction set, added as the
   `State.llBit` single-hart model (see `Types.lean`'s `llBit` docstring and
   `docs/spec/INSTRUCTION-REF.md`).
+- I-type unaligned load/store (`rs rt imm`), same field shape as `lw`/`sw`:
+  `lwl lwr swl swr` — real MIPS32 classic (pre-r6) unaligned memory-access
+  pair (opcodes 0x22/0x26/0x2a/0x2e); not part of the original v1
+  instruction set (see `docs/spec/MIPS-COVERAGE-GAPS.md` §3.6 and
+  `docs/spec/INSTRUCTION-REF.md`'s dedicated section). `rs` is the base
+  register, `rt` is the dest/src register (also read, since these partially
+  preserve `$rt`'s prior value), `imm` is the raw offset field, exactly like
+  `lw`/`sw`; unlike `lw`/`sw`, the effective address has no alignment
+  requirement at all.
 - I-type branch reg/reg (`rs rt imm`): `beq bne`.
 - I-type branch reg-only (`rs imm`): `blez bgtz` — `rt` is unused/fixed 0.
 - J-type (`target`): `j jal` — raw 26-bit target field (not yet shifted/combined
@@ -386,6 +395,33 @@ inductive Instruction where
   MD00086 Rev 2.50 §3.2, Table 3-4). Identical addressing/alignment to
   `sw`. -/
   | sc  (rs rt imm : W32)
+  -- I-type unaligned load/store (classic MIPS32; removed in MIPS32r6). Same
+  -- `rs rt imm` field shape as `lw`/`sw`; see `docs/spec/INSTRUCTION-REF.md`'s
+  -- dedicated section for the exact big-endian byte-merge semantics.
+  /-- Load Word Left (opcode 0x22; MD00086 Rev 2.50 §3.2, Table 3-4, p. 25,
+  entry 174). `addr = $rs + sext16(offset)` (no alignment check). Loads the
+  bytes from `addr` up to the next word boundary (inclusive of `addr`) into
+  the most-significant bytes of `$rt`; `$rt`'s remaining (less-significant)
+  bytes are left unchanged. -/
+  | lwl (rs rt imm : W32)
+  /-- Load Word Right (opcode 0x26; MD00086 Rev 2.50 §3.2, Table 3-4, p. 25,
+  entry 177). Same `addr` as `lwl`. Loads the bytes from the start of the
+  word containing `addr` up to and including `addr` into the
+  least-significant bytes of `$rt`; `$rt`'s remaining (more-significant)
+  bytes are left unchanged. Paired with `lwl` (opposite offsets) to load an
+  arbitrary unaligned word. -/
+  | lwr (rs rt imm : W32)
+  /-- Store Word Left (opcode 0x2a; MD00086 Rev 2.50 §3.2, Table 3-4, p. 26,
+  entry 282). Same `addr` as `lwl`. Stores `$rt`'s most-significant bytes
+  into memory from `addr` up to the next word boundary (inclusive of
+  `addr`). -/
+  | swl (rs rt imm : W32)
+  /-- Store Word Right (opcode 0x2e; MD00086 Rev 2.50 §3.2, Table 3-4, p. 26,
+  entry 285). Same `addr` as `lwl`. Stores `$rt`'s least-significant bytes
+  into memory from the start of the word containing `addr` up to and
+  including `addr`. Paired with `swl` to store an arbitrary unaligned
+  word. -/
+  | swr (rs rt imm : W32)
   -- I-type branch reg/reg
   /-- `if $rs == $rt then PC = PC_next + (sext16(imm) << 2)` (opcode 0x04). -/
   | beq (rs rt imm : W32)
@@ -788,6 +824,10 @@ def decode (w : W32) : Option Instruction :=
   | 0x24 => some (.lbu rs rt imm)
   | 0x21 => some (.lh rs rt imm)
   | 0x25 => some (.lhu rs rt imm)
+  | 0x22 => some (.lwl rs rt imm)
+  | 0x26 => some (.lwr rs rt imm)
+  | 0x2a => some (.swl rs rt imm)
+  | 0x2e => some (.swr rs rt imm)
   | 0x29 => some (.sh rs rt imm)
   | 0x30 => some (.ll rs rt imm)
   | 0x38 => some (.sc rs rt imm)
@@ -946,6 +986,10 @@ def encode (i : Instruction) : W32 :=
   | .sh rs rt imm => mkIT 0x29#32 rs rt imm
   | .ll rs rt imm => mkIT 0x30#32 rs rt imm
   | .sc rs rt imm => mkIT 0x38#32 rs rt imm
+  | .lwl rs rt imm => mkIT 0x22#32 rs rt imm
+  | .lwr rs rt imm => mkIT 0x26#32 rs rt imm
+  | .swl rs rt imm => mkIT 0x2a#32 rs rt imm
+  | .swr rs rt imm => mkIT 0x2e#32 rs rt imm
   | .beq rs rt imm => mkIT 0x04#32 rs rt imm
   | .bne rs rt imm => mkIT 0x05#32 rs rt imm
   | .blez rs imm => mkIT 0x06#32 rs 0#32 imm
@@ -1129,6 +1173,13 @@ example : decode (mkIT 0x29#32 29#32 8#32 0x1234#32) = some (.sh 29#32 8#32 0x12
 -- field layout to lw/sw
 example : decode (mkIT 0x30#32 29#32 8#32 0x1234#32) = some (.ll 29#32 8#32 0x1234#32) := by decide
 example : decode (mkIT 0x38#32 29#32 8#32 0x1234#32) = some (.sc 29#32 8#32 0x1234#32) := by decide
+
+-- lwl/lwr/swl/swr: rs=29 (base), rt=8 (dest/src), imm=0x1234 (offset) --
+-- identical field layout to lw/sw
+example : decode (mkIT 0x22#32 29#32 8#32 0x1234#32) = some (.lwl 29#32 8#32 0x1234#32) := by decide
+example : decode (mkIT 0x26#32 29#32 8#32 0x1234#32) = some (.lwr 29#32 8#32 0x1234#32) := by decide
+example : decode (mkIT 0x2a#32 29#32 8#32 0x1234#32) = some (.swl 29#32 8#32 0x1234#32) := by decide
+example : decode (mkIT 0x2e#32 29#32 8#32 0x1234#32) = some (.swr 29#32 8#32 0x1234#32) := by decide
 
 -- branch reg/reg: rs=29, rt=8, imm=0x1234
 example : decode (mkIT 0x04#32 29#32 8#32 0x1234#32) = some (.beq 29#32 8#32 0x1234#32) := by decide
@@ -1349,6 +1400,16 @@ example : encode (.ll 29#32 8#32 0x1234#32) = mkIT 0x30#32 29#32 8#32 0x1234#32 
 example : encode (.sc 29#32 8#32 0x1234#32) = mkIT 0x38#32 29#32 8#32 0x1234#32 := by decide
 example : decode (encode (.ll 29#32 8#32 0x1234#32)) = some (.ll 29#32 8#32 0x1234#32) := by decide
 example : decode (encode (.sc 29#32 8#32 0x1234#32)) = some (.sc 29#32 8#32 0x1234#32) := by decide
+-- lwl/lwr/swl/swr: encode matches the hand-computed opcode, and
+-- decode (encode i) = some i
+example : encode (.lwl 29#32 8#32 0x1234#32) = mkIT 0x22#32 29#32 8#32 0x1234#32 := by decide
+example : encode (.lwr 29#32 8#32 0x1234#32) = mkIT 0x26#32 29#32 8#32 0x1234#32 := by decide
+example : encode (.swl 29#32 8#32 0x1234#32) = mkIT 0x2a#32 29#32 8#32 0x1234#32 := by decide
+example : encode (.swr 29#32 8#32 0x1234#32) = mkIT 0x2e#32 29#32 8#32 0x1234#32 := by decide
+example : decode (encode (.lwl 29#32 8#32 0x1234#32)) = some (.lwl 29#32 8#32 0x1234#32) := by decide
+example : decode (encode (.lwr 29#32 8#32 0x1234#32)) = some (.lwr 29#32 8#32 0x1234#32) := by decide
+example : decode (encode (.swl 29#32 8#32 0x1234#32)) = some (.swl 29#32 8#32 0x1234#32) := by decide
+example : decode (encode (.swr 29#32 8#32 0x1234#32)) = some (.swr 29#32 8#32 0x1234#32) := by decide
 
 -- unknown opcodes → none
 #guard decode (mkIT 0x3a#32 0#32 0#32 0#32) = none  -- opcode 0x3a, unassigned/not in v1+ scope

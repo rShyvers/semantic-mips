@@ -56,6 +56,12 @@ above (docs/spec/MIPS-COVERAGE-GAPS.md section 3.8), sharing the REGIMM
 opcode with `bltz`/`bgez`/`bltzal`/`bgezal`; see the dedicated
 ["REGIMM trap-immediate family"](#regimm-trap-immediate-family-real-mips32-isa--v1x-addition)
 section just after the REGIMM zero-comparison branches below.
+Finally, the real MIPS32 classic (pre-Release-6) unaligned memory-access
+pair `lwl`/`lwr`/`swl`/`swr` has since been added on top of the v1 set
+(identified as a coverage gap in `docs/spec/MIPS-COVERAGE-GAPS.md` §3.6);
+see the dedicated
+["Unaligned memory access (`lwl`/`lwr`/`swl`/`swr`)"](#unaligned-memory-access-lwllwrswlswr--v1x-addition)
+section at the end of this document.
 
 Conventions pinned elsewhere and assumed here (see
 [`SPEC-NOTES.md`](SPEC-NOTES.md)): one real-MIPS32 branch delay slot per
@@ -1834,7 +1840,8 @@ deliberate simplification, modeled as a new `State.llBit : Bool` field
 (`Types.lean`, defaulting to `false` in `initialState`):
 
 - **`llBit` is cleared by any store-class instruction that executes after
-  `ll`** — `sw`, `sh`, and `swc1` (this project's v1 set has no `sb`; see
+  `ll`** — `sw`, `sh`, `swc1`, and (per the later "Unaligned memory access"
+  addition below) `swl`/`swr` too (this project's v1 set has no `sb`; see
   `Instruction.lean`'s module docstring for the full store inventory), to
   *any* address, not just the `ll`'s own address. This is the one part of
   the real multi-event `LLbit`-clearing rule that is both architecturally
@@ -2146,6 +2153,162 @@ Rev 2.50, §3.2 — not MARS-specific behavior.
 - **Errors/halts**: none.
 - **ISA note**: MIPS32r2 instruction. MD00086 §3.2, Table 3-6 (p. 26,
   entry 321 `WSBH`).
+## Unaligned memory access (`lwl`/`lwr`/`swl`/`swr`) — v1.x addition
+
+This section documents a v1.x addition: the real MIPS32 classic (MIPS I
+through MIPS32 Release 2) unaligned load/store pair `lwl`/`lwr` (Load/Store
+Word Left) and `swl`/`swr` (Store Word Left/Right), identified as a coverage
+gap in `docs/spec/MIPS-COVERAGE-GAPS.md` §3.6 ("very common" in classic MIPS:
+emitted by standard-library `memcpy`/`strcpy` and by unaligned-struct-field
+access in compiled C). **Grounding note**: like the Coprocessor 0,
+floating-point, GPR-multiply/variable-shift, and `ll`/`sc` additions above,
+this section is grounded directly in the **real MIPS32 architecture** —
+specifically "MIPS32 Architecture For Programmers, Volume II-A: The MIPS32
+Instruction Set" (MD00086, Rev 2.50), §3.2, Table 3-4 (pp. 25–26), entries
+174 (`LWL`), 177 (`LWR`), 282 (`SWL`), 285 (`SWR`) — not against MARS (which
+is this project's differential-testing oracle, not the spec source).
+**Scope note**: MIPS32 Release 6 removed this instruction family entirely
+(MD00086 Rev 6.04 §2.1.2), replacing it with native misaligned-access support
+in `lw`/`sw`; this project targets MIPS32 Release 2 (per the project
+baseline note near the top of this document and in
+`docs/spec/MIPS-COVERAGE-GAPS.md` §2's "Note on Architecture Releases"), so
+these four classic instructions are in scope.
+
+### Why this family exists
+
+`lw`/`sw` require a word-aligned address (Global rule 5) and halt with
+`addressError` otherwise. `lwl`/`lwr`/`swl`/`swr` are classic MIPS's
+alignment-free alternative: **neither ever halts on a misaligned address —
+that is their entire purpose.** Software loads/stores an arbitrary unaligned
+32-bit word by issuing one `lwl` (or `swl`) and one `lwr` (or `swr`) to two
+different offsets of the *same* base register; between the two instructions,
+every byte of the 4-byte unaligned word is touched exactly once, so the pair
+is equivalent to a hypothetical "unaligned `lw`/`sw`".
+
+### Shared addressing and the byte-position convention
+
+All four compute the same way: `addr = $rs + sext16(offset)`, exactly like
+`lw`/`sw` (**no alignment check** — this is the one addressing-mode
+difference from `lw`/`sw`). Let `off = addr mod 4` (i.e. how far `addr` is
+past the start of the word that contains it) and let `wordBase = addr - off`
+(the address of that word's first/most-significant byte). Per Global rule 4,
+this project's memory is big-endian: for any word-aligned address `W`, byte
+`W` holds bits `[31:24]` of the conceptual word at `W` ("slot 0"), `W+1`
+holds bits `[23:16]` ("slot 1"), `W+2` holds `[15:8]` ("slot 2"), and `W+3`
+holds `[7:0]` ("slot 3"). `lwl`/`swl` work from `addr` *up to* the next word
+boundary (i.e. slots `off..3`); `lwr`/`swr` work from the word boundary *up
+to and including* `addr` (i.e. slots `0..off`, except indexed from the
+*other* end — see each entry below for the exact slot arithmetic).
+
+### lwl (I)
+
+- **Encoding**: `opcode=100010` (0x22). Same field layout as `lw`:
+  `base=rs`, `rt` (destination — and also *read*, since the bytes `lwl`
+  doesn't touch are preserved from `rt`'s prior value), `offset` (sign-
+  extended exactly like `lw`'s offset).
+- **Semantics**: `addr = $base + sext16(offset)` (no alignment check). Let
+  `off = addr mod 4`. Reads the `4 - off` bytes starting at `addr` up to and
+  including `wordBase + 3` (the next word boundary) and places them into the
+  **most-significant** `4 - off` byte-slots of `$rt` (slots `0 .. 3-off`, in
+  address order — the byte at `addr` is the most significant of the ones
+  read); `$rt`'s remaining `off` least-significant byte-slots are left
+  **unchanged**. When `off = 0`, this reads all 4 bytes and behaves exactly
+  like `lw`.
+- **Errors/halts**: none, ever — `readMemByte` (the per-byte primitive this
+  is built from) has no alignment requirement, unlike `readMemWord`.
+- **ISA note**: standard classic-MIPS instruction (MIPS I onward; removed in
+  MIPS32r6). Always paired with `lwr` to load an arbitrary unaligned word;
+  see the worked example below.
+
+### lwr (I)
+
+- **Encoding**: `opcode=100110` (0x26). Same field layout as `lwl`.
+- **Semantics**: Same `addr`/`off` as `lwl`. Reads the `off + 1` bytes from
+  `wordBase` up to and including `addr` and places them into the
+  **least-significant** `off + 1` byte-slots of `$rt` (slots `3-off .. 3`,
+  in address order); `$rt`'s remaining `3 - off` most-significant byte-slots
+  are left **unchanged**. When `off = 3`, this reads all 4 bytes (`wordBase`
+  through `wordBase + 3 = addr`) and behaves exactly like `lw`.
+- **Errors/halts**: none, ever (same reason as `lwl`).
+- **ISA note**: standard classic-MIPS instruction (MIPS I onward; removed in
+  MIPS32r6). Complementary to `lwl` — see the worked example below.
+
+### swl (I)
+
+- **Encoding**: `opcode=101010` (0x2a). Same field layout as `sw`:
+  `base=rs`, `rt` (source register, read-only — unlike `lwl`, `swl` does not
+  write `$rt`), `offset` (sign-extended exactly like `sw`'s offset).
+- **Semantics**: Same `addr`/`off` as `lwl`. Stores `$rt`'s **most-
+  significant** `4 - off` byte-slots (slots `0 .. 3-off`) into memory at
+  `addr` through `wordBase + 3` (the next word boundary), in address order.
+  When `off = 0`, this stores all 4 bytes and behaves exactly like `sw`.
+  Like `sw`, clears `State.llBit` (see the "`LLbit` single-hart
+  simplification" note above — `swl`/`swr` are store-class instructions for
+  that purpose too).
+- **Errors/halts**: none, ever (`writeMemByte`, the per-byte primitive this
+  is built from, has no alignment requirement, unlike `writeMemWord`).
+- **ISA note**: standard classic-MIPS instruction (MIPS I onward; removed in
+  MIPS32r6). Always paired with `swr`; see the worked example below.
+
+### swr (I)
+
+- **Encoding**: `opcode=101110` (0x2e). Same field layout as `swl`.
+- **Semantics**: Same `addr`/`off` as `lwl`. Stores `$rt`'s **least-
+  significant** `off + 1` byte-slots (slots `3-off .. 3`) into memory from
+  `wordBase` through `addr`, in address order. When `off = 3`, this stores
+  all 4 bytes and behaves exactly like `sw`. Clears `State.llBit`, same as
+  `swl`.
+- **Errors/halts**: none, ever (same reason as `swl`).
+- **ISA note**: standard classic-MIPS instruction (MIPS I onward; removed in
+  MIPS32r6). Complementary to `swl` — see the worked example below.
+
+### Worked example: loading/storing an unaligned word with the complementary pair
+
+Let `$s0 = A` where `A mod 4 = 0` (word-aligned), and suppose memory holds
+the big-endian bytes `A:0x11, A+1:0x22, A+2:0x33, A+3:0x44, A+4:0x55,
+A+5:0x66, A+6:0x77, A+7:0x88`. The *unaligned* word spanning `A+1 .. A+4` is
+conceptually `0x22334455` (byte `A+1` most significant, `A+4` least
+significant) — but no single `lw` can read it, since neither `A+1` nor any
+address in that range is word-aligned.
+
+```
+lwl $t0, 1($s0)    # addr = A+1, off = 1
+lwr $t0, 4($s0)    # addr = A+4, off = 0
+```
+
+- `lwl $t0, 1($s0)`: `addr = A+1`, `off = 1`, so it reads the `4-1=3` bytes
+  `A+1=0x22, A+2=0x33, A+3=0x44` into `$t0`'s top 3 byte-slots (slots 0,1,2);
+  slot 3 (the low byte) is left unchanged (whatever `$t0` held before). After
+  this instruction, `$t0 = 0x2233_44??` (`??` = `$t0`'s prior low byte).
+- `lwr $t0, 4($s0)`: `addr = A+4`, `off = (A+4) mod 4 = 0`, so it reads the
+  `0+1=1` byte `A+4=0x55` into `$t0`'s bottom byte-slot (slot 3) only; slots
+  0–2 are left unchanged (`lwr` never touches them). After this instruction,
+  `$t0 = 0x22334455` — exactly the unaligned word, with each of the 4 bytes
+  `A+1..A+4` supplied by exactly one of the two instructions (`lwl` supplied
+  `A+1,A+2,A+3`; `lwr` supplied `A+4`; no byte is supplied twice or missed).
+
+The store direction is the exact mirror image: to write `$t0 = 0x22334455`
+back to the same unaligned range,
+
+```
+swl $t0, 1($s0)    # addr = A+1, off = 1: stores $t0's top 3 bytes (0x22,0x33,0x44) to A+1,A+2,A+3
+swr $t0, 4($s0)    # addr = A+4, off = 0: stores $t0's bottom byte (0x55) to A+4
+```
+
+writes `A+1:0x22, A+2:0x33, A+3:0x44, A+4:0x55` — again, every byte in the
+range touched exactly once between the two instructions.
+
+### Encoding summary
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `lwl $rt, offset($rs)` | I, opcode 0x22 | loads bytes `addr..wordBase+3` into `$rt`'s high byte-slots; low slots unchanged |
+| `lwr $rt, offset($rs)` | I, opcode 0x26 | loads bytes `wordBase..addr` into `$rt`'s low byte-slots; high slots unchanged |
+| `swl $rt, offset($rs)` | I, opcode 0x2a | stores `$rt`'s high byte-slots to memory `addr..wordBase+3` |
+| `swr $rt, offset($rs)` | I, opcode 0x2e | stores `$rt`'s low byte-slots to memory `wordBase..addr` |
+
+(`addr = $rs + sext16(offset)`, no alignment check; `wordBase = addr - (addr
+mod 4)`.)
 
 ### Citation
 
@@ -2181,3 +2344,11 @@ no-internet-access environment; the `decode (encode i) = some i` round-trip
 tests in `Instruction.lean` confirm the two fields are mutually consistent
 within this codebase, but do not by themselves prove the packing matches
 real MIPS32r2 silicon bit-for-bit.
+Set" (MD00086, Rev 2.50), §3.2, Table 3-4 (pp. 25–26): `LWL` (entry 174,
+opcode 0x22), `LWR` (entry 177, opcode 0x26), `SWL` (entry 282, opcode
+0x2a), `SWR` (entry 285, opcode 0x2e). Removal in MIPS32 Release 6: MD00086
+Rev 6.04 §2.1.2. No internet access was used to write this section; these
+are well-established, memorized ISA constants (the same citation already
+used by `docs/spec/MIPS-COVERAGE-GAPS.md` §3.6), and any single value a
+future reader doubts should be cross-checked against a primary MIPS32 ISA
+reference before relying on it for anything beyond this simulator.
