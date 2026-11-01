@@ -1733,6 +1733,129 @@ project's differential-testing oracle, not the spec source.
 - **Errors/halts**: none.
 - **ISA note**: standard MIPS32 instruction. The write-direction counterpart
   to `mflo`, same context-switch/`setjmp`/`longjmp` rationale as `mthi`.
+## MIPS32r2 rotate and bitfield extract/insert (v1.x addition)
+
+This section documents a v1.x addition: five more real MIPS32r2 instructions
+(`rotr`, `rotrv`, `ext`, `ins`, `wsbh`) added on top of the v1 scope and the
+previous v1.x addition sections above. Per `docs/spec/MIPS-COVERAGE-GAPS.md`
+§3.4, `ext`/`ins` are ubiquitous in MIPS32r2-compiled C for struct bitfields
+and protocol decoding, `rotr`/`rotrv` are common in cryptographic hash
+implementations, and `wsbh` is common in endianness-conversion pipelines.
+**Grounding note**: like the other v1.x addition sections, this is grounded
+directly in the **real MIPS32r2 architecture** — specifically MD00086 ("MIPS32
+Architecture For Programmers, Volume II-A: The MIPS32 Instruction Set"),
+Rev 2.50, §3.2 — not MARS-specific behavior.
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `rotr $rd, $rt, sa` | R (overloaded `srl`) | `$rd = $rt` rotated right by constant `sa` |
+| `rotrv $rd, $rt, $rs` | R (overloaded `srlv`) | `$rd = $rt` rotated right by `$rs & 0x1f` |
+| `ext $rt, $rs, pos, size` | R (SPECIAL3) | `$rt = zext($rs[pos+size-1 .. pos])` |
+| `ins $rt, $rs, pos, size` | R (SPECIAL3) | `$rt[pos+size-1 .. pos] = $rs[size-1 .. 0]`, rest of `$rt` unchanged |
+| `wsbh $rd, $rt` | R (SPECIAL3/BSHFL) | swap bytes within each halfword of `$rt` independently |
+
+### rotr (R) / rotrv (R)
+
+- **Encoding**: `rotr` shares `srl`'s opcode (`000000`, SPECIAL) and funct
+  (`000010`, 0x02); `rotrv` shares `srlv`'s opcode (SPECIAL) and funct
+  (`000110`, 0x06). Real MIPS32r2 distinguishes rotate from shift by
+  overloading a field that is otherwise unused/fixed-zero in the plain-shift
+  encodings: for `rotr` (shift-by-constant format), the normally-`00000`
+  `rs` field (bits 25-21) is set to `00001`; for `rotrv` (shift-by-register
+  format), the normally-`00000` `shamt` field (bits 10-6) is set to `00001`.
+  Everything else matches `srl`/`srlv`'s field layout exactly (`rotr`:
+  `rd rt sa`; `rotrv`: `rd rt rs`). This is a **new decode/encode branch
+  added alongside** the existing `srl`/`srlv` handling, not a replacement —
+  a word with `rs=0`/`shamt=0` still decodes to plain `srl`/`srlv`.
+- **Semantics**: Rotate Word Right (`rotr`) / Rotate Word Right Variable
+  (`rotrv`). Bits shifted off the bottom wrap around to fill the top — this
+  is the one bit that distinguishes rotate from `srl`/`srlv`'s **zero-fill**
+  on the exact same input. Worked example: `rotr $t0, $t1, 4` with
+  `$t1 = 0x12345678` gives `$t0 = 0x81234567` (the low nibble `0x8` wraps
+  around to the top byte), whereas `srl $t0, $t1, 4` on the same input gives
+  `$t0 = 0x01234567` (zero-fill instead). `rotrv`'s rotate amount is `$rs`'s
+  low 5 bits, masked exactly like `sllv`/`srlv`/`srav`'s shift amount (e.g.
+  `$rs = 36` behaves identically to `$rs = 4`).
+- **Errors/halts**: none.
+- **ISA note**: MIPS32r2 instruction (not present in MIPS32 Release 1).
+  MD00086 §3.2, Table 3-8 (p. 27, entries 245 `ROTR` and 246 `ROTRV`).
+
+### ext (R, SPECIAL3)
+
+- **Encoding**: `opcode=011111` (0x1f, SPECIAL3), `funct=000000` (0x00).
+  Fields: `011111 sssss ttttt mmmmm lllll 000000` → `rs=sssss` (source),
+  `rt=ttttt` (destination), and two compile-time constants packed into the
+  remaining fields: `lsb` (bits 10-6, this project's `shamt`-position field)
+  is `pos` directly; `msbd` (bits 15-11, this project's `rd`-position field)
+  is `size - 1` — **not** `size` itself (the real MIPS32 ISA pseudocode
+  computes `size = msbd + 1`, so `Instruction.decode`/`encode` do this `±1`
+  arithmetic so that `Step.lean` only ever sees the semantic `pos`/`size`
+  pair directly, the same way this codebase already hides `clo`/`clz`'s
+  duplicated-rt-field quirk).
+- **Semantics**: Extract Bit Field. `$rt = zero-extend($rs[pos+size-1 ..
+  pos])` — a `size`-bit field starting at bit `pos` of `$rs`, zero-extended
+  into `$rt`. Worked example: `ext $t0, $t1, 6, 10` with
+  `$t1 = 0x12345678` extracts the 10-bit field at bits [15:6]
+  (`(0x12345678 >> 6) & 0x3ff`), giving `$t0 = 0x159`.
+- **Real hardware constraint**: `pos + size <= 32` is required; violating it
+  is architecturally `UNPREDICTABLE`. This simulator makes **no special
+  case** for the violation — `Step.lean`'s `execInstr` just computes
+  whatever the plain bit-shift-and-mask arithmetic implies, per this
+  track's brief — but the assembler (`Asm.lean`) does reject out-of-range
+  `pos`/`size`/`pos+size` at assembly time, the same way it already rejects
+  an out-of-range `shamt` for `sll`/`srl`/`sra`.
+- **Errors/halts**: none at execution time (see above).
+- **ISA note**: MIPS32r2 instruction. MD00086 §3.2, Table 3-6 (p. 26,
+  entry 140 `EXT`).
+
+### ins (R, SPECIAL3)
+
+- **Encoding**: `opcode=011111` (0x1f, SPECIAL3), `funct=000100` (0x04).
+  Same `rs`/`rt`/`lsb` field roles as `ext` (`lsb` = `pos`), but the
+  `rd`-position field (bits 15-11, called `msb` for this instruction) holds
+  a **different** quantity than `ext`'s `msbd`: `msb = pos + size - 1` (the
+  real MIPS32 ISA pseudocode sets `lsb = pos; msb = pos + size - 1`). This
+  is a genuinely different field computation from `ext`'s `size - 1`, not a
+  typo — `Instruction.decode`/`encode` do the matching `±1` arithmetic for
+  each instruction separately.
+- **Semantics**: Insert Bit Field. Inserts the low `size` bits of `$rs` into
+  `$rt` starting at bit `pos`; bits of `$rt` **outside** `[pos+size-1 ..
+  pos]` are left completely unchanged (the same "partially update a
+  register" shape as `movn`/`movz`, though the bit-level masking here is
+  new). Worked example: `ins $t0, $t1, 6, 10` with `$t1 = 0x159` and
+  `$t0 = 0x12345678` beforehand re-inserts exactly the field `ext` extracted
+  above, reproducing `$t0 = 0x12345678` unchanged — `ext`/`ins` round-trip
+  by construction. A second example starting from `$t0 = 0`: with
+  `$t1 = 0xfffffc01` (`size = 10`, so only the low 10 bits `0x001` are
+  used, the rest of `$t1` is ignored), `ins $t0, $t1, 6, 10` gives
+  `$t0 = 0x00000040` (`0x001 << 6`) — the bits of `$t0` outside `[15:6]`
+  stay `0`, demonstrating the "unchanged outside the field" guarantee.
+- **Real hardware constraint**: same `pos + size <= 32` note as `ext`.
+- **Errors/halts**: none.
+- **ISA note**: MIPS32r2 instruction. MD00086 §3.2, Table 3-6 (p. 26,
+  entry 148 `INS`).
+
+### wsbh (R, SPECIAL3/BSHFL)
+
+- **Encoding**: `opcode=011111` (0x1f, SPECIAL3), `funct=100000` (0x20) —
+  the same BSHFL funct family as the already-implemented `seb`/`seh`,
+  distinguished by the shamt-position sub-field: `seb` is `0x10`, `seh` is
+  `0x18`, `wsbh` is `0x02` (`rs` unused/fixed 0, same as `seb`/`seh`). This
+  is a **new case added alongside** the existing `seb`/`seh` dispatch on
+  that sub-field, not a replacement.
+- **Semantics**: Word Swap Bytes Within Halfwords. Swaps the byte order
+  **within** each 16-bit half of `$rt` independently (byte 0 ↔ byte 1,
+  byte 2 ↔ byte 3) — the two halfwords themselves stay in their original
+  word positions. This is **not** a full 32-bit byte-reverse; that needs
+  `wsbh` followed by `rotr $rd, $rd, 16` (swap bytes within each halfword,
+  then swap the halfwords themselves), the standard MIPS32r2
+  endianness-conversion idiom — `wsbh` alone does not do this. Worked
+  example: `wsbh $t0, $t1` with `$t1 = 0x12345678` gives `$t0 =
+  0x34127856` (halfword `0x5678` → `0x7856`; halfword `0x1234` → `0x3412`;
+  halfword *positions* unchanged).
+- **Errors/halts**: none.
+- **ISA note**: MIPS32r2 instruction. MD00086 §3.2, Table 3-6 (p. 26,
+  entry 321 `WSBH`).
 
 ### Citation
 
@@ -1751,3 +1874,20 @@ being relied upon here. As with every hand-encoded constant in this project,
 any single value a future reader doubts should be cross-checked against a
 primary MIPS32 ISA reference before relying on it for anything beyond this
 simulator.
+Set" (MD00086, Rev 2.50), §3.2: Table 3-8 (p. 27, entries 245/246) for
+`ROTR`/`ROTRV`'s opcode/funct encodings and rotate pseudocode; Table 3-6
+(p. 26, entries 140/148/321) for `EXT`/`INS`/`WSBH`'s SPECIAL3 opcode
+(0x1f) and funct (0x00/0x04/0x20) encodings and their bitfield/byte-swap
+pseudocode. No internet access was used to write this section; these are
+well-established, memorized ISA constants, cross-referenced against
+`docs/spec/MIPS-COVERAGE-GAPS.md`'s independent research pass (§3.4, which
+cites the same table/page/entry numbers) before being relied upon here.
+**One detail flagged for independent double-checking**: the `EXT`/`INS`
+`msbd`/`msb` field encodings above (`size - 1` for `ext`, `pos + size - 1`
+for `ins`) are reconstructed from memorized MD00086 pseudocode
+(`pos = lsb; size = msbd + 1` for `EXT`, `lsb = pos; msb = pos + size - 1`
+for `INS`) rather than verified against a primary source in this
+no-internet-access environment; the `decode (encode i) = some i` round-trip
+tests in `Instruction.lean` confirm the two fields are mutually consistent
+within this codebase, but do not by themselves prove the packing matches
+real MIPS32r2 silicon bit-for-bit.

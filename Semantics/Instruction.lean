@@ -165,6 +165,21 @@ inductive Instruction where
   /-- `$rd = $rt >> ($rs & 0x1f)`, arithmetic/sign-fill, shift amount from a
   register's low 5 bits (opcode 0, funct 0x07). MIPS32. -/
   | srav (rd rt rs : W32)
+  -- R-type rotate (MIPS32r2; docs/spec/MIPS-COVERAGE-GAPS.md §3.4). Real
+  -- MIPS32r2 overloads `srl`'s opcode-0/funct-0x02 encoding: the `rs` field
+  -- (normally unused/fixed 0 for the plain shift-by-constant format) is set
+  -- to 0x01 to select rotate instead of shift. Likewise `srlv`'s
+  -- opcode-0/funct-0x06 encoding is overloaded via the (normally
+  -- unused/fixed 0) `shamt` field set to 0x01. These are new decode/encode
+  -- branches alongside the existing `srl`/`srlv` ones, not replacements.
+  /-- `$rd = $rt` rotated right by the constant `sa` (0-31) bits -- bits
+  shifted off the bottom wrap around to the top, unlike `srl`'s zero-fill
+  (opcode 0, funct 0x02, `rs` field = 0x01). MIPS32r2. -/
+  | rotr (rd rt sa : W32)
+  /-- `$rd = $rt` rotated right by `$rs & 0x1f` bits, rotate amount from a
+  register's low 5 bits (opcode 0, funct 0x06, `shamt` field = 0x01).
+  MIPS32r2. -/
+  | rotrv (rd rt rs : W32)
   -- R-type mult/div (rd, shamt unused)
   /-- `{hi,lo} = $rs * $rt`, signed 64-bit (opcode 0, funct 0x18). -/
   | mult   (rs rt : W32)
@@ -251,6 +266,34 @@ inductive Instruction where
   /-- `$rd = sign-extend($rt[15:0])` to 32 bits (SPECIAL3 opcode 0x1f,
   funct 0x20, sub-field 0x18). MIPS32r2. -/
   | seh (rd rt : W32)
+  /-- "Word Swap Bytes Within Halfwords": swaps the byte order *within* each
+  16-bit half of `$rt` independently (byte 0 <-> 1, byte 2 <-> 3), leaving
+  the two halfwords in their original word positions -- **not** a full
+  32-bit byte-reverse (that needs `wsbh` followed by `rotr` by 16)
+  (SPECIAL3 opcode 0x1f, funct 0x20, sub-field 0x02 -- same BSHFL funct
+  family as `seb`/`seh`, distinguished by the sub-field like they are).
+  MIPS32r2. -/
+  | wsbh (rd rt : W32)
+  -- R-type SPECIAL3 bitfield extract/insert (MIPS32r2;
+  -- docs/spec/MIPS-COVERAGE-GAPS.md section 3.4). Both `pos` and `size` are
+  -- small compile-time constants (0-31) encoded directly in the
+  -- instruction word, not register values. Real constraint `pos + size <=
+  -- 32` is architecturally UNPREDICTABLE if violated; this model makes no
+  -- special case for it (SPEC-NOTES precedent: just compute what the
+  -- bit masking implies). The raw encoding packs `pos` into the `shamt`
+  -- field (bits 10..6) for both instructions, but the `rd`-position field
+  -- (bits 15..11) differs: for `ext` it holds `size - 1` ("msbd"); for
+  -- `ins` it holds `pos + size - 1` ("msb") -- these are genuinely
+  -- different fields in the real MIPS32 ISA (MD00086 section 3.2), not a
+  -- typo. `decode`/`encode` below do the +-1 arithmetic so `Step.lean`
+  -- only ever sees the semantic `pos`/`size` pair.
+  /-- `$rt = zero-extend($rs[pos+size-1 .. pos])`, extracting a `size`-bit
+  field starting at bit `pos` (SPECIAL3 opcode 0x1f, funct 0x00). MIPS32r2. -/
+  | ext (rt rs pos size : W32)
+  /-- Inserts the low `size` bits of `$rs` into `$rt` starting at bit `pos`;
+  bits of `$rt` outside `[pos+size-1 .. pos]` are left unchanged (SPECIAL3
+  opcode 0x1f, funct 0x04). MIPS32r2. -/
+  | ins (rt rs pos size : W32)
   -- I-type arith/logic
   /-- `$rt = $rs + sext16(imm)`, traps on overflow (opcode 0x08). -/
   | addi  (rs rt imm : W32)
@@ -474,10 +517,15 @@ def decode (w : W32) : Option Instruction :=
     | 0x0b => some (.movn rs rt rd)
     | 0x0a => some (.movz rs rt rd)
     | 0x00 => some (.sll rd rt shamt)
-    | 0x02 => some (.srl rd rt shamt)
+    -- `srl`/`rotr` share funct 0x02; the `rs` field (normally unused/fixed 0
+    -- for `srl`) is overloaded to 0x01 to select `rotr` (MIPS32r2; see the
+    -- `.rotr` docstring).
+    | 0x02 => if rs.toNat == 0x01 then some (.rotr rd rt shamt) else some (.srl rd rt shamt)
     | 0x03 => some (.sra rd rt shamt)
     | 0x04 => some (.sllv rd rt rs)
-    | 0x06 => some (.srlv rd rt rs)
+    -- `srlv`/`rotrv` share funct 0x06; the `shamt` field (normally
+    -- unused/fixed 0 for `srlv`) is overloaded to 0x01 to select `rotrv`.
+    | 0x06 => if shamt.toNat == 0x01 then some (.rotrv rd rt rs) else some (.srlv rd rt rs)
     | 0x07 => some (.srav rd rt rs)
     | 0x18 => some (.mult rs rt)
     | 0x19 => some (.multu rs rt)
@@ -514,7 +562,14 @@ def decode (w : W32) : Option Instruction :=
       match shamt.toNat with
       | 0x10 => some (.seb rd rt)
       | 0x18 => some (.seh rd rt)
+      | 0x02 => some (.wsbh rd rt)
       | _ => none
+    -- `ext`/`ins` (MIPS32r2 bitfield extract/insert): `pos` is the raw
+    -- `shamt` field for both; the raw `rd`-position field means something
+    -- different for each (see the `.ext`/`.ins` docstrings), so the +-1
+    -- arithmetic to recover the semantic `size` happens right here.
+    | 0x00 => some (.ext rt rs shamt (rd + 1#32))
+    | 0x04 => some (.ins rt rs shamt (rd - shamt + 1#32))
     | _ => none
   | 0x08 => some (.addi rs rt imm)
   | 0x09 => some (.addiu rs rt imm)
@@ -604,6 +659,10 @@ def encode (i : Instruction) : W32 :=
   | .sllv rd rt rs => mkRT rs rt rd 0#32 0x04#32
   | .srlv rd rt rs => mkRT rs rt rd 0#32 0x06#32
   | .srav rd rt rs => mkRT rs rt rd 0#32 0x07#32
+  -- Rotate (MIPS32r2): `rs`/`shamt` field overloading, per the `.rotr`/
+  -- `.rotrv` docstrings.
+  | .rotr  rd rt sa => mkRT 0x01#32 rt rd sa 0x02#32
+  | .rotrv rd rt rs => mkRT rs rt rd 0x01#32 0x06#32
   | .mult  rs rt => mkRT rs rt 0#32 0#32 0x18#32
   | .multu rs rt => mkRT rs rt 0#32 0#32 0x19#32
   | .div   rs rt => mkRT rs rt 0#32 0#32 0x1a#32
@@ -622,9 +681,15 @@ def encode (i : Instruction) : W32 :=
   | .maddu rs rt => (0x1c#32 <<< 26) ||| mkRT rs rt 0#32 0#32 0x01#32
   | .msub  rs rt => (0x1c#32 <<< 26) ||| mkRT rs rt 0#32 0#32 0x04#32
   | .msubu rs rt => (0x1c#32 <<< 26) ||| mkRT rs rt 0#32 0#32 0x05#32
-  -- SPECIAL3 BSHFL: rs fixed 0, shamt-position field selects seb/seh.
+  -- SPECIAL3 BSHFL: rs fixed 0, shamt-position field selects seb/seh/wsbh.
   | .seb rd rt => (0x1f#32 <<< 26) ||| mkRT 0#32 rt rd 0x10#32 0x20#32
   | .seh rd rt => (0x1f#32 <<< 26) ||| mkRT 0#32 rt rd 0x18#32 0x20#32
+  | .wsbh rd rt => (0x1f#32 <<< 26) ||| mkRT 0#32 rt rd 0x02#32 0x20#32
+  -- SPECIAL3 bitfield extract/insert: `pos` is the raw `shamt` field for
+  -- both; the raw `rd`-position field is `size - 1` for `ext` ("msbd") but
+  -- `pos + size - 1` for `ins` ("msb") -- see the `.ext`/`.ins` docstrings.
+  | .ext rt rs pos size => (0x1f#32 <<< 26) ||| mkRT rs rt (size - 1#32) pos 0x00#32
+  | .ins rt rs pos size => (0x1f#32 <<< 26) ||| mkRT rs rt (pos + size - 1#32) pos 0x04#32
   | .addi  rs rt imm => mkIT 0x08#32 rs rt imm
   | .addiu rs rt imm => mkIT 0x09#32 rs rt imm
   | .slti  rs rt imm => mkIT 0x0a#32 rs rt imm
@@ -742,11 +807,26 @@ example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 8#32 0#32 0#32 0x01#32) = some
 example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 8#32 0#32 0#32 0x04#32) = some (.msub 29#32 8#32) := by decide
 example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 8#32 0#32 0#32 0x05#32) = some (.msubu 29#32 8#32) := by decide
 
--- SPECIAL3 BSHFL sign-extend: rd=3, rt=8, sub-field selects seb vs seh
+-- SPECIAL3 BSHFL sign-extend/byte-swap: rd=3, rt=8, sub-field selects seb/seh/wsbh
 example : decode ((0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x10#32 0x20#32) = some (.seb 3#32 8#32) := by decide
 example : decode ((0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x18#32 0x20#32) = some (.seh 3#32 8#32) := by decide
--- an unrecognized BSHFL sub-field (e.g. 0x02 = WSBH) is out of v1+ scope → none
-#guard decode ((0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x02#32 0x20#32) = none
+example : decode ((0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x02#32 0x20#32) = some (.wsbh 3#32 8#32) := by decide
+-- an unrecognized BSHFL sub-field (neither seb/seh/wsbh's) is out of v1+ scope → none
+#guard decode ((0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x03#32 0x20#32) = none
+
+-- rotr/rotrv (MIPS32r2): rd=3, rt=8, sa=5 / rs=29 -- share srl/srlv's
+-- opcode/funct but overload the rs/shamt field to select rotate.
+example : decode (mkRT 0x01#32 8#32 3#32 5#32 0x02#32) = some (.rotr 3#32 8#32 5#32) := by decide
+example : decode (mkRT 29#32 8#32 3#32 0x01#32 0x06#32) = some (.rotrv 3#32 8#32 29#32) := by decide
+-- rs=0 under funct 0x02 still decodes to plain srl (existing behavior unchanged)
+example : decode (mkRT 0#32 8#32 3#32 5#32 0x02#32) = some (.srl 3#32 8#32 5#32) := by decide
+example : decode (mkRT 29#32 8#32 3#32 0#32 0x06#32) = some (.srlv 3#32 8#32 29#32) := by decide
+
+-- ext/ins (MIPS32r2 bitfield extract/insert): rt=8, rs=29, pos=6, size=10
+-- (so the raw `shamt` field is 6, and the raw `rd`-position field is
+-- `size-1=9` for ext but `pos+size-1=15` for ins)
+example : decode ((0x1f#32 <<< 26) ||| mkRT 29#32 8#32 9#32 6#32 0x00#32) = some (.ext 8#32 29#32 6#32 10#32) := by decide
+example : decode ((0x1f#32 <<< 26) ||| mkRT 29#32 8#32 15#32 6#32 0x04#32) = some (.ins 8#32 29#32 6#32 10#32) := by decide
 -- break: opcode 0, funct 0x0d, all other fields 0
 example : decode (mkRT 0#32 0#32 0#32 0#32 0x0d#32) = some .break := by decide
 
@@ -855,6 +935,11 @@ example : encode (.sll 3#32 8#32 5#32) = mkRT 0#32 8#32 3#32 5#32 0x00#32 := by 
 example : encode (.movn 29#32 8#32 3#32) = mkRT 29#32 8#32 3#32 0#32 0x0b#32 := by decide
 example : encode (.clo 29#32 3#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 3#32 3#32 0#32 0x21#32 := by decide
 example : encode (.seb 3#32 8#32) = (0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x10#32 0x20#32 := by decide
+example : encode (.wsbh 3#32 8#32) = (0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x02#32 0x20#32 := by decide
+example : encode (.rotr 3#32 8#32 5#32) = mkRT 0x01#32 8#32 3#32 5#32 0x02#32 := by decide
+example : encode (.rotrv 3#32 8#32 29#32) = mkRT 29#32 8#32 3#32 0x01#32 0x06#32 := by decide
+example : encode (.ext 8#32 29#32 6#32 10#32) = (0x1f#32 <<< 26) ||| mkRT 29#32 8#32 9#32 6#32 0x00#32 := by decide
+example : encode (.ins 8#32 29#32 6#32 10#32) = (0x1f#32 <<< 26) ||| mkRT 29#32 8#32 15#32 6#32 0x04#32 := by decide
 example : encode (.sllv 3#32 8#32 29#32) = mkRT 29#32 8#32 3#32 0#32 0x04#32 := by decide
 example : encode (.mul 29#32 8#32 3#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 8#32 3#32 0#32 0x02#32 := by decide
 example : encode (.madd 29#32 8#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 8#32 0#32 0#32 0x00#32 := by decide
@@ -872,6 +957,16 @@ example : decode (encode (.clo 29#32 3#32)) = some (.clo 29#32 3#32) := by decid
 example : decode (encode (.clz 29#32 3#32)) = some (.clz 29#32 3#32) := by decide
 example : decode (encode (.seb 3#32 8#32)) = some (.seb 3#32 8#32) := by decide
 example : decode (encode (.seh 3#32 8#32)) = some (.seh 3#32 8#32) := by decide
+example : decode (encode (.wsbh 3#32 8#32)) = some (.wsbh 3#32 8#32) := by decide
+example : decode (encode (.rotr 3#32 8#32 5#32)) = some (.rotr 3#32 8#32 5#32) := by decide
+example : decode (encode (.rotrv 3#32 8#32 29#32)) = some (.rotrv 3#32 8#32 29#32) := by decide
+example : decode (encode (.ext 8#32 29#32 6#32 10#32)) = some (.ext 8#32 29#32 6#32 10#32) := by decide
+example : decode (encode (.ins 8#32 29#32 6#32 10#32)) = some (.ins 8#32 29#32 6#32 10#32) := by decide
+-- ext/ins round-trip edge cases: pos=0 (size=32, the full word) and
+-- pos+size=32 (touches the top bit) -- both satisfy the real `pos+size<=32`
+-- constraint so the `rd`-position field packs/unpacks without truncation.
+example : decode (encode (.ext 8#32 29#32 0#32 32#32)) = some (.ext 8#32 29#32 0#32 32#32) := by decide
+example : decode (encode (.ins 8#32 29#32 20#32 12#32)) = some (.ins 8#32 29#32 20#32 12#32) := by decide
 example : decode (encode (.sllv 3#32 8#32 29#32)) = some (.sllv 3#32 8#32 29#32) := by decide
 example : decode (encode (.srlv 3#32 8#32 29#32)) = some (.srlv 3#32 8#32 29#32) := by decide
 example : decode (encode (.srav 3#32 8#32 29#32)) = some (.srav 3#32 8#32 29#32) := by decide

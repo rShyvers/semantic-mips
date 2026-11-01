@@ -39,6 +39,15 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   `mthi`/`mtlo` (`rs` -- opcode 0, funct 0x11/0x13, the write-direction
   counterparts to `mfhi`/`mflo`, same one-operand shape as `jr` so
   hand-encoded alongside it).
+- MIPS32r2 rotate/bitfield additions (docs/spec/MIPS-COVERAGE-GAPS.md section
+  3.4), all hand-encoded alongside `clo`/`clz`/`seb`/`seh` since none fits an
+  existing `RForm`: `rotr $rd, $rt, $sa` / `rotrv $rd, $rt, $rs` (same
+  `rd, rt, shamt`/`rd, rt, rs` shapes as `shift`/`shiftv`, but overload the
+  normally-unused `rs`/`shamt` field to `0x01` to select rotate over `srl`/
+  `srlv`); `wsbh $rd, $rt` (same BSHFL family as `seb`/`seh`, sub-field
+  `0x02`); `ext $rt, $rs, pos, size` / `ins $rt, $rs, pos, size` (SPECIAL3
+  opcode 0x1f, funct 0x00/0x04 -- see `Instruction.lean`'s `.ext`/`.ins`
+  docstrings for the `pos`/`size` field-packing details).
 - The coprocessor-0 trap/exception family (real MIPS32 ISA, added on top of
   the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): `teq`/`tne`/
   `tlt`/`tge`/`tltu`/`tgeu` (`rs, rt` operands, same shape as `mult`/`div`),
@@ -441,12 +450,21 @@ write-direction counterparts to `mfhi`/`mflo` (`RForm.hilo`), needed for OS
 context switching and setjmp/longjmp to save/restore `hi`/`lo` (see
 docs/spec/MIPS-COVERAGE-GAPS.md §3.5). -/
 private def hiLoMoveMnemonics : List String := ["mthi", "mtlo"]
+/-- MIPS32r2 rotate/bitfield mnemonics (docs/spec/MIPS-COVERAGE-GAPS.md
+section 3.4): `rotr`/`rotrv` overload `srl`/`srlv`'s opcode/funct via the
+`rs`/`shamt` field (so they don't fit `rTable`'s `.shift`/`.shiftv` forms,
+which always encode `rs`/`shamt` as 0); `wsbh` is another BSHFL sub-op like
+`seb`/`seh`; `ext`/`ins` are SPECIAL3-opcoded with a four-operand
+`rt, rs, pos, size` shape no existing `RForm` has. All hand-encoded in
+`encodeInstruction` below, the same way `bshflMnemonics` are. -/
+private def bitfieldMnemonics : List String := ["rotr", "rotrv", "wsbh", "ext", "ins"]
 
 private def isKnownMnemonic (m : String) : Bool :=
   rTable.any (·.1 == m) ∨ iTable.any (·.1 == m) ∨ jTable.any (·.1 == m) ∨
     bTable.any (·.1 == m) ∨ cop1Table.any (·.1 == m) ∨ pseudoSet.contains m ∨
     directiveSet.contains m ∨ bshflMnemonics.contains m ∨ jrJalrMnemonics.contains m ∨
-    multAccumMnemonics.contains m ∨ hiLoMoveMnemonics.contains m
+    multAccumMnemonics.contains m ∨ hiLoMoveMnemonics.contains m ∨
+    bitfieldMnemonics.contains m
 
 /-- Number of 32-bit words a `li $rt, v` expansion emits, per
 `PseudoOps.txt` lines 245-247: sign-extendable-16-bit values use a single
@@ -946,6 +964,72 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
         let rt ← parseRegister rtT item.lineNo
         pure [opRtWord 0x1f 0 rt rd 0x18 0x20]
     | _ => throw (.badOperand s!"seh expects 'rd, rt'" item.lineNo)
+  -- `wsbh $rd, $rt`: SPECIAL3 BSHFL (MIPS32r2), same family/shape as
+  -- `seb`/`seh`, sub-field 0x02.
+  | "wsbh" =>
+    match item.operands with
+    | [rdT, rtT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rt ← parseRegister rtT item.lineNo
+        pure [opRtWord 0x1f 0 rt rd 0x02 0x20]
+    | _ => throw (.badOperand s!"wsbh expects 'rd, rt'" item.lineNo)
+  -- `rotr $rd, $rt, $sa` (MIPS32r2): same `rd, rt, shamt` shape as `srl`
+  -- (the `.shift` `RForm`), but overloads the normally-0 `rs` field to
+  -- 0x01 to select rotate (see `Instruction.lean`'s `.rotr` docstring).
+  | "rotr" =>
+    match item.operands with
+    | [rdT, rtT, saT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rt ← parseRegister rtT item.lineNo
+        let sa ← parseImmediate saT item.lineNo
+        if sa < 0 ∨ sa > 31 then throw (.badImmediate s!"rotr shamt out of range (0-31)" item.lineNo)
+        pure [rtWord 1 rt rd sa.toNat 0x02]
+    | _ => throw (.badOperand s!"rotr expects 'rd, rt, sa'" item.lineNo)
+  -- `rotrv $rd, $rt, $rs` (MIPS32r2): same `rd, rt, rs` shape as `srlv`
+  -- (the `.shiftv` `RForm`), but overloads the normally-0 `shamt` field to
+  -- 0x01 to select rotate.
+  | "rotrv" =>
+    match item.operands with
+    | [rdT, rtT, rsT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rt ← parseRegister rtT item.lineNo
+        let rs ← parseRegister rsT item.lineNo
+        pure [rtWord rs rt rd 1 0x06]
+    | _ => throw (.badOperand s!"rotrv expects 'rd, rt, rs'" item.lineNo)
+  -- `ext $rt, $rs, pos, size` / `ins $rt, $rs, pos, size` (MIPS32r2
+  -- bitfield extract/insert, SPECIAL3 opcode 0x1f): `pos`/`size` are
+  -- compile-time constants (not registers). Real hardware packs `pos`
+  -- into the `shamt` field for both, but the `rd`-position field differs
+  -- (`size - 1` for `ext`, `pos + size - 1` for `ins`) -- see
+  -- `Instruction.lean`'s `.ext`/`.ins` docstrings. Both fields must fit
+  -- their 5-bit encoding slots, so `pos` is 0-31, `size` is 1-32, and
+  -- `pos + size <= 32` (the real architectural constraint; violating it
+  -- is UNPREDICTABLE on real hardware, so this assembler rejects it
+  -- outright rather than silently truncating).
+  | "ext" =>
+    match item.operands with
+    | [rtT, rsT, posT, sizeT] => do
+        let rt ← parseRegister rtT item.lineNo
+        let rs ← parseRegister rsT item.lineNo
+        let pos ← parseImmediate posT item.lineNo
+        let size ← parseImmediate sizeT item.lineNo
+        if pos < 0 ∨ pos > 31 then throw (.badImmediate s!"ext pos out of range (0-31)" item.lineNo)
+        if size < 1 ∨ size > 32 then throw (.badImmediate s!"ext size out of range (1-32)" item.lineNo)
+        if pos + size > 32 then throw (.badImmediate s!"ext pos + size must be <= 32" item.lineNo)
+        pure [opRtWord 0x1f rs rt (size - 1).toNat pos.toNat 0x00]
+    | _ => throw (.badOperand s!"ext expects 'rt, rs, pos, size'" item.lineNo)
+  | "ins" =>
+    match item.operands with
+    | [rtT, rsT, posT, sizeT] => do
+        let rt ← parseRegister rtT item.lineNo
+        let rs ← parseRegister rsT item.lineNo
+        let pos ← parseImmediate posT item.lineNo
+        let size ← parseImmediate sizeT item.lineNo
+        if pos < 0 ∨ pos > 31 then throw (.badImmediate s!"ins pos out of range (0-31)" item.lineNo)
+        if size < 1 ∨ size > 32 then throw (.badImmediate s!"ins size out of range (1-32)" item.lineNo)
+        if pos + size > 32 then throw (.badImmediate s!"ins pos + size must be <= 32" item.lineNo)
+        pure [opRtWord 0x1f rs rt (pos + size - 1).toNat pos.toNat 0x04]
+    | _ => throw (.badOperand s!"ins expects 'rt, rs, pos, size'" item.lineNo)
   -- Register-indirect jump/call (real MIPS32 `jr`/`jalr`, opcode 0, funct
   -- 0x08/0x09; see `Instruction.lean`'s `.jr`/`.jalr` docstrings). `rt`/
   -- `shamt` are unused/fixed 0 in the real encoding.
@@ -1240,6 +1324,53 @@ def sebSehProg : Program :=
 #guard sebSehProg.getD (textBase + 4#32) 0 = (natToW32 0x1f <<< 26) ||| mkRT (0#32) (9#32) (8#32) (0x18#32) (0x20#32)
 #guard decode (sebSehProg.getD textBase 0) = some (.seb 8#32 9#32)
 #guard decode (sebSehProg.getD (textBase + 4#32) 0) = some (.seh 8#32 9#32)
+
+-- `wsbh $rd, $rt`: SPECIAL3 opcode 0x1f, funct 0x20, same BSHFL family as
+-- seb/seh, sub-field 0x02.
+def wsbhSrc : String := "wsbh $t0, $t1\n"
+def wsbhProg : Program :=
+  match assemble wsbhSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard wsbhProg.getD textBase 0 = (natToW32 0x1f <<< 26) ||| mkRT (0#32) (9#32) (8#32) (0x02#32) (0x20#32)
+#guard decode (wsbhProg.getD textBase 0) = some (.wsbh 8#32 9#32)
+
+-- `rotr $rd, $rt, $sa` / `rotrv $rd, $rt, $rs` (MIPS32r2): same opcode/funct
+-- as srl/srlv, but overload the rs/shamt field to 0x01 to select rotate.
+def rotrSrc : String := "rotr $t0, $t1, 5\nrotrv $t0, $t1, $t2\n"
+def rotrProg : Program :=
+  match assemble rotrSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard rotrProg.getD textBase 0 = mkRT (1#32) (9#32) (8#32) (5#32) (0x02#32)
+#guard rotrProg.getD (textBase + 4#32) 0 = mkRT (10#32) (9#32) (8#32) (1#32) (0x06#32)
+#guard decode (rotrProg.getD textBase 0) = some (.rotr 8#32 9#32 5#32)
+#guard decode (rotrProg.getD (textBase + 4#32) 0) = some (.rotrv 8#32 9#32 10#32)
+-- rotr shamt out of range is rejected, same as shift's shamt check
+#guard (assemble "rotr $t0, $t1, 32\n").isOk = false
+
+-- `ext $rt, $rs, pos, size` / `ins $rt, $rs, pos, size` (MIPS32r2 bitfield
+-- extract/insert): SPECIAL3 opcode 0x1f, funct 0x00/0x04. `pos`/`size` are
+-- compile-time constants (pos=6, size=10 here), packed per the
+-- `Instruction.lean`'s `.ext`/`.ins` docstrings (`rd`-position field is
+-- `size-1=9` for ext, `pos+size-1=15` for ins).
+def extInsSrc : String := "ext $t0, $t1, 6, 10\nins $t0, $t1, 6, 10\n"
+def extInsProg : Program :=
+  match assemble extInsSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard extInsProg.getD textBase 0 = (natToW32 0x1f <<< 26) ||| mkRT (9#32) (8#32) (9#32) (6#32) (0x00#32)
+#guard extInsProg.getD (textBase + 4#32) 0 = (natToW32 0x1f <<< 26) ||| mkRT (9#32) (8#32) (15#32) (6#32) (0x04#32)
+#guard decode (extInsProg.getD textBase 0) = some (.ext 8#32 9#32 6#32 10#32)
+#guard decode (extInsProg.getD (textBase + 4#32) 0) = some (.ins 8#32 9#32 6#32 10#32)
+-- out-of-range pos/size, and pos+size > 32, are all rejected
+#guard (assemble "ext $t0, $t1, 32, 1\n").isOk = false   -- pos out of range
+#guard (assemble "ext $t0, $t1, 0, 33\n").isOk = false    -- size out of range
+#guard (assemble "ext $t0, $t1, 30, 10\n").isOk = false   -- pos + size > 32
+#guard (assemble "ins $t0, $t1, 30, 10\n").isOk = false   -- pos + size > 32
 
 -- `jr $rs` / `jalr $rd, $rs`: real MIPS32 register-indirect jump/call,
 -- opcode 0, funct 0x08/0x09. Also covers the `jalr $rs` one-operand sugar
