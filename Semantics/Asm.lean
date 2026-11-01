@@ -44,6 +44,11 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): identical
   `rt, offset(rs)` shape and parsing to `lw`/`sw`, table-driven the same way
   (opcodes 0x30/0x38).
+- `lwl`/`lwr`/`swl`/`swr` (real MIPS32 classic, pre-r6 unaligned load/store
+  pair, added on top of the original v1 set -- see `docs/spec/
+  MIPS-COVERAGE-GAPS.md` section 3.6 and `docs/spec/INSTRUCTION-REF.md`):
+  identical `rt, offset(rs)` shape and parsing to `lw`/`sw`, table-driven the
+  same way (opcodes 0x22/0x26/0x2a/0x2e).
 - Coprocessor-1 (FPU) single-precision subset (docs/spec/INSTRUCTION-REF.md's
   floating-point section): `mtc1`/`mfc1`, `lwc1`/`swc1`, `add.s`/`sub.s`/
   `mul.s`/`div.s`, `mov.s`, `cvt.s.w`/`cvt.w.s`, `c.eq.s`/`c.lt.s`/`c.le.s`,
@@ -359,7 +364,12 @@ private def iTable : List (String × Nat × IForm) :=
    -- `ll`/`sc`: real MIPS32 atomic synchronization primitives (opcodes
    -- 0x30/0x38; MD00086 Rev 2.50 §3.2), same `rt, offset(rs)` shape as
    -- `lw`/`sw` (see `Instruction.lean`/`docs/spec/INSTRUCTION-REF.md`).
-   ("ll", 0x30, .mem), ("sc", 0x38, .mem)]
+   ("ll", 0x30, .mem), ("sc", 0x38, .mem),
+   -- `lwl`/`lwr`/`swl`/`swr`: real MIPS32 classic (pre-r6) unaligned
+   -- load/store pair (opcodes 0x22/0x26/0x2a/0x2e; MD00086 Rev 2.50
+   -- §3.2, Table 3-4), same `rt, offset(rs)` shape as `lw`/`sw` (see
+   -- `Instruction.lean`/`docs/spec/INSTRUCTION-REF.md`).
+   ("lwl", 0x22, .mem), ("lwr", 0x26, .mem), ("swl", 0x2a, .mem), ("swr", 0x2e, .mem)]
 
 /-- Static table of J-type mnemonics: (name, opcode). -/
 private def jTable : List (String × Nat) := [("j", 0x02), ("jal", 0x03)]
@@ -1310,6 +1320,28 @@ def llscProg : Program :=
 #guard llscProg.getD (textBase + 4#32) 0 = encode (.sc 29#32 8#32 4#32)
 #guard decode (llscProg.getD textBase 0) = some (.ll 29#32 8#32 4#32)
 #guard decode (llscProg.getD (textBase + 4#32) 0) = some (.sc 29#32 8#32 4#32)
+
+-- `lwl`/`lwr`/`swl`/`swr`: identical `rt, offset(rs)` parsing to `lw`/`sw`,
+-- cross-checked against `Instruction.encode`.
+def unalignedSrc : String :=
+"lwl $t0, 1($sp)\n" ++
+"lwr $t0, 4($sp)\n" ++
+"swl $t0, 1($sp)\n" ++
+"swr $t0, 4($sp)\n"
+
+def unalignedProg : Program :=
+  match assemble unalignedSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard unalignedProg.getD textBase 0 = encode (.lwl 29#32 8#32 1#32)
+#guard unalignedProg.getD (textBase + 4#32) 0 = encode (.lwr 29#32 8#32 4#32)
+#guard unalignedProg.getD (textBase + 8#32) 0 = encode (.swl 29#32 8#32 1#32)
+#guard unalignedProg.getD (textBase + 12#32) 0 = encode (.swr 29#32 8#32 4#32)
+#guard decode (unalignedProg.getD textBase 0) = some (.lwl 29#32 8#32 1#32)
+#guard decode (unalignedProg.getD (textBase + 4#32) 0) = some (.lwr 29#32 8#32 4#32)
+#guard decode (unalignedProg.getD (textBase + 8#32) 0) = some (.swl 29#32 8#32 1#32)
+#guard decode (unalignedProg.getD (textBase + 12#32) 0) = some (.swr 29#32 8#32 4#32)
 
 -- One error case per major `AsmError` kind.
 #guard (assemble "frobnicate $t0, $t1\n").isOk = false

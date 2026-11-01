@@ -129,6 +129,24 @@ private def signExtByte (b : UInt8) : W32 :=
 private def zeroExtByte (b : UInt8) : W32 :=
   BitVec.ofNat 32 b.toNat
 
+/-- Replace byte-position `slot` of `w` with `b`, leaving the other three
+byte-positions unchanged. `slot = 0` is the most-significant byte (bits
+31..24), `slot = 3` the least-significant (bits 7..0) -- the same
+big-endian byte-position convention `State.readMemWord`/`writeMemWord` use
+(`slot` is literally "how many word-boundary-crossing bytes this position is
+from the top"). Used by `lwl`/`lwr`'s partial-register merge (`docs/spec/
+INSTRUCTION-REF.md`'s unaligned-memory-access section). -/
+private def setByteSlot (w : W32) (slot : Nat) (b : UInt8) : W32 :=
+  let shift := (3 - slot) * 8
+  let mask : W32 := 0xff#32 <<< shift
+  (w &&& ~~~mask) ||| (zeroExtByte b <<< shift)
+
+/-- Extract byte-position `slot` of `w` (same convention as `setByteSlot`).
+Used by `swl`/`swr`'s partial-memory-store byte extraction. -/
+private def getByteSlot (w : W32) (slot : Nat) : UInt8 :=
+  let shift := (3 - slot) * 8
+  ((w >>> shift) &&& 0xff#32).toNat.toUInt8
+
 /-- Sign-extend the low byte of a register value to 32 bits (for `seb`).
 Same technique as `signExtByte`, but operating directly on a `W32` register
 value rather than a `UInt8` loaded from memory. -/
@@ -441,6 +459,102 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
         mkNext s { (writeReg stored (regIdx rt) 1#32) with llBit := false }
       else
         mkNext s { (writeReg s (regIdx rt) 0#32) with llBit := false }
+  -- `lwl`/`lwr`/`swl`/`swr`: real MIPS32 classic (pre-r6) unaligned
+  -- load/store pair (MD00086 Rev 2.50 §3.2, Table 3-4; `docs/spec/
+  -- MIPS-COVERAGE-GAPS.md` §3.6). Unlike `lw`/`sw`, `addr` has no alignment
+  -- requirement -- `readMemByte`/`writeMemByte` are already total, so none
+  -- of these four cases can halt. `off = addr.toNat % 4` selects how many
+  -- bytes straddle the word boundary; the `.getD` fallback on every
+  -- `readMemByte`/`writeMemByte` result is never actually exercised (those
+  -- helpers always return `some`), it just discharges the `Option` they
+  -- still return. See `docs/spec/INSTRUCTION-REF.md`'s dedicated section
+  -- for the worked byte-position example this case-split implements.
+  | .lwl rs rt imm =>
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    let off := addr.toNat % 4
+    let old := readReg s (regIdx rt)
+    let b0 := (readMemByte s addr).getD 0
+    let v :=
+      match off with
+      | 0 =>
+        let b1 := (readMemByte s (addr + 1#32)).getD 0
+        let b2 := (readMemByte s (addr + 2#32)).getD 0
+        let b3 := (readMemByte s (addr + 3#32)).getD 0
+        setByteSlot (setByteSlot (setByteSlot (setByteSlot old 0 b0) 1 b1) 2 b2) 3 b3
+      | 1 =>
+        let b1 := (readMemByte s (addr + 1#32)).getD 0
+        let b2 := (readMemByte s (addr + 2#32)).getD 0
+        setByteSlot (setByteSlot (setByteSlot old 0 b0) 1 b1) 2 b2
+      | 2 =>
+        let b1 := (readMemByte s (addr + 1#32)).getD 0
+        setByteSlot (setByteSlot old 0 b0) 1 b1
+      | _ =>  -- off = 3 (Nat match needs a default; addr.toNat % 4 is always < 4)
+        setByteSlot old 0 b0
+    mkNext s (writeReg s (regIdx rt) v)
+  | .lwr rs rt imm =>
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    let off := addr.toNat % 4
+    let old := readReg s (regIdx rt)
+    let v :=
+      match off with
+      | 0 =>
+        let b3 := (readMemByte s addr).getD 0
+        setByteSlot old 3 b3
+      | 1 =>
+        let b2 := (readMemByte s (addr - 1#32)).getD 0
+        let b3 := (readMemByte s addr).getD 0
+        setByteSlot (setByteSlot old 2 b2) 3 b3
+      | 2 =>
+        let b1 := (readMemByte s (addr - 2#32)).getD 0
+        let b2 := (readMemByte s (addr - 1#32)).getD 0
+        let b3 := (readMemByte s addr).getD 0
+        setByteSlot (setByteSlot (setByteSlot old 1 b1) 2 b2) 3 b3
+      | _ =>  -- off = 3 (and unreachable default; addr.toNat % 4 is always < 4)
+        let b0 := (readMemByte s (addr - 3#32)).getD 0
+        let b1 := (readMemByte s (addr - 2#32)).getD 0
+        let b2 := (readMemByte s (addr - 1#32)).getD 0
+        let b3 := (readMemByte s addr).getD 0
+        setByteSlot (setByteSlot (setByteSlot (setByteSlot old 0 b0) 1 b1) 2 b2) 3 b3
+    mkNext s (writeReg s (regIdx rt) v)
+  -- `swl`/`swr` are store-class, so (like `sw`/`sh`/`swc1`) they clear
+  -- `llBit` -- see the module docstring's `ll`/`sc` paragraph.
+  | .swl rs rt imm =>
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    let off := addr.toNat % 4
+    let v := readReg s (regIdx rt)
+    let s1 := (writeMemByte s addr (getByteSlot v 0)).getD s
+    let s' :=
+      match off with
+      | 0 =>
+        let s2 := (writeMemByte s1 (addr + 1#32) (getByteSlot v 1)).getD s1
+        let s3 := (writeMemByte s2 (addr + 2#32) (getByteSlot v 2)).getD s2
+        (writeMemByte s3 (addr + 3#32) (getByteSlot v 3)).getD s3
+      | 1 =>
+        let s2 := (writeMemByte s1 (addr + 1#32) (getByteSlot v 1)).getD s1
+        (writeMemByte s2 (addr + 2#32) (getByteSlot v 2)).getD s2
+      | 2 => (writeMemByte s1 (addr + 1#32) (getByteSlot v 1)).getD s1
+      | _ => s1  -- off = 3 (and unreachable default; addr.toNat % 4 is always < 4)
+    mkNext s { s' with llBit := false }
+  | .swr rs rt imm =>
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    let off := addr.toNat % 4
+    let v := readReg s (regIdx rt)
+    let s' :=
+      match off with
+      | 0 => (writeMemByte s addr (getByteSlot v 3)).getD s
+      | 1 =>
+        let s1 := (writeMemByte s (addr - 1#32) (getByteSlot v 2)).getD s
+        (writeMemByte s1 addr (getByteSlot v 3)).getD s1
+      | 2 =>
+        let s1 := (writeMemByte s (addr - 2#32) (getByteSlot v 1)).getD s
+        let s2 := (writeMemByte s1 (addr - 1#32) (getByteSlot v 2)).getD s1
+        (writeMemByte s2 addr (getByteSlot v 3)).getD s2
+      | _ =>  -- off = 3 (and unreachable default; addr.toNat % 4 is always < 4)
+        let s1 := (writeMemByte s (addr - 3#32) (getByteSlot v 0)).getD s
+        let s2 := (writeMemByte s1 (addr - 2#32) (getByteSlot v 1)).getD s1
+        let s3 := (writeMemByte s2 (addr - 1#32) (getByteSlot v 2)).getD s2
+        (writeMemByte s3 addr (getByteSlot v 3)).getD s3
+    mkNext s { s' with llBit := false }
   -- Control flow: one architectural delay slot per branch/jump, matching
   -- real MIPS32 (SPEC-NOTES §9 item 1 — not MARS's default no-delay-slot
   -- config; INSTRUCTION-REF Global rule 3). A taken branch/jump never jumps
@@ -1086,6 +1200,116 @@ private def llscDoubleState : State := setRegs regs0 [(8, llscAddr), (10, 0xaaaa
 -- (failed) attempt's
 #guard (stepN llscDoubleProg 3 llscDoubleState).bind (fun s => readMemWord s llscAddr)
   = some 0xaaaa5555#32
+
+-- ### lwl/lwr/swl/swr: classic MIPS32 unaligned load/store pair
+-- (docs/spec/MIPS-COVERAGE-GAPS.md §3.6; docs/spec/INSTRUCTION-REF.md's
+-- dedicated section). `A` below is word-aligned; bytes A..A+7 are
+-- 0x11,0x22,...,0x88 so every byte-position merge is individually visible
+-- in the resulting word.
+
+private def unalignedBase : W32 := 0x10010000#32
+
+private def unalignedTestState : State :=
+  { (setRegs regs0 [(8, unalignedBase)]) with
+      mem := (∅ : Std.HashMap W32 UInt8)
+                |>.insert (unalignedBase + 0#32) 0x11
+                |>.insert (unalignedBase + 1#32) 0x22
+                |>.insert (unalignedBase + 2#32) 0x33
+                |>.insert (unalignedBase + 3#32) 0x44
+                |>.insert (unalignedBase + 4#32) 0x55
+                |>.insert (unalignedBase + 5#32) 0x66
+                |>.insert (unalignedBase + 6#32) 0x77
+                |>.insert (unalignedBase + 7#32) 0x88 }
+
+-- `lwl`: addr % 4 == 0 loads the full word, exactly matching plain `lw`.
+#guard nextRegEq (step (prog1 (.lwl 8#32 9#32 0#32)) unalignedTestState) 9 0x11223344#32
+#guard nextRegEq (step (prog1 (.lw  8#32 9#32 0#32)) unalignedTestState) 9 0x11223344#32
+-- `lwl`: the three misaligned offsets, `$rt`'s untouched low bytes coming
+-- from its prior value.
+#guard nextRegEq (step (prog1 (.lwl 8#32 9#32 1#32)) (setRegs unalignedTestState [(9, 0x000000ff#32)]))
+  9 0x223344ff#32
+#guard nextRegEq (step (prog1 (.lwl 8#32 9#32 2#32)) (setRegs unalignedTestState [(9, 0x0000abcd#32)]))
+  9 0x3344abcd#32
+#guard nextRegEq (step (prog1 (.lwl 8#32 9#32 3#32)) (setRegs unalignedTestState [(9, 0x00112233#32)]))
+  9 0x44112233#32
+-- `lwl` never halts on a misaligned address (contrast `lw`).
+#guard isNext (step (prog1 (.lwl 8#32 9#32 1#32)) unalignedTestState)
+
+-- `lwr`: addr % 4 == 3 loads the full word, exactly matching plain `lw`.
+#guard nextRegEq (step (prog1 (.lwr 8#32 9#32 3#32)) unalignedTestState) 9 0x11223344#32
+-- `lwr`: the three misaligned offsets, `$rt`'s untouched high bytes coming
+-- from its prior value.
+#guard nextRegEq (step (prog1 (.lwr 8#32 9#32 0#32)) (setRegs unalignedTestState [(9, 0xaabbcc00#32)]))
+  9 0xaabbcc11#32
+#guard nextRegEq (step (prog1 (.lwr 8#32 9#32 1#32)) (setRegs unalignedTestState [(9, 0xaabb0000#32)]))
+  9 0xaabb1122#32
+#guard nextRegEq (step (prog1 (.lwr 8#32 9#32 2#32)) (setRegs unalignedTestState [(9, 0xaa000000#32)]))
+  9 0xaa112233#32
+-- `lwr` never halts on a misaligned address (contrast `lw`).
+#guard isNext (step (prog1 (.lwr 8#32 9#32 1#32)) unalignedTestState)
+
+-- Complementary-pair idiom: `lwl $rt, 1($rs)` then `lwr $rt, 4($rs)`
+-- (addresses `A+1` and `A+4`, both unaligned/aligned-boundary-straddling)
+-- together reconstruct the unaligned word spanning bytes `A+1..A+4`
+-- (`0x22334455`), each byte supplied by exactly one of the two instructions.
+private def lwlLwrIdiomProg : Program :=
+  buildProg textBase [.lwl 8#32 9#32 1#32, .lwr 8#32 9#32 4#32]
+#guard (stepN lwlLwrIdiomProg 2 unalignedTestState).bind (fun s => some (readReg s 9))
+  = some 0x22334455#32
+
+-- `swl`: addr % 4 == 0 stores the full word, exactly matching plain `sw`.
+private def swTestState : State := setRegs regs0 [(8, unalignedBase), (9, 0xaabbccdd#32)]
+#guard (stepState (prog1 (.swl 8#32 9#32 0#32)) swTestState).bind (fun s => readMemWord s unalignedBase)
+  = some 0xaabbccdd#32
+#guard (stepState (prog1 (.sw  8#32 9#32 0#32)) swTestState).bind (fun s => readMemWord s unalignedBase)
+  = some 0xaabbccdd#32
+-- `swl`: the three misaligned offsets store only the top `4 - off` bytes,
+-- starting at `addr`; bytes before `addr` (and after the stored run) are
+-- untouched (read back as the zero-fill default).
+#guard (stepState (prog1 (.swl 8#32 9#32 1#32)) swTestState).bind
+    (fun s => some (readMemByte s (unalignedBase+1#32), readMemByte s (unalignedBase+2#32),
+                     readMemByte s (unalignedBase+3#32), readMemByte s (unalignedBase+4#32)))
+  = some (some 0xaa, some 0xbb, some 0xcc, some 0)
+#guard (stepState (prog1 (.swl 8#32 9#32 2#32)) swTestState).bind
+    (fun s => some (readMemByte s (unalignedBase+2#32), readMemByte s (unalignedBase+3#32)))
+  = some (some 0xaa, some 0xbb)
+#guard (stepState (prog1 (.swl 8#32 9#32 3#32)) swTestState).bind
+    (fun s => readMemByte s (unalignedBase+3#32)) = some 0xaa
+-- `swl` never halts on a misaligned address (contrast `sw`), and clears
+-- `llBit` like every other store-class instruction.
+#guard isNext (step (prog1 (.swl 8#32 9#32 1#32)) swTestState)
+#guard (stepState (prog1 (.swl 8#32 9#32 1#32)) { swTestState with llBit := true }).bind
+    (fun s => some s.llBit) = some false
+
+-- `swr`: addr % 4 == 3 stores the full word, exactly matching plain `sw`.
+#guard (stepState (prog1 (.swr 8#32 9#32 3#32)) swTestState).bind (fun s => readMemWord s unalignedBase)
+  = some 0xaabbccdd#32
+-- `swr`: the three misaligned offsets store only the bottom `off + 1`
+-- bytes, ending at `addr`.
+#guard (stepState (prog1 (.swr 8#32 9#32 0#32)) swTestState).bind
+    (fun s => readMemByte s unalignedBase) = some 0xdd
+#guard (stepState (prog1 (.swr 8#32 9#32 1#32)) swTestState).bind
+    (fun s => some (readMemByte s unalignedBase, readMemByte s (unalignedBase+1#32)))
+  = some (some 0xcc, some 0xdd)
+#guard (stepState (prog1 (.swr 8#32 9#32 2#32)) swTestState).bind
+    (fun s => some (readMemByte s unalignedBase, readMemByte s (unalignedBase+1#32),
+                     readMemByte s (unalignedBase+2#32)))
+  = some (some 0xbb, some 0xcc, some 0xdd)
+-- `swr` never halts on a misaligned address (contrast `sw`), and clears
+-- `llBit` like every other store-class instruction.
+#guard isNext (step (prog1 (.swr 8#32 9#32 1#32)) swTestState)
+#guard (stepState (prog1 (.swr 8#32 9#32 1#32)) { swTestState with llBit := true }).bind
+    (fun s => some s.llBit) = some false
+
+-- Complementary-pair idiom: `swl $rt, 1($rs)` then `swr $rt, 4($rs)`
+-- together store every byte of `$rt` into the unaligned word spanning
+-- `A+1..A+4`, exactly once each.
+private def swlSwrIdiomProg : Program :=
+  buildProg textBase [.swl 8#32 9#32 1#32, .swr 8#32 9#32 4#32]
+#guard (stepN swlSwrIdiomProg 2 swTestState).bind
+    (fun s => some (readMemByte s (unalignedBase+1#32), readMemByte s (unalignedBase+2#32),
+                     readMemByte s (unalignedBase+3#32), readMemByte s (unalignedBase+4#32)))
+  = some (some 0xaa, some 0xbb, some 0xcc, some 0xdd)
 
 -- ### beq/bne/blez/bgtz: taken schedules a `pendingBranch` and falls
 -- through to the delay slot; not-taken behaves exactly as before (SPEC-NOTES
