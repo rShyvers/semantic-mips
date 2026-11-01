@@ -75,6 +75,19 @@ Field-shape summary (see each constructor's docstring for details):
   purely a software-visible hint with no architecturally-defined effect on
   the exception itself, so it is out of scope here — this is a deliberate
   simplification, not an oversight).
+- Coprocessor-0 (CP0) register move and execution-control instructions —
+  opcode `0x10` (COP0); real MIPS32 encoding, scoped to exactly the three
+  CP0 registers this project already models (`cp0Status`/`cp0Cause`/
+  `cp0Epc`, register numbers 12/13/14) — no TLB/interrupt-mask registers are
+  added (`docs/spec/MIPS-COVERAGE-GAPS.md` §3.10A):
+  - `mfc0`/`mtc0` (`rt rd`): CP0-register ↔ GPR move, `rs`-position field
+    selects `MF`(`0x00`)/`MT`(`0x04`); `rd` is the CP0 register number
+    (only 12/13/14 are meaningful in this model — `Step.lean` documents the
+    out-of-scope-`rd` behavior).
+  - `eret`/`wait` (no fields): `rs`-position field `0x10` (`CO`
+    sub-format), distinguished by `funct` (`0x18`/`0x20`); see
+    `Step.lean`'s execution semantics for `eret`'s no-delay-slot
+    architectural exception and `wait`'s no-op simplification.
 - Coprocessor-1 (FPU) single-precision subset — opcode `0x11` (COP1); real
   MIPS32 encoding, ground truth is the MIPS32 ISA (not MARS), cited in each
   constructor's docstring and in `docs/spec/INSTRUCTION-REF.md`'s
@@ -325,9 +338,35 @@ inductive Instruction where
   /-- Unconditional trap (opcode 0, funct 0x0d — the funct value immediately
   after `syscall`'s 0x0c). -/
   | break
+  -- Coprocessor 0 (CP0) register move and execution-control instructions
+  -- (v1.x addition; `docs/spec/MIPS-COVERAGE-GAPS.md` §3.10A). Real MIPS32
+  -- encoding (opcode 0x10, COP0), scoped to exactly the three CP0
+  -- registers this project already models (`cp0Status`/`cp0Cause`/
+  -- `cp0Epc`, real MIPS32 register numbers 12/13/14); no TLB/interrupt-mask
+  -- registers are added.
+  /-- `$rt = ` the CP0 register named by `rd` (opcode 0x10 COP0, `rs`-field =
+  `MF` = 0x00). Only `rd = 12/13/14` (`Status`/`Cause`/`EPC`) are meaningful
+  in this model — see `Step.lean` for the documented out-of-scope-`rd`
+  behavior. -/
+  | mfc0 (rt rd : W32)
+  /-- the CP0 register named by `rd := $rt` (opcode 0x10 COP0, `rs`-field =
+  `MT` = 0x04). Same `rd` scoping (12/13/14 only) as `mfc0`. -/
+  | mtc0 (rt rd : W32)
+  /-- Exception return: `PC := cp0Epc`, `Status.EXL := 0` (opcode 0x10 COP0,
+  `rs`-field = `CO` = 0x10, `funct` = 0x18). No operands. Real MIPS32:
+  **not** a delay-slotted instruction — it takes effect immediately, an
+  architectural exception to the general branch/jump delay-slot rule (see
+  `Step.lean`'s execution semantics and `docs/spec/INSTRUCTION-REF.md`). -/
+  | eret
+  /-- Enter standby mode (opcode 0x10 COP0, `rs`-field = `CO` = 0x10,
+  `funct` = 0x20). No operands. This simulator has no interrupt/timer model,
+  so `Step.lean` treats this as a documented no-op that falls through to
+  `pc + 4`, not a realistic idle/halt-until-interrupt. -/
+  | wait
   -- Coprocessor 1 (FPU), single-precision subset. Ground truth: the MIPS32
   -- ISA (not MARS) "COP1" encodings; see docs/spec/INSTRUCTION-REF.md's
   -- floating-point section for the full citation and scope notes.
+
   /-- `$rt = rawbits($fs)`, no numeric conversion (opcode 0x11 COP1, `fmt`
   field = `MF` = 0x00). -/
   | mfc1 (rt fs : W32)
@@ -502,6 +541,19 @@ def decode (w : W32) : Option Instruction :=
     | _ => none
   | 0x02 => some (.j target)
   | 0x03 => some (.jal target)
+  -- Coprocessor 0 (CP0): `rs`-position field is the format selector
+  -- (MF/MT/CO), `rt` is the GPR, `rd` is the CP0 register number for
+  -- mfc0/mtc0; eret/wait are the CO sub-format, selected by `funct`.
+  | 0x10 =>
+    match rs.toNat with
+    | 0x00 => some (.mfc0 rt rd)  -- fmt = MF
+    | 0x04 => some (.mtc0 rt rd)  -- fmt = MT
+    | 0x10 =>  -- fmt = CO (coprocessor operation sub-format)
+      match (functOf w).toNat with
+      | 0x18 => some .eret
+      | 0x20 => some .wait
+      | _ => none
+    | _ => none
   | 0x31 => some (.lwc1 rs rt imm)
   | 0x39 => some (.swc1 rs rt imm)
   -- Coprocessor 1 (FPU): `rs`-position field is `fmt`/sub-opcode, `rt` is
@@ -610,6 +662,11 @@ def encode (i : Instruction) : W32 :=
   | .tltu rs rt => mkRT rs rt 0#32 0#32 0x33#32
   | .tgeu rs rt => mkRT rs rt 0#32 0#32 0x31#32
   | .break => mkRT 0#32 0#32 0#32 0#32 0x0d#32
+  -- Coprocessor 0 (CP0). Same opcode-OR convention as the COP1 cases below.
+  | .mfc0 rt rd => (0x10#32 <<< 26) ||| mkRT 0x00#32 rt rd 0#32 0#32
+  | .mtc0 rt rd => (0x10#32 <<< 26) ||| mkRT 0x04#32 rt rd 0#32 0#32
+  | .eret => (0x10#32 <<< 26) ||| mkRT 0x10#32 0#32 0#32 0#32 0x18#32
+  | .wait => (0x10#32 <<< 26) ||| mkRT 0x10#32 0#32 0#32 0#32 0x20#32
   -- Coprocessor 1 (FPU). `mkRT` leaves the opcode field 0 (correct for
   -- plain R-type), so the COP1 cases OR in opcode 0x11 explicitly, the same
   -- way `.j`/`.jal` OR in their opcode over `mkJT`'s target-only field.
@@ -881,3 +938,38 @@ example : decode (encode (.sc 29#32 8#32 0x1234#32)) = some (.sc 29#32 8#32 0x12
 -- in the real MIPS32 trap family; no mnemonic maps to it.
 #guard decode (mkRT 0#32 0#32 0#32 0#32 0x35#32) = none
 #guard decode (encode (.addS 8#32 7#32 6#32)) = some (.addS 8#32 7#32 6#32)
+
+-- Coprocessor 0 (CP0) register move / execution control: mfc0/mtc0/eret/wait
+-- (docs/spec/MIPS-COVERAGE-GAPS.md §3.10A). rt=8 (GPR), rd=13 (Cause).
+example : decode ((0x10#32 <<< 26) ||| mkRT 0x00#32 8#32 13#32 0#32 0#32)
+  = some (.mfc0 8#32 13#32) := by decide
+example : decode ((0x10#32 <<< 26) ||| mkRT 0x04#32 8#32 13#32 0#32 0#32)
+  = some (.mtc0 8#32 13#32) := by decide
+example : decode ((0x10#32 <<< 26) ||| mkRT 0x10#32 0#32 0#32 0#32 0x18#32)
+  = some .eret := by decide
+example : decode ((0x10#32 <<< 26) ||| mkRT 0x10#32 0#32 0#32 0#32 0x20#32)
+  = some .wait := by decide
+
+-- encode produces the exact hand-computed words above.
+example : encode (.mfc0 8#32 13#32) = (0x10#32 <<< 26) ||| mkRT 0x00#32 8#32 13#32 0#32 0#32 := by
+  decide
+example : encode (.mtc0 8#32 13#32) = (0x10#32 <<< 26) ||| mkRT 0x04#32 8#32 13#32 0#32 0#32 := by
+  decide
+example : encode .eret = (0x10#32 <<< 26) ||| mkRT 0x10#32 0#32 0#32 0#32 0x18#32 := by decide
+example : encode .wait = (0x10#32 <<< 26) ||| mkRT 0x10#32 0#32 0#32 0#32 0x20#32 := by decide
+
+-- full decode ∘ encode round trips, across all three real CP0 register numbers.
+example : decode (encode (.mfc0 8#32 12#32)) = some (.mfc0 8#32 12#32) := by decide
+example : decode (encode (.mfc0 8#32 13#32)) = some (.mfc0 8#32 13#32) := by decide
+example : decode (encode (.mfc0 8#32 14#32)) = some (.mfc0 8#32 14#32) := by decide
+example : decode (encode (.mtc0 8#32 12#32)) = some (.mtc0 8#32 12#32) := by decide
+example : decode (encode (.mtc0 8#32 13#32)) = some (.mtc0 8#32 13#32) := by decide
+example : decode (encode (.mtc0 8#32 14#32)) = some (.mtc0 8#32 14#32) := by decide
+example : decode (encode .eret) = some .eret := by decide
+example : decode (encode .wait) = some .wait := by decide
+
+-- an unrecognized COP0 `rs`-field (not MF/MT/CO) decodes to `none`.
+#guard decode (mkIT 0x10#32 0x08#32 0#32 0#32) = none
+-- a CO-sub-format word with an unrecognized `funct` (not eret's 0x18 or
+-- wait's 0x20) decodes to `none`.
+#guard decode ((0x10#32 <<< 26) ||| mkRT 0x10#32 0#32 0#32 0#32 0x01#32) = none

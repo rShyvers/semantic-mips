@@ -48,6 +48,12 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   floating-point section): `mtc1`/`mfc1`, `lwc1`/`swc1`, `add.s`/`sub.s`/
   `mul.s`/`div.s`, `mov.s`, `cvt.s.w`/`cvt.w.s`, `c.eq.s`/`c.lt.s`/`c.le.s`,
   `bc1t`/`bc1f`.
+- Coprocessor-0 (CP0) register move / execution control (real MIPS32 ISA,
+  `docs/spec/MIPS-COVERAGE-GAPS.md` \u00a73.10A; see `Instruction.lean`/
+  `Step.lean`): `mfc0 $rt, rd` / `mtc0 $rt, rd` (`rd` is a plain numeric CP0
+  register reference, e.g. `mfc0 $t0, 12` \u2014 this model has no named CP0
+  register aliases, unlike `$f0`..`$f31` for coprocessor 1), and `eret`/
+  `wait` (zero operands, like `break`).
 - Pseudo-ops: `li`, `la` (label only — see deviation note below), `move`,
   `nop`, expanded per `vendor/mars-src/PseudoOps.txt`.
 - Register names `$zero,$at,$v0,$v1,$a0..$a3,$t0..$t7,$s0..$s7,$t8,$t9,
@@ -262,6 +268,19 @@ private def parseFpRegister (tok : String) (line : Nat) : Except AsmError Nat :=
   | some (_, n) => pure n
   | none => throw (.badRegister s!"unknown FP register (expected '$f0'..'$f31'): '{tok}'" line)
 
+/-- Parse a `mfc0`/`mtc0` CP0-register-number operand: a plain numeric
+token (`12`, not `$12`) in range 0-31 \u2014 this model has no named CP0
+register aliases (`Asm.lean` module docstring), so the operand is always a
+raw register number, same convention real MIPS32 assembly uses for `mfc0`/
+`mtc0`'s `rd` operand. Only 12/13/14 are semantically meaningful
+(`Step.lean` halts on any other value at execution time), but the
+assembler accepts the full 0-31 range here, matching the real encoding's
+5-bit field. -/
+private def parseCp0Register (tok : String) (line : Nat) : Except AsmError Nat := do
+  match tok.toNat? with
+  | some n => if n < 32 then pure n else throw (.badRegister s!"CP0 register number out of range (0-31): '{tok}'" line)
+  | none => throw (.badRegister s!"expected a numeric CP0 register number, got '{tok}'" line)
+
 private def hexDigit? (c : Char) : Option Nat :=
   if '0' ≤ c ∧ c ≤ '9' then some (c.toNat - '0'.toNat)
   else if 'a' ≤ c ∧ c ≤ 'f' then some (c.toNat - 'a'.toNat + 10)
@@ -421,10 +440,20 @@ private def bshflMnemonics : List String := ["clo", "clz", "seb", "seh", "mul"]
 `encodeInstruction` below, the same way `bshflMnemonics` are. -/
 private def jrJalrMnemonics : List String := ["jr", "jalr"]
 
+/-- Coprocessor-0 (CP0) register move / execution-control mnemonics
+(docs/spec/MIPS-COVERAGE-GAPS.md \u00a73.10A). `mfc0`/`mtc0` share `mfc1`/
+`mtc1`'s move-shape but address a plain numeric CP0 register instead of an
+`$fN` FP register, and `eret`/`wait` are zero-operand like `break`, so none
+of the four fit `Cop1Form`/`RForm`/the existing zero-operand special cases
+exactly -- hand-encoded directly in `encodeInstruction` below, the same way
+`bshflMnemonics`/`jrJalrMnemonics` are. -/
+private def cop0Mnemonics : List String := ["mfc0", "mtc0", "eret", "wait"]
+
 private def isKnownMnemonic (m : String) : Bool :=
   rTable.any (·.1 == m) ∨ iTable.any (·.1 == m) ∨ jTable.any (·.1 == m) ∨
     bTable.any (·.1 == m) ∨ cop1Table.any (·.1 == m) ∨ pseudoSet.contains m ∨
-    directiveSet.contains m ∨ bshflMnemonics.contains m ∨ jrJalrMnemonics.contains m
+    directiveSet.contains m ∨ bshflMnemonics.contains m ∨ jrJalrMnemonics.contains m ∨
+    cop0Mnemonics.contains m
 
 /-- Number of 32-bit words a `li $rt, v` expansion emits, per
 `PseudoOps.txt` lines 245-247: sign-extendable-16-bit values use a single
@@ -619,6 +648,11 @@ always 0 (correct for plain R-type), so this ORs in opcode 0x11 explicitly,
 the same way `jWord` ORs its opcode over `mkJT`'s target-only field. -/
 private def cop1RtWord (fmt rt rd shamt funct : Nat) : W32 :=
   (natToW32 0x11 <<< 26) ||| rtWord fmt rt rd shamt funct
+
+/-- Build a coprocessor-0 (CP0) R-type-shaped word: same opcode-OR
+convention as `cop1RtWord`, but opcode 0x10 (COP0). -/
+private def cop0RtWord (fmt rt rd shamt funct : Nat) : W32 :=
+  (natToW32 0x10 <<< 26) ||| rtWord fmt rt rd shamt funct
 
 /-- Encode an `li $rt, v` expansion per `PseudoOps.txt` (see `liWordCount`). -/
 private def encodeLi (rt : Nat) (v : Int) : List W32 :=
@@ -916,6 +950,32 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
     match item.operands with
     | [] => pure [0x0000000D#32]              -- all fields zero except funct = 0x0d
     | _ => throw (.badOperand s!"break takes no operands" item.lineNo)
+  -- Coprocessor-0 (CP0) register move / execution control (real MIPS32
+  -- ISA, docs/spec/MIPS-COVERAGE-GAPS.md \u00a73.10A; see `Instruction.lean`/
+  -- `Step.lean`). `rd` is a plain numeric CP0 register reference (0-31);
+  -- only 12/13/14 (Status/Cause/EPC) are meaningful in this model.
+  | "mfc0" =>
+    match item.operands with
+    | [rtT, rdT] => do
+        let rt ← parseRegister rtT item.lineNo
+        let rd ← parseCp0Register rdT item.lineNo
+        pure [cop0RtWord 0x00 rt rd 0 0]
+    | _ => throw (.badOperand s!"mfc0 expects '$rt, rd'" item.lineNo)
+  | "mtc0" =>
+    match item.operands with
+    | [rtT, rdT] => do
+        let rt ← parseRegister rtT item.lineNo
+        let rd ← parseCp0Register rdT item.lineNo
+        pure [cop0RtWord 0x04 rt rd 0 0]
+    | _ => throw (.badOperand s!"mtc0 expects '$rt, rd'" item.lineNo)
+  | "eret" =>
+    match item.operands with
+    | [] => pure [cop0RtWord 0x10 0 0 0 0x18]
+    | _ => throw (.badOperand s!"eret takes no operands" item.lineNo)
+  | "wait" =>
+    match item.operands with
+    | [] => pure [cop0RtWord 0x10 0 0 0 0x20]
+    | _ => throw (.badOperand s!"wait takes no operands" item.lineNo)
   | _ => throw (.unknownMnemonic s!"unknown mnemonic '{name}'" item.lineNo)
 
 private def applyItem (labels : Std.HashMap String W32) (prog : Program) (item : RawItem) :
@@ -1310,6 +1370,48 @@ def llscProg : Program :=
 #guard llscProg.getD (textBase + 4#32) 0 = encode (.sc 29#32 8#32 4#32)
 #guard decode (llscProg.getD textBase 0) = some (.ll 29#32 8#32 4#32)
 #guard decode (llscProg.getD (textBase + 4#32) 0) = some (.sc 29#32 8#32 4#32)
+
+-- Coprocessor-0 (CP0) register move / execution control: `mfc0`/`mtc0`
+-- (`$rt, rd` with `rd` a plain numeric CP0 register reference, e.g.
+-- `mfc0 $t0, 12` -- this model has no named CP0 register aliases) and
+-- `eret`/`wait` (zero operands, like `break`). Cross-checked word-for-word
+-- against `Instruction.encode`, same convention as the COP1 block above.
+def cop0Src : String :=
+"mfc0 $t0, 12\n" ++
+"mtc0 $t0, 12\n" ++
+"mfc0 $t1, 13\n" ++
+"mtc0 $t1, 13\n" ++
+"mfc0 $t2, 14\n" ++
+"mtc0 $t2, 14\n" ++
+"eret\n" ++
+"wait\n"
+
+def cop0Prog : Program :=
+  match assemble cop0Src with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard cop0Prog.getD textBase 0 = encode (.mfc0 8#32 12#32)
+#guard cop0Prog.getD (textBase + 4#32) 0 = encode (.mtc0 8#32 12#32)
+#guard cop0Prog.getD (textBase + 8#32) 0 = encode (.mfc0 9#32 13#32)
+#guard cop0Prog.getD (textBase + 12#32) 0 = encode (.mtc0 9#32 13#32)
+#guard cop0Prog.getD (textBase + 16#32) 0 = encode (.mfc0 10#32 14#32)
+#guard cop0Prog.getD (textBase + 20#32) 0 = encode (.mtc0 10#32 14#32)
+#guard cop0Prog.getD (textBase + 24#32) 0 = encode .eret
+#guard cop0Prog.getD (textBase + 28#32) 0 = encode .wait
+-- every emitted CP0 word also round-trips through `decode`
+#guard decode (cop0Prog.getD textBase 0) = some (.mfc0 8#32 12#32)
+#guard decode (cop0Prog.getD (textBase + 4#32) 0) = some (.mtc0 8#32 12#32)
+#guard decode (cop0Prog.getD (textBase + 24#32) 0) = some .eret
+#guard decode (cop0Prog.getD (textBase + 28#32) 0) = some .wait
+-- operand errors: wrong operand count, and a non-numeric `rd` token
+-- (`mfc0`/`mtc0`'s second operand is a raw register number, not a `$`-named
+-- register -- `parseCp0Register` has no label/register fallback).
+#guard (assemble "mfc0 $t0\n").isOk = false
+#guard (assemble "mfc0 $t0, $t1\n").isOk = false
+#guard (assemble "mfc0 $t0, 32\n").isOk = false
+#guard (assemble "eret $t0\n").isOk = false
+#guard (assemble "wait $t0\n").isOk = false
 
 -- One error case per major `AsmError` kind.
 #guard (assemble "frobnicate $t0, $t1\n").isOk = false

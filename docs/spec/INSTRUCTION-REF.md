@@ -18,6 +18,12 @@ plus `cp0Status`/`cp0Cause`/`cp0Epc`). That addition is grounded in the real
 MIPS32 ISA, not MARS — see the dedicated
 ["Coprocessor 0 / traps and exceptions"](#coprocessor-0--traps-and-exceptions-real-mips32-isa)
 section below, which is explicit about this difference in sourcing.
+A further addition on top of that (`docs/spec/MIPS-COVERAGE-GAPS.md` §3.10A)
+adds `mfc0`/`mtc0` (generic CP0-register move, scoped to the same three
+registers), `eret` (exception return — closing the "no way to leave
+exception level" gap the original CP0 model left open), and `wait`
+(documented no-op idle instruction); see the same "Coprocessor 0" section
+below for all four.
 A further v1.x addition ("MIPS32 GPR multiply and variable shifts" section,
 at the end of this document) adds `mul`, `sllv`, `srlv`, and `srav` — also
 grounded directly in the standard MIPS32 ISA, not MARS — per
@@ -111,6 +117,10 @@ execution logic (method `populate()`, lines 77–3236).
 | `tltu` | R | `if ($rs < $rt) trap`, unsigned |
 | `tgeu` | R | `if ($rs >= $rt) trap`, unsigned |
 | `break` | R | unconditional trap |
+| `mfc0` | R (COP0) | `$rt = ` named CP0 register (`rd` = 12/13/14 only) |
+| `mtc0` | R (COP0) | named CP0 register (`rd` = 12/13/14 only) `:= $rt` |
+| `eret` | R (COP0) | `PC := cp0Epc; Status.EXL := 0` — no delay slot |
+| `wait` | R (COP0) | no-op (falls through to `PC_next`); no interrupt model exists to wait for |
 | `ll` | I | `$rt = MEM32[$rs + offset]`, word-aligned; sets `llBit` |
 | `sc` | I | if `llBit`: `MEM32[$rs + offset] = $rt`, `$rt := 1`; else `$rt := 0`; clears `llBit` either way |
 
@@ -1142,19 +1152,23 @@ This is a **minimal** CP0 model: three registers, not the full coprocessor.
 
 | Field (on `State`) | Real MIPS32 register | Modeled behavior |
 |---|---|---|
-| `cp0Status` | `Status` (CP0 register 12) | Only bit 1 (`EXL`, exception level) is ever set, on any exception; no other bit (`IE`, `ERL`, `KSU`, `UM`, `BEV`, `IM7..IM0`, ...) is modeled. Initialized to `0`. |
-| `cp0Cause` | `Cause` (CP0 register 13) | Only the `ExcCode` field (bits 6..2) is ever written, as `excCode <<< 2`; no other field (`BD`, `CE`, `IV`, `WP`, the `IP` pending-interrupt bits, ...) is modeled. Initialized to `0`. |
-| `cp0Epc` | `EPC` (CP0 register 14) | Set to the trapping instruction's own address (`pc` at the time of the trap/`break`, *not* `pc + 4`) on every exception. Initialized to `0`. |
+| `cp0Status` | `Status` (CP0 register 12) | Only bit 1 (`EXL`, exception level) is ever set by an exception, on any exception, and cleared by `eret`; no other bit (`IE`, `ERL`, `KSU`, `UM`, `BEV`, `IM7..IM0`, ...) is modeled. Readable/writable in full via `mfc0`/`mtc0 $rt, 12`. Initialized to `0`. |
+| `cp0Cause` | `Cause` (CP0 register 13) | Only the `ExcCode` field (bits 6..2) is ever written by an exception, as `excCode <<< 2`; no other field (`BD`, `CE`, `IV`, `WP`, the `IP` pending-interrupt bits, ...) is modeled. Readable/writable in full via `mfc0`/`mtc0 $rt, 13`. Initialized to `0`. |
+| `cp0Epc` | `EPC` (CP0 register 14) | Set to the trapping instruction's own address (`pc` at the time of the trap/`break`, *not* `pc + 4`) on every exception; read by `eret` to restore `pc`. Readable/writable in full via `mfc0`/`mtc0 $rt, 14`. Initialized to `0`. |
 
 **Explicitly out of scope** (documented here rather than silently omitted,
 per this track's process requirements): every other CP0 register (`Index`,
 `Random`, `EntryLo0/1`, `Context`, `PageMask`, `Wired`, `BadVAddr`, `Count`,
 `EntryHi`, `Compare`, `Config0-7`, `PRId`, `EBase`, ...), the full `Status`/
 `Cause` bitfields beyond `EXL`/`ExcCode`, interrupts (hardware or software),
-TLB/MMU behavior, `eret` (there is no way to leave exception level once
-entered — `EXL` is set and never cleared), and any notion of kernel/user
-mode. This model answers exactly one question: "did a trap/`break` fire,
-and where did control transfer to" — nothing more.
+TLB/MMU behavior, and any notion of kernel/user mode. This model answers one
+narrow question beyond "did a trap/`break` fire, and where did control
+transfer to": "can a kernel-style handler read/write the three CP0 registers
+this model has, and return from the exception it is handling" — nothing
+more. (`mfc0`/`mtc0`/`eret`/`wait`, documented in their own subsections
+below, close exactly that loop for the three registers that already exist;
+see `docs/spec/MIPS-COVERAGE-GAPS.md` §3.10A for why TLB/interrupt-mask
+support stays out of scope.)
 
 ### Exception mechanism (shared by all seven new instructions)
 
@@ -1243,6 +1257,104 @@ is just ordinary code at an ordinary (if high) address.
   `excCode = excCodeBp`.
 - **Errors/halts**: none beyond the exception transition itself.
 - **MARS note**: not applicable, as for the trap family above.
+
+### mfc0 / mtc0 (R, COP0 generic register move) — v1.x addition
+
+A further v1.x addition on top of the `teq`/.../`break` trap model above,
+per `docs/spec/MIPS-COVERAGE-GAPS.md` §3.10A ("the OS-kernel-essential CP0
+instructions that don't require the much larger TLB/virtual-memory
+machinery"). Ground truth: MD00086 Rev 2.50 §3.2, Table 3-23, p. 31
+(`mfc0`/`mtc0`), the real MIPS32 ISA, not MARS (same sourcing discipline as
+the rest of this section).
+
+- **Encoding**: `opcode=010000` (0x10, COP0). Fields:
+  `010000 fffff ttttt ddddd 00000 000000` → `rt=ttttt` (the GPR), `rd=ddddd`
+  (the CP0 register number); `fff` (the `rs`-field format selector) is
+  `00000` (`MF` = 0x00) for `mfc0` and `00100` (`MT` = 0x04) for `mtc0`;
+  `shamt`/`funct` are unused/fixed 0. Assembly syntax: `mfc0 $rt, rd` /
+  `mtc0 $rt, rd`, where `rd` is a **plain numeric** CP0 register reference
+  (e.g. `mfc0 $t0, 12`) — this project has no named CP0 register aliases.
+- **Register scoping**: real MIPS32 has 32 CP0 registers (0-31, several with
+  multiple `sel` sub-registers); this project models exactly three
+  (`cp0Status`/`cp0Cause`/`cp0Epc`, at their real MIPS32 register numbers
+  12/13/14 — see the "Coprocessor 0 state modeled" table above). `rd=12`
+  maps to `cp0Status`, `rd=13` to `cp0Cause`, `rd=14` to `cp0Epc`; no other
+  CP0 register exists in this model, and no `sel` field is modeled (always
+  implicitly `sel=0`, the only `sel` any of these three registers has on
+  real hardware).
+- **Semantics**: `mfc0`: `$rt := ` the CP0 register named by `rd`. `mtc0`:
+  the CP0 register named by `rd := $rt`. Either direction, for any `rd`
+  other than 12/13/14 (i.e. every one of the other 29 real CP0 registers,
+  none of which exist in this model): **halts with
+  `HaltReason.illegalInstruction`**, rather than silently fabricating a `0`
+  read or silently dropping a write. This is a deliberate, documented
+  choice over the two alternatives the brief allowed (reading back `0`, or
+  halting): real hardware's behavior for an unmodeled register genuinely
+  varies by register (some read as reserved/garbage, some trap), so there
+  is no single "more realistic" fabricated value to return, and inventing
+  one risks silently masking a test program's bug; a clean, diagnosable
+  halt is the more honest choice for architecture this model has
+  deliberately placed out of scope (same judgment call the brief flagged as
+  the "more defensible" option).
+- **Errors/halts**: `HaltReason.illegalInstruction` for any `rd` other than
+  12/13/14, as above; otherwise none.
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  ground truth is the real MIPS32 ISA, per this section's sourcing
+  discipline.
+
+### eret (R, COP0 exception return) — v1.x addition
+
+Ground truth: MD00086 Rev 2.50 §3.2, Table 3-23, p. 31 (`eret`), the real
+MIPS32 ISA. This instruction closes the gap the original CP0 model left
+open (previously documented here as "there is no way to leave exception
+level once entered") for the three registers that model already has.
+
+- **Encoding**: `opcode=010000` (0x10, COP0), `rs`-field = `10000` (`CO`
+  = 0x10, the "coprocessor operation" sub-format, as opposed to the `MF`/
+  `MT` register-move sub-formats `mfc0`/`mtc0` use), `funct=011000` (0x18).
+  Zero operands; all other fields are 0
+  (`010000 10000 00000 00000 00000 011000`).
+- **Semantics**: `PC := cp0Epc`; `Status.EXL := 0` (bit 1, the same bit
+  `takeException` sets on exception entry — see the "Exception mechanism"
+  section above — cleared here, not just left set, which is the one state
+  change that actually lets a handler return to normal execution and take
+  a *second* exception later). **Real MIPS32 architectural note: `eret` is
+  not delay-slotted.** Every branch/jump in this project's v1+ scope
+  (`beq`/`bne`/`j`/`jal`/`jr`/`jalr`/etc.) has exactly one real-MIPS32
+  architectural delay slot (Global rule 3; `SPEC-NOTES.md` §9 item 1); real
+  MIPS32 `eret` is an explicit, documented exception to that general rule —
+  it takes effect immediately, with **no** delay slot of its own (MD00086
+  Rev 2.50 §3.2's `ERET` pseudocode transfers control on the same cycle,
+  unlike every delay-slotted branch/jump instruction in the same table).
+  This project's `step` therefore does not route `eret` through the
+  `pendingBranch` delay-slot machinery at all — a single `step` call lands
+  `pc` exactly on `cp0Epc`'s value.
+- **Errors/halts**: none; `eret` always succeeds (it has no out-of-scope
+  operand to reject, unlike `mfc0`/`mtc0`).
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  ground truth is the real MIPS32 ISA.
+
+### wait (R, COP0 enter standby mode) — v1.x addition
+
+Ground truth: MD00086 Rev 2.50 §3.2, Table 3-23, p. 32 (`wait`), the real
+MIPS32 ISA.
+
+- **Encoding**: `opcode=010000` (0x10, COP0), `rs`-field = `10000` (`CO` =
+  0x10, same sub-format as `eret`), `funct=100000` (0x20). Zero operands;
+  all other fields are 0 (`010000 10000 00000 00000 00000 100000`).
+- **Semantics**: real MIPS32 hardware halts the pipeline until an interrupt
+  arrives. **This simulator has no interrupt/timer model of any kind** (no
+  `Count`/`Compare` registers, no `Status.IM`/`Cause.IP` interrupt-mask/
+  pending bits — see the "Explicitly out of scope" list above), so there is
+  nothing for `wait` to meaningfully wait *for*. This is therefore modeled
+  as a **documented no-op**: it falls through to `PC_next` exactly like any
+  other non-control-flow instruction, via the same `mkNext` path every
+  arithmetic/logic instruction uses. This is a deliberate simplification
+  flagged explicitly, not a silent pretense that idle/standby behavior is
+  modeled.
+- **Errors/halts**: none.
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  ground truth is the real MIPS32 ISA.
 
 ## Flagged MARS deviations (summary)
 
