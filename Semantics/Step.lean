@@ -76,6 +76,31 @@ private def signExtByte (b : UInt8) : W32 :=
 private def zeroExtByte (b : UInt8) : W32 :=
   BitVec.ofNat 32 b.toNat
 
+/-- Sign-extend the low byte of a register value to 32 bits (for `seb`).
+Same technique as `signExtByte`, but operating directly on a `W32` register
+value rather than a `UInt8` loaded from memory. -/
+private def signExtLowByte (w : W32) : W32 :=
+  (w.extractLsb 7 0).signExtend 32
+
+/-- Count leading zero bits in `w` from the MSB (bit 31), stopping at the
+first set bit; `32` if `w` is all-zero. `fuel` bounds the scan to the
+remaining unscanned bit positions (`pos .. 31`) so this terminates by
+structural recursion on `fuel`, with no `partial`/`sorry` needed. Used by
+`clz`/`clo` (`docs/spec/INSTRUCTION-REF.md`): per the MIPS32 ISA, both
+instructions report `32` when there is no bit of the relevant kind. -/
+private def countLeadingZerosFrom (w : W32) : Nat → Nat → Nat
+  | 0, pos => pos
+  | fuel + 1, pos => if w.getMsbD pos then pos else countLeadingZerosFrom w fuel (pos + 1)
+
+/-- Count leading zero bits in `w`, from the MSB. -/
+private def countLeadingZeros (w : W32) : Nat :=
+  countLeadingZerosFrom w 32 0
+
+/-- Count leading one bits in `w`, from the MSB: a run of `1`s in `w` is
+exactly a run of `0`s in `~~~w`, so this reduces to `countLeadingZeros`. -/
+private def countLeadingOnes (w : W32) : Nat :=
+  countLeadingZeros (~~~w)
+
 /-- Maximum number of bytes scanned by syscall 4 (`PrintString`) before
 giving up. This is a v1 simulator limitation (needed for `step` to remain a
 total function without assuming anything about how "long" a null-terminated
@@ -138,6 +163,18 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     let v := if (readReg s (regIdx rs)).toNat < (readReg s (regIdx rt)).toNat
              then 1#32 else 0#32
     mkNext (writeReg s (regIdx rd) v)
+  -- Conditional move: `$rd` is left *unchanged*, not zeroed, when the
+  -- condition fails (MIPS32r2 `movn`/`movz`; docs/spec/INSTRUCTION-REF.md).
+  | .movn rs rt rd =>
+    if readReg s (regIdx rt) != 0#32 then
+      mkNext (writeReg s (regIdx rd) (readReg s (regIdx rs)))
+    else
+      mkNext s
+  | .movz rs rt rd =>
+    if readReg s (regIdx rt) == 0#32 then
+      mkNext (writeReg s (regIdx rd) (readReg s (regIdx rs)))
+    else
+      mkNext s
   -- R-type shifts
   | .sll rd rt shamt =>
     mkNext (writeReg s (regIdx rd) (readReg s (regIdx rt) <<< shamt.toNat))
@@ -173,6 +210,16 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
       mkNext { s with lo := BitVec.ofNat 32 (a / b), hi := BitVec.ofNat 32 (a % b) }
   | .mflo rd => mkNext (writeReg s (regIdx rd) s.lo)
   | .mfhi rd => mkNext (writeReg s (regIdx rd) s.hi)
+  -- SPECIAL2 bit-count (MIPS32)
+  | .clo rs rd =>
+    mkNext (writeReg s (regIdx rd) (BitVec.ofNat 32 (countLeadingOnes (readReg s (regIdx rs)))))
+  | .clz rs rd =>
+    mkNext (writeReg s (regIdx rd) (BitVec.ofNat 32 (countLeadingZeros (readReg s (regIdx rs)))))
+  -- SPECIAL3 BSHFL sign-extend (MIPS32r2)
+  | .seb rd rt =>
+    mkNext (writeReg s (regIdx rd) (signExtLowByte (readReg s (regIdx rt))))
+  | .seh rd rt =>
+    mkNext (writeReg s (regIdx rd) (signExt16 (readReg s (regIdx rt))))
   -- I-type arith/logic
   | .addi rs rt imm =>
     let av := readReg s (regIdx rs)
@@ -408,6 +455,17 @@ example : subOverflows (-0x80000000 : Int) 1 0x7fffffff = true := by decide
 example : subOverflows 10 3 7 = false := by decide
 example : signExtByte 0x80 = 0xffffff80#32 := by decide
 example : zeroExtByte 0x80 = 0x00000080#32 := by decide
+example : signExtLowByte 0x00000080#32 = 0xffffff80#32 := by decide
+example : signExtLowByte 0x0000007f#32 = 0x0000007f#32 := by decide
+example : countLeadingZeros 0#32 = 32 := by decide
+example : countLeadingZeros 0xffffffff#32 = 0 := by decide
+example : countLeadingZeros 0x80000000#32 = 0 := by decide
+example : countLeadingZeros 1#32 = 31 := by decide
+example : countLeadingZeros 0x0000ffff#32 = 16 := by decide
+example : countLeadingOnes 0xffffffff#32 = 32 := by decide
+example : countLeadingOnes 0#32 = 0 := by decide
+example : countLeadingOnes 0xffff0000#32 = 16 := by decide
+example : countLeadingOnes 0x7fffffff#32 = 0 := by decide  -- MSB clear -> zero leading ones
 -- PC wraparound (W32 arithmetic): pc+4 wraps past 0xffffffff.
 example : (0xfffffffc#32 : W32) + 4#32 = 0#32 := by decide
 
@@ -443,6 +501,18 @@ example : isHaltAddr (step (∅ : Program) misalignedState) (textBase + 1#32) = 
 #guard (match step (prog1 (.add 8#32 9#32 0#32)) (setRegs regs0 [(8, 5#32), (9, 7#32)]) with
         | .next s' => readReg s' 0 == 0#32 && s'.pc == textBase + 4#32
         | .halt _ => false)
+
+-- ### movn/movz: conditional move -- the "condition fails" case must leave
+-- `$rd` at its *preset* value (99 below), not zero it (a real no-op, per
+-- docs/spec/INSTRUCTION-REF.md's movn/movz entries).
+#guard nextRegEq (step (prog1 (.movn 8#32 9#32 10#32)) (setRegs regs0 [(8, 5#32), (9, 1#32), (10, 99#32)]))
+  10 5#32   -- movn, $rt != 0: moves
+#guard nextRegEq (step (prog1 (.movn 8#32 9#32 10#32)) (setRegs regs0 [(8, 5#32), (9, 0#32), (10, 99#32)]))
+  10 99#32  -- movn, $rt == 0: $rd unchanged
+#guard nextRegEq (step (prog1 (.movz 8#32 9#32 10#32)) (setRegs regs0 [(8, 5#32), (9, 0#32), (10, 99#32)]))
+  10 5#32   -- movz, $rt == 0: moves
+#guard nextRegEq (step (prog1 (.movz 8#32 9#32 10#32)) (setRegs regs0 [(8, 5#32), (9, 1#32), (10, 99#32)]))
+  10 99#32  -- movz, $rt != 0: $rd unchanged
 
 -- ### add/sub overflow traps
 
@@ -501,6 +571,25 @@ private def seededHiLo : State := { regs0 with hi := 0xdeadbeef#32, lo := 0xcafe
 #guard nextHiLoEq (step (prog1 (.divu 8#32 9#32)) (setRegs regs0 [(8, 17#32), (9, 5#32)])) 2#32 3#32
 -- divu: zero divisor unchanged, no halt
 #guard isNext (step (prog1 (.divu 8#32 9#32)) (setRegs seededHiLo [(8, 10#32), (9, 0#32)]))
+
+-- ### clo/clz/movn/movz/seb/seh (MIPS32/MIPS32r2 additions; see
+-- docs/spec/INSTRUCTION-REF.md)
+
+-- clo: all-ones -> 32; a mixed pattern; all-zero -> 0 leading ones
+#guard nextRegEq (step (prog1 (.clo 8#32 10#32)) (setRegs regs0 [(8, 0xffffffff#32)])) 10 32#32
+#guard nextRegEq (step (prog1 (.clo 8#32 10#32)) (setRegs regs0 [(8, 0xfff0ffff#32)])) 10 12#32
+#guard nextRegEq (step (prog1 (.clo 8#32 10#32)) (setRegs regs0 [(8, 0x00000000#32)])) 10 0#32
+-- clz: all-zero -> 32; a mixed pattern; all-ones -> 0 leading zeros
+#guard nextRegEq (step (prog1 (.clz 8#32 10#32)) (setRegs regs0 [(8, 0x00000000#32)])) 10 32#32
+#guard nextRegEq (step (prog1 (.clz 8#32 10#32)) (setRegs regs0 [(8, 0x0000ffff#32)])) 10 16#32
+#guard nextRegEq (step (prog1 (.clz 8#32 10#32)) (setRegs regs0 [(8, 0xffffffff#32)])) 10 0#32
+
+-- seb: sign-extends only the low byte of $rt, ignoring higher bits
+#guard nextRegEq (step (prog1 (.seb 10#32 8#32)) (setRegs regs0 [(8, 0x12345680#32)])) 10 0xffffff80#32
+#guard nextRegEq (step (prog1 (.seb 10#32 8#32)) (setRegs regs0 [(8, 0x1234567f#32)])) 10 0x0000007f#32
+-- seh: sign-extends only the low halfword of $rt
+#guard nextRegEq (step (prog1 (.seh 10#32 8#32)) (setRegs regs0 [(8, 0x1234ffff#32)])) 10 0xffffffff#32
+#guard nextRegEq (step (prog1 (.seh 10#32 8#32)) (setRegs regs0 [(8, 0x12347fff#32)])) 10 0x00007fff#32
 
 -- ### addi overflow trap vs addiu wrap; andi/ori/xori high-imm-bits; lui
 

@@ -7,6 +7,12 @@ cited against the vendored MARS 4.5 source (`vendor/mars-src/`). Where MARS
 deviates from "textbook" MIPS, or where the source is ambiguous/inconsistent,
 this is flagged explicitly rather than normalized away.
 
+A later, purely-additive extension ("MIPS32 / MIPS32r2 additions" section,
+near the end of this document) adds six more real MIPS32/MIPS32r2 integer
+instructions (`movn`, `movz`, `clo`, `clz`, `seb`, `seh`) beyond the original
+v1 subset. Those six are grounded directly in the standard MIPS32 ISA rather
+than the MARS source (see that section's header note for why).
+
 Conventions pinned elsewhere and assumed here (see
 [`SPEC-NOTES.md`](SPEC-NOTES.md)): no branch delay slots (`DelayedBranching`
 default `false`); execution starts at `0x00400000`; big-endian memory;
@@ -665,6 +671,99 @@ Source: `vendor/mars-src/mars/mips/hardware/Memory.java`:
 - **Errors/halts**: none directly.
 - **MARS note**: **DEVIATION** — no delay slot, same as `beq`.
 - **Source**: `InstructionSet.java`, lines 926–941.
+
+---
+
+## MIPS32 / MIPS32r2 additions (beyond the MARS-matched v1 baseline)
+
+The six instructions in this section (`movn`, `movz`, `clo`, `clz`, `seb`,
+`seh`) are real MIPS32/MIPS32r2 instructions that were out of the original
+v1 subset. Per this addition's house rule, their semantics are grounded
+directly in the **standard MIPS32 architecture** (as specified in the MIPS32
+Architecture Reference Manual, Volume II-A, the "CLO"/"CLZ"/"MOVN"/"MOVZ"/
+"SEB"/"SEH" instruction pages), not against the vendored MARS source —
+MARS is this project's differential-testing oracle, not the spec source,
+and (unlike every v1 instruction above) these encodings/semantics are
+pinned from the ISA directly rather than derived from `InstructionSet.java`
+line citations.
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `movn` | R | `if ($rt != 0) $rd = $rs` (else `$rd` unchanged) |
+| `movz` | R | `if ($rt == 0) $rd = $rs` (else `$rd` unchanged) |
+| `clo` | R (SPECIAL2) | `$rd = count of leading one bits in $rs` (32 if all-ones) |
+| `clz` | R (SPECIAL2) | `$rd = count of leading zero bits in $rs` (32 if all-zero) |
+| `seb` | R (SPECIAL3/BSHFL) | `$rd = sext8($rt[7:0])` |
+| `seh` | R (SPECIAL3/BSHFL) | `$rd = sext16($rt[15:0])` |
+
+### movn (R)
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=001011` (0x0b). Same
+  `rs, rt, rd` field layout as `add`/`slt`/etc.
+- **Semantics**: Move Conditional on Not Zero. If `$rt != 0`, `$rd = $rs`.
+  **If `$rt == 0`, `$rd` is left completely unchanged** — this is a true
+  conditional no-op on the destination register, not "write zero"; a
+  common implementation mistake this spec deliberately avoids (see
+  `Step.lean`'s `movn`/`movz` test cases, which pre-seed `$rd` with a
+  sentinel value to catch exactly this bug).
+- **Errors/halts**: none; no overflow concept.
+- **ISA note**: standard MIPS32r2 instruction, present from MIPS32 Release 1
+  onward alongside `movz`; commonly used to implement branch-free
+  conditional-move idioms (e.g. `a = cond ? b : a`).
+
+### movz (R)
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=001010` (0x0a). Same
+  layout as `movn`.
+- **Semantics**: Move Conditional on Zero. If `$rt == 0`, `$rd = $rs`;
+  otherwise `$rd` is left unchanged (same "true no-op", not "write zero",
+  caveat as `movn`).
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32r2 instruction.
+
+### clo (R, SPECIAL2)
+- **Encoding**: `opcode=011100` (0x1c, SPECIAL2), `funct=100001` (0x21).
+  Fields: `011100 sssss ddddd ddddd 00000 100001` → `rs=sssss` (source),
+  `rd=ddddd` (destination). **Encoding quirk**: the raw `rt` field
+  (bits 20..16) is required by the ISA to carry the *same* register number
+  as `rd` (both field positions are written with the destination register
+  when assembling); hardware does not read `rt` for `clo`. This `Instruction`
+  constructor therefore stores only `(rs, rd)` — see `Instruction.lean`'s
+  `.clo` docstring — and `decode` ignores the raw `rt` field rather than
+  validating or surfacing it, matching real hardware behavior.
+- **Semantics**: Count Leading Ones. `$rd` = the number of consecutive `1`
+  bits starting from the most-significant bit (bit 31) of `$rs`, stopping at
+  the first `0` bit. If `$rs` is all-ones (`0xFFFFFFFF`), the result is `32`.
+- **Errors/halts**: none; no overflow concept.
+- **ISA note**: standard MIPS32 instruction (present since MIPS32 Release 1).
+
+### clz (R, SPECIAL2)
+- **Encoding**: `opcode=011100` (0x1c, SPECIAL2), `funct=100000` (0x20).
+  Same field layout and `rt`-duplicates-`rd` quirk as `clo`.
+- **Semantics**: Count Leading Zeros. `$rd` = the number of consecutive `0`
+  bits starting from bit 31 of `$rs`, stopping at the first `1` bit. If
+  `$rs` is all-zero, the result is `32`.
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32 instruction.
+
+### seb (R, SPECIAL3/BSHFL)
+- **Encoding**: `opcode=011111` (0x1f, SPECIAL3), `funct=100000` (0x20,
+  the shared BSHFL sub-opcode family). Fields: `011111 00000 ttttt ddddd
+  10000 100000` → `rs=00000` (unused/fixed 0), `rt=ttttt` (source),
+  `rd=ddddd` (destination), and the 5-bit shamt-position sub-field fixed to
+  `10000` (0x10) to select SEB specifically out of the BSHFL family (which
+  also includes `wsbh`, `seh`, and others not in this scope — any other
+  sub-field value under funct 0x20 decodes to `none` here).
+- **Semantics**: Sign-Extend Byte. `$rd` = the low byte of `$rt`
+  (`$rt[7:0]`), sign-extended to 32 bits.
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32r2 instruction.
+
+### seh (R, SPECIAL3/BSHFL)
+- **Encoding**: `opcode=011111` (0x1f, SPECIAL3), `funct=100000` (0x20).
+  Same layout as `seb`, but the sub-field is `11000` (0x18).
+- **Semantics**: Sign-Extend Halfword. `$rd` = the low halfword of `$rt`
+  (`$rt[15:0]`), sign-extended to 32 bits.
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32r2 instruction.
 
 ---
 

@@ -20,7 +20,10 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
 - All v1 real instructions (`docs/spec/INSTRUCTION-REF.md`): R-type arith/
   logic/shift/mult-div/mfhi/mflo, I-type immediate/logic/memory, J-type,
   branches, and `syscall` (zero operands, all fields zero except
-  funct = 0x0c, i.e. word `0x0000000C`).
+  funct = 0x0c, i.e. word `0x0000000C`). Plus the MIPS32/MIPS32r2 additions
+  `movn`/`movz` (fit the `rd, rs, rt` R-type shape exactly, table-driven like
+  `add`), and `clo`/`clz`/`seb`/`seh` (SPECIAL2/SPECIAL3 opcodes, hand-encoded
+  below since they don't fit any existing `RForm`).
 - Pseudo-ops: `li`, `la` (label only — see deviation note below), `move`,
   `nop`, expanded per `vendor/mars-src/PseudoOps.txt`.
 - Register names `$zero,$at,$v0,$v1,$a0..$a3,$t0..$t7,$s0..$s7,$t8,$t9,
@@ -290,6 +293,7 @@ private def rTable : List (String × Nat × RForm) :=
   [("add", 0x20, .arith3), ("addu", 0x21, .arith3), ("sub", 0x22, .arith3), ("subu", 0x23, .arith3),
    ("and", 0x24, .arith3), ("or", 0x25, .arith3), ("xor", 0x26, .arith3), ("nor", 0x27, .arith3),
    ("slt", 0x2a, .arith3), ("sltu", 0x2b, .arith3),
+   ("movn", 0x0b, .arith3), ("movz", 0x0a, .arith3),  -- MIPS32r2; same opcode-0 `rd, rs, rt` shape as `add`
    ("sll", 0x00, .shift), ("srl", 0x02, .shift), ("sra", 0x03, .shift),
    ("mult", 0x18, .multdiv), ("multu", 0x19, .multdiv), ("div", 0x1a, .multdiv), ("divu", 0x1b, .multdiv),
    ("mfhi", 0x10, .hilo), ("mflo", 0x12, .hilo)]
@@ -312,9 +316,16 @@ private def bTable : List (String × Nat × BForm) :=
 private def pseudoSet : List String := ["li", "la", "move", "nop", "syscall"]
 private def directiveSet : List String := [".text", ".data", ".word", ".half", ".byte", ".asciiz", ".space"]
 
+/-- SPECIAL2/SPECIAL3 mnemonics with an opcode-bearing R-type-like shape that
+doesn't fit any existing `RForm` (nonzero opcode and/or an operand count
+that doesn't match `arith3`/`shift`/`multdiv`/`hilo`); hand-encoded directly
+in `encodeInstruction` below instead of via `rTable`. -/
+private def bshflMnemonics : List String := ["clo", "clz", "seb", "seh"]
+
 private def isKnownMnemonic (m : String) : Bool :=
   rTable.any (·.1 == m) ∨ iTable.any (·.1 == m) ∨ jTable.any (·.1 == m) ∨
-    bTable.any (·.1 == m) ∨ pseudoSet.contains m ∨ directiveSet.contains m
+    bTable.any (·.1 == m) ∨ pseudoSet.contains m ∨ directiveSet.contains m ∨
+    bshflMnemonics.contains m
 
 /-- Number of 32-bit words a `li $rt, v` expansion emits, per
 `PseudoOps.txt` lines 245-247: sign-extendable-16-bit values use a single
@@ -493,6 +504,13 @@ private def itWord (opcode rs rt : Nat) (imm : W32) : W32 :=
 private def jWord (opcode : Nat) (targetWordAddr : Nat) : W32 :=
   (natToW32 opcode <<< 26) ||| mkJT (natToW32 targetWordAddr)
 
+/-- Build a nonzero-opcode R-type-like word (`clo`/`clz`/`seb`/`seh`:
+SPECIAL2/SPECIAL3), same as `rtWord` but with the real opcode OR'd into the
+top 6 bits (mirrors `jWord`'s `opcode <<< 26` composition, since `mkRT`
+always leaves the opcode field as 0). -/
+private def opRtWord (opcode rs rt rd shamt funct : Nat) : W32 :=
+  (natToW32 opcode <<< 26) ||| rtWord rs rt rd shamt funct
+
 /-- Encode an `li $rt, v` expansion per `PseudoOps.txt` (see `liWordCount`). -/
 private def encodeLi (rt : Nat) (v : Int) : List W32 :=
   if (-32768 : Int) ≤ v ∧ v ≤ -1 then
@@ -652,6 +670,40 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
     match item.operands with
     | [] => pure [0x0000000C#32]              -- all fields zero except funct = 0x0c
     | _ => throw (.badOperand s!"syscall takes no operands" item.lineNo)
+  -- SPECIAL2 bit-count (MIPS32): `clo $rd, $rs` / `clz $rd, $rs`. The raw
+  -- encoding's rt-position field duplicates rd (real hardware quirk, see
+  -- `Instruction.lean`'s `.clo`/`.clz` docstrings).
+  | "clo" =>
+    match item.operands with
+    | [rdT, rsT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rs ← parseRegister rsT item.lineNo
+        pure [opRtWord 0x1c rs rd rd 0 0x21]
+    | _ => throw (.badOperand s!"clo expects 'rd, rs'" item.lineNo)
+  | "clz" =>
+    match item.operands with
+    | [rdT, rsT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rs ← parseRegister rsT item.lineNo
+        pure [opRtWord 0x1c rs rd rd 0 0x20]
+    | _ => throw (.badOperand s!"clz expects 'rd, rs'" item.lineNo)
+  -- SPECIAL3 BSHFL sign-extend (MIPS32r2): `seb $rd, $rt` / `seh $rd, $rt`.
+  -- `rs` is unused/fixed 0; the shamt-position field (0x10/0x18) selects
+  -- which BSHFL sub-op this is.
+  | "seb" =>
+    match item.operands with
+    | [rdT, rtT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rt ← parseRegister rtT item.lineNo
+        pure [opRtWord 0x1f 0 rt rd 0x10 0x20]
+    | _ => throw (.badOperand s!"seb expects 'rd, rt'" item.lineNo)
+  | "seh" =>
+    match item.operands with
+    | [rdT, rtT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rt ← parseRegister rtT item.lineNo
+        pure [opRtWord 0x1f 0 rt rd 0x18 0x20]
+    | _ => throw (.badOperand s!"seh expects 'rd, rt'" item.lineNo)
   | _ => throw (.unknownMnemonic s!"unknown mnemonic '{name}'" item.lineNo)
 
 private def applyItem (labels : Std.HashMap String W32) (prog : Program) (item : RawItem) :
@@ -824,6 +876,43 @@ def syscallProg : Program :=
 
 #guard syscallProg.getD (textBase + 4#32) 0 = 0x0000000C#32
 #guard decode (syscallProg.getD (textBase + 4#32) 0) = some .syscall
+
+-- `movn`/`movz`: table-driven like `add`, 'rd, rs, rt' operand order.
+def movSrc : String := "movn $t0, $t1, $t2\nmovz $t0, $t1, $t2\n"
+def movProg : Program :=
+  match assemble movSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard movProg.getD textBase 0 = mkRT (9#32) (10#32) (8#32) (0#32) (0x0b#32)
+#guard movProg.getD (textBase + 4#32) 0 = mkRT (9#32) (10#32) (8#32) (0#32) (0x0a#32)
+#guard decode (movProg.getD textBase 0) = some (.movn 9#32 10#32 8#32)
+#guard decode (movProg.getD (textBase + 4#32) 0) = some (.movz 9#32 10#32 8#32)
+
+-- `clo $rd, $rs` / `clz $rd, $rs`: SPECIAL2 opcode 0x1c, rt field duplicates rd.
+def cloClzSrc : String := "clo $t0, $t1\nclz $t0, $t1\n"
+def cloClzProg : Program :=
+  match assemble cloClzSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard cloClzProg.getD textBase 0 = (natToW32 0x1c <<< 26) ||| mkRT (9#32) (8#32) (8#32) (0#32) (0x21#32)
+#guard cloClzProg.getD (textBase + 4#32) 0 = (natToW32 0x1c <<< 26) ||| mkRT (9#32) (8#32) (8#32) (0#32) (0x20#32)
+#guard decode (cloClzProg.getD textBase 0) = some (.clo 9#32 8#32)
+#guard decode (cloClzProg.getD (textBase + 4#32) 0) = some (.clz 9#32 8#32)
+
+-- `seb $rd, $rt` / `seh $rd, $rt`: SPECIAL3 opcode 0x1f, funct 0x20, the
+-- shamt-position sub-field (0x10/0x18) selects seb vs seh.
+def sebSehSrc : String := "seb $t0, $t1\nseh $t0, $t1\n"
+def sebSehProg : Program :=
+  match assemble sebSehSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard sebSehProg.getD textBase 0 = (natToW32 0x1f <<< 26) ||| mkRT (0#32) (9#32) (8#32) (0x10#32) (0x20#32)
+#guard sebSehProg.getD (textBase + 4#32) 0 = (natToW32 0x1f <<< 26) ||| mkRT (0#32) (9#32) (8#32) (0x18#32) (0x20#32)
+#guard decode (sebSehProg.getD textBase 0) = some (.seb 8#32 9#32)
+#guard decode (sebSehProg.getD (textBase + 4#32) 0) = some (.seh 8#32 9#32)
 
 -- One error case per major `AsmError` kind.
 #guard (assemble "frobnicate $t0, $t1\n").isOk = false
