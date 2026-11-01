@@ -29,6 +29,10 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   `tlt`/`tge`/`tltu`/`tgeu` (`rs, rt` operands, same shape as `mult`/`div`),
   and `break` (zero operands, like `syscall`; funct = 0x0d, word
   `0x0000000D`).
+- `ll`/`sc` (real MIPS32 atomic synchronization primitives, added on top of
+  the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): identical
+  `rt, offset(rs)` shape and parsing to `lw`/`sw`, table-driven the same way
+  (opcodes 0x30/0x38).
 - Coprocessor-1 (FPU) single-precision subset (docs/spec/INSTRUCTION-REF.md's
   floating-point section): `mtc1`/`mfc1`, `lwc1`/`swc1`, `add.s`/`sub.s`/
   `mul.s`/`div.s`, `mov.s`, `cvt.s.w`/`cvt.w.s`, `c.eq.s`/`c.lt.s`/`c.le.s`,
@@ -334,7 +338,11 @@ private def iTable : List (String × Nat × IForm) :=
    ("andi", 0x0c, .arith), ("ori", 0x0d, .arith), ("xori", 0x0e, .arith),
    ("lui", 0x0f, .lui),
    ("lw", 0x23, .mem), ("sw", 0x2b, .mem), ("lb", 0x20, .mem), ("lbu", 0x24, .mem),
-   ("lh", 0x21, .mem), ("lhu", 0x25, .mem), ("sh", 0x29, .mem)]
+   ("lh", 0x21, .mem), ("lhu", 0x25, .mem), ("sh", 0x29, .mem),
+   -- `ll`/`sc`: real MIPS32 atomic synchronization primitives (opcodes
+   -- 0x30/0x38; MD00086 Rev 2.50 §3.2), same `rt, offset(rs)` shape as
+   -- `lw`/`sw` (see `Instruction.lean`/`docs/spec/INSTRUCTION-REF.md`).
+   ("ll", 0x30, .mem), ("sc", 0x38, .mem)]
 
 /-- Static table of J-type mnemonics: (name, opcode). -/
 private def jTable : List (String × Nat) := [("j", 0x02), ("jal", 0x03)]
@@ -1124,6 +1132,22 @@ def cop1Prog : Program :=
 #guard decode (cop1Prog.getD (textBase + 56#32) 0) = some (.bc1t 0xffff#32)
 -- an unknown `$f` register is a `badRegister` error
 #guard (assemble "mov.s $f8, $f32\n").isOk = false
+
+-- `ll`/`sc`: identical `rt, offset(rs)` parsing to `lw`/`sw`, cross-checked
+-- against `Instruction.encode`.
+def llscSrc : String :=
+"ll $t0, 4($sp)\n" ++
+"sc $t0, 4($sp)\n"
+
+def llscProg : Program :=
+  match assemble llscSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard llscProg.getD textBase 0 = encode (.ll 29#32 8#32 4#32)
+#guard llscProg.getD (textBase + 4#32) 0 = encode (.sc 29#32 8#32 4#32)
+#guard decode (llscProg.getD textBase 0) = some (.ll 29#32 8#32 4#32)
+#guard decode (llscProg.getD (textBase + 4#32) 0) = some (.sc 29#32 8#32 4#32)
 
 -- One error case per major `AsmError` kind.
 #guard (assemble "frobnicate $t0, $t1\n").isOk = false

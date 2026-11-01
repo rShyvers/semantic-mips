@@ -35,6 +35,11 @@ Field-shape summary (see each constructor's docstring for details):
 - I-type load/store (`rs rt imm`): `lw sw lb lbu lh lhu sh` — `rs` is the base
   register, `rt` is the destination (loads) or source (stores) register,
   `imm` is the raw 16-bit offset field (not yet sign-extended).
+- I-type load-linked/store-conditional (`rs rt imm`), same field shape as
+  `lw`/`sw`: `ll sc` — real MIPS32 atomic synchronization primitives (opcodes
+  0x30/0x38); not part of the original v1 instruction set, added as the
+  `State.llBit` single-hart model (see `Types.lean`'s `llBit` docstring and
+  `docs/spec/INSTRUCTION-REF.md`).
 - I-type branch reg/reg (`rs rt imm`): `beq bne`.
 - I-type branch reg-only (`rs imm`): `blez bgtz` — `rt` is unused/fixed 0.
 - J-type (`target`): `j jal` — raw 26-bit target field (not yet shifted/combined
@@ -191,6 +196,19 @@ inductive Instruction where
   | lhu (rs rt imm : W32)
   /-- `MEM16[$rs + offset] = $rt[15:0]`, halfword-aligned (opcode 0x29). -/
   | sh  (rs rt imm : W32)
+  /-- `$rt = MEM32[$rs + offset]`, word-aligned, and sets `State.llBit`
+  (real MIPS32 "Load Linked Word", opcode 0x30; MD00086 Rev 2.50 §3.2,
+  Table 3-4). Identical addressing/alignment to `lw`; see
+  `docs/spec/INSTRUCTION-REF.md` for the paired `sc` semantics and this
+  model's single-hart `llBit` simplification. -/
+  | ll  (rs rt imm : W32)
+  /-- Conditionally `MEM32[$rs + offset] = $rt`, word-aligned, based on
+  `State.llBit`: if set, performs the store and writes `1` to `$rt`;
+  otherwise the store does not happen and `0` is written to `$rt`. Either
+  way, clears `llBit` (real MIPS32 "Store Conditional Word", opcode 0x38;
+  MD00086 Rev 2.50 §3.2, Table 3-4). Identical addressing/alignment to
+  `sw`. -/
+  | sc  (rs rt imm : W32)
   -- I-type branch reg/reg
   /-- `if $rs == $rt then PC = PC_next + (sext16(imm) << 2)` (opcode 0x04). -/
   | beq (rs rt imm : W32)
@@ -386,6 +404,8 @@ def decode (w : W32) : Option Instruction :=
   | 0x21 => some (.lh rs rt imm)
   | 0x25 => some (.lhu rs rt imm)
   | 0x29 => some (.sh rs rt imm)
+  | 0x30 => some (.ll rs rt imm)
+  | 0x38 => some (.sc rs rt imm)
   | 0x04 => some (.beq rs rt imm)
   | 0x05 => some (.bne rs rt imm)
   | 0x06 => some (.blez rs imm)
@@ -474,6 +494,8 @@ def encode (i : Instruction) : W32 :=
   | .lh rs rt imm => mkIT 0x21#32 rs rt imm
   | .lhu rs rt imm => mkIT 0x25#32 rs rt imm
   | .sh rs rt imm => mkIT 0x29#32 rs rt imm
+  | .ll rs rt imm => mkIT 0x30#32 rs rt imm
+  | .sc rs rt imm => mkIT 0x38#32 rs rt imm
   | .beq rs rt imm => mkIT 0x04#32 rs rt imm
   | .bne rs rt imm => mkIT 0x05#32 rs rt imm
   | .blez rs imm => mkIT 0x06#32 rs 0#32 imm
@@ -589,6 +611,11 @@ example : decode (mkIT 0x21#32 29#32 8#32 0x1234#32) = some (.lh 29#32 8#32 0x12
 example : decode (mkIT 0x25#32 29#32 8#32 0x1234#32) = some (.lhu 29#32 8#32 0x1234#32) := by decide
 example : decode (mkIT 0x29#32 29#32 8#32 0x1234#32) = some (.sh 29#32 8#32 0x1234#32) := by decide
 
+-- ll/sc: rs=29 (base), rt=8 (dest/src), imm=0x1234 (offset) -- identical
+-- field layout to lw/sw
+example : decode (mkIT 0x30#32 29#32 8#32 0x1234#32) = some (.ll 29#32 8#32 0x1234#32) := by decide
+example : decode (mkIT 0x38#32 29#32 8#32 0x1234#32) = some (.sc 29#32 8#32 0x1234#32) := by decide
+
 -- branch reg/reg: rs=29, rt=8, imm=0x1234
 example : decode (mkIT 0x04#32 29#32 8#32 0x1234#32) = some (.beq 29#32 8#32 0x1234#32) := by decide
 example : decode (mkIT 0x05#32 29#32 8#32 0x1234#32) = some (.bne 29#32 8#32 0x1234#32) := by decide
@@ -687,6 +714,12 @@ example : decode (encode (.cLtS 7#32 6#32)) = some (.cLtS 7#32 6#32) := by decid
 example : decode (encode (.cLeS 7#32 6#32)) = some (.cLeS 7#32 6#32) := by decide
 example : decode (encode (.bc1t 0x1234#32)) = some (.bc1t 0x1234#32) := by decide
 example : decode (encode (.bc1f 0x1234#32)) = some (.bc1f 0x1234#32) := by decide
+
+-- ll/sc: encode matches the hand-computed opcode, and decode (encode i) = some i
+example : encode (.ll 29#32 8#32 0x1234#32) = mkIT 0x30#32 29#32 8#32 0x1234#32 := by decide
+example : encode (.sc 29#32 8#32 0x1234#32) = mkIT 0x38#32 29#32 8#32 0x1234#32 := by decide
+example : decode (encode (.ll 29#32 8#32 0x1234#32)) = some (.ll 29#32 8#32 0x1234#32) := by decide
+example : decode (encode (.sc 29#32 8#32 0x1234#32)) = some (.sc 29#32 8#32 0x1234#32) := by decide
 
 -- unknown opcodes → none
 #guard decode (mkIT 0x01#32 0#32 0#32 0#32) = none  -- REGIMM, unimplemented
