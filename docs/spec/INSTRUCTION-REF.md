@@ -37,6 +37,12 @@ linked/store-conditional) have since been added on top of the v1 set, along
 with a new `State.llBit` field; see the dedicated
 ["Atomic synchronization (`ll`/`sc`)"](#atomic-synchronization-llsc--v1x-addition)
 section near the end of this document.
+Most recently, the real MIPS32 integer multiply-accumulate family
+(`madd`/`maddu`/`msub`/`msubu`) and the write-direction HI/LO register moves
+(`mthi`/`mtlo`, the counterparts to the existing `mfhi`/`mflo`) have been
+added, per `docs/spec/MIPS-COVERAGE-GAPS.md` §3.5 — see the dedicated
+["Integer multiply-accumulate and HI/LO register moves"](#integer-multiply-accumulate-and-hilo-register-moves-v1x-addition)
+section at the end of this document.
 
 Conventions pinned elsewhere and assumed here (see
 [`SPEC-NOTES.md`](SPEC-NOTES.md)): one real-MIPS32 branch delay slot per
@@ -1254,7 +1260,7 @@ is just ordinary code at an ordinary (if high) address.
    jumps to the target immediately with no delay-slot instruction executed.
    Our semantics does **not** follow that default: it implements real
    MIPS32's architecturally-mandated one-instruction delay slot instead
-   (Global rule 3; SPEC-NOTES \u00a79 item 1) \u2014 the one case in this reference
+   (Global rule 3; SPEC-NOTES \u00a79 item 1) — the one case in this reference
    where we deliberately diverge from MARS's default configuration rather
    than documenting it as a quirk to match.
 3. **`lw`/`sw` offset sign-extension asymmetry** (flagged as a source
@@ -1612,4 +1618,136 @@ to write this section; these are well-established, memorized ISA constants
 (the same citation already used by `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7),
 and any single value a future reader doubts should be cross-checked against
 a primary MIPS32 ISA reference before relying on it for anything beyond this
+simulator.
+
+## Integer multiply-accumulate and HI/LO register moves (v1.x addition)
+
+This section documents a v1.x addition: the real MIPS32 integer multiply-
+accumulate family (`madd`, `maddu`, `msub`, `msubu`) and the write-direction
+HI/LO register moves (`mthi`, `mtlo` — the counterparts to the existing
+`mfhi`/`mflo`). Per `docs/spec/MIPS-COVERAGE-GAPS.md` §3.5, `madd`/`maddu`/
+`msub`/`msubu` are the core loop instruction in DSP filters, vector
+dot-products, and numerical libraries, and `mthi`/`mtlo` are mandatory for OS
+context switching and setjmp/longjmp to save/restore the `hi`/`lo` registers
+(this project already modeled the read direction, `mfhi`/`mflo`, but not the
+write direction). **Grounding note**: like the other v1.x additions above,
+all six are grounded directly in the **standard MIPS32 architecture** —
+specifically MD00086 ("MIPS32 Architecture For Programmers, Volume II-A: The
+MIPS32 Instruction Set"), §3.2, Table 3-1 (`MADD`/`MADDU`/`MSUB`/`MSUBU`) and
+Table 3-7 (`MTHI`/`MTLO`) — not MARS-specific behavior; MARS is this
+project's differential-testing oracle, not the spec source.
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `madd $rs, $rt` | R (SPECIAL2) | `{hi,lo} += $rs * $rt`, signed 64-bit |
+| `maddu $rs, $rt` | R (SPECIAL2) | `{hi,lo} += $rs * $rt`, unsigned 64-bit |
+| `msub $rs, $rt` | R (SPECIAL2) | `{hi,lo} -= $rs * $rt`, signed 64-bit |
+| `msubu $rs, $rt` | R (SPECIAL2) | `{hi,lo} -= $rs * $rt`, unsigned 64-bit |
+| `mthi $rs` | R (SPECIAL) | `hi = $rs` |
+| `mtlo $rs` | R (SPECIAL) | `lo = $rs` |
+
+### madd (R, SPECIAL2)
+
+- **Encoding**: `opcode=011100` (0x1c, SPECIAL2, same opcode as `clo`/`clz`/
+  `mul`), `funct=000000` (0x00). Fields: `011100 sssss ttttt 00000 00000
+  000000` → `rs=sssss`, `rt=ttttt`; `rd`/`shamt` unused (always 0) — the
+  same `rs, rt`-only shape as the existing `mult`/`div` (no `rd` field is
+  written directly).
+- **Semantics**: Multiply and Add Word to HI/LO. Forms the signed 64-bit
+  product `$rs * $rt` exactly like `mult` does (both operands sign-extended
+  to 64 bits before multiplying), then **adds** that product to the
+  *existing* `{hi,lo}` 64-bit pair, rather than overwriting it the way
+  `mult` does: `{hi,lo} := {hi,lo} + ($rs * $rt)` as a 64-bit addition,
+  with `hi` the high 32 bits and `lo` the low 32 bits of the result.
+- **Errors/halts**: none; no overflow trap. Matching `mult`'s existing
+  non-trapping precedent (see `mult` entry above), the 64-bit accumulator
+  wraps on overflow like any other fixed-width arithmetic in this model —
+  real MIPS32 hardware has no overflow-trap concept for this instruction
+  either.
+- **ISA note**: standard MIPS32 instruction (present since MIPS32 Release 1).
+  The canonical use is a DSP-style multiply-accumulate loop (`for` loop
+  computing a dot product or FIR filter tap), where each iteration's
+  `madd $a, $b` adds one more product into a running 64-bit sum without an
+  intervening `mflo`/`add`/`mthi` round trip through a GPR.
+
+### maddu (R, SPECIAL2)
+
+- **Encoding**: `opcode=011100` (0x1c), `funct=000001` (0x01). Same field
+  layout as `madd`.
+- **Semantics**: Multiply and Add Unsigned Word to HI/LO. Same as `madd`,
+  but the product is formed from the **unsigned** 64-bit zero-extension of
+  `$rs`/`$rt` (mirroring `multu`): `{hi,lo} := {hi,lo} + (unsigned($rs) *
+  unsigned($rt))`. The addition itself is plain 64-bit wraparound arithmetic
+  either way — only the product's formation differs between the signed and
+  unsigned variants.
+- **Errors/halts**: none; same non-trapping precedent as `madd`/`multu`.
+- **ISA note**: standard MIPS32 instruction. Used for unsigned dot-products
+  and big-integer multiply-accumulate routines.
+
+### msub (R, SPECIAL2)
+
+- **Encoding**: `opcode=011100` (0x1c), `funct=000100` (0x04). Same field
+  layout as `madd`.
+- **Semantics**: Multiply and Subtract Word to HI/LO. Forms the signed
+  64-bit product `$rs * $rt` exactly like `madd`, but **subtracts** it from
+  the existing `{hi,lo}` pair instead of adding: `{hi,lo} := {hi,lo} -
+  ($rs * $rt)`, a 64-bit subtraction with the same wraparound-on-underflow
+  behavior as `madd`'s wraparound-on-overflow.
+- **Errors/halts**: none; same non-trapping precedent as `madd`.
+- **ISA note**: standard MIPS32 instruction. Used in DSP filter routines
+  that need to subtract a tap's contribution from a running accumulator.
+
+### msubu (R, SPECIAL2)
+
+- **Encoding**: `opcode=011100` (0x1c), `funct=000101` (0x05). Same field
+  layout as `madd`.
+- **Semantics**: Multiply and Subtract Unsigned Word to HI/LO. Same as
+  `msub`, but the product is formed unsigned, mirroring `maddu`/`multu`:
+  `{hi,lo} := {hi,lo} - (unsigned($rs) * unsigned($rt))`.
+- **Errors/halts**: none; same non-trapping precedent as `msub`.
+- **ISA note**: standard MIPS32 instruction. Unsigned counterpart to `msub`.
+
+### mthi (R)
+
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=010001` (0x11 — the next
+  funct value immediately after `mfhi`'s 0x10, the same kind of adjacency
+  as `syscall`'s 0x0c/`break`'s 0x0d). Fields: `000000 sssss 00000 00000
+  00000 010001` → `rs=sssss`(source register); `rt`/`rd`/`shamt` unused
+  (always 0) — the same one-operand `rs`-only shape as `jr`.
+- **Semantics**: Move to HI Register. `hi := $rs`. No GPR is written; `lo`
+  is left unchanged.
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32 instruction (present since MIPS I). The
+  write-direction counterpart to the already-implemented `mfhi`. Mandatory
+  for OS context-switch code and `setjmp`/`longjmp` implementations that
+  must save and later restore the `hi`/`lo` registers around arbitrary
+  multiply/divide usage elsewhere in a program (MD00086 §3.2, Table 3-7).
+
+### mtlo (R)
+
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=010011` (0x13 — the next
+  funct value immediately after `mflo`'s 0x12). Same field layout as
+  `mthi`.
+- **Semantics**: Move to LO Register. `lo := $rs`. No GPR is written; `hi`
+  is left unchanged.
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32 instruction. The write-direction counterpart
+  to `mflo`, same context-switch/`setjmp`/`longjmp` rationale as `mthi`.
+
+### Citation
+
+"MIPS32 Architecture For Programmers, Volume II-A: The MIPS32 Instruction
+Set" (MD00086, Rev 2.50), §3.2: Table 3-1 (p. 24) for `MADD` (entry 182),
+`MADDU` (entry 184), `MSUB` (entry 209), and `MSUBU` (entry 211) — all four
+SPECIAL2-opcoded (0x1c) with `funct` 0x00/0x01/0x04/0x05 respectively, same
+opcode family as the already-implemented `MUL`/`CLO`/`CLZ`; Table 3-7 (p. 27)
+for `MTHI` (entry 215) and `MTLO` (entry 216) — both SPECIAL-opcoded
+(opcode 0) with `funct` 0x11/0x13, the funct values immediately following
+`MFHI`'s 0x10/`MFLO`'s 0x12. No internet access was used to write this
+section; these are well-established, memorized ISA constants,
+cross-referenced against `docs/spec/MIPS-COVERAGE-GAPS.md`'s independent
+research pass (§3.5, which cites the same table/page/entry numbers) before
+being relied upon here. As with every hand-encoded constant in this project,
+any single value a future reader doubts should be cross-checked against a
+primary MIPS32 ISA reference before relying on it for anything beyond this
 simulator.

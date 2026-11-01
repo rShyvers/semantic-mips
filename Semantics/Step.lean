@@ -329,8 +329,47 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
       mkNext s s
     else
       mkNext s { s with lo := BitVec.ofNat 32 (a / b), hi := BitVec.ofNat 32 (a % b) }
+  -- SPECIAL2 multiply-accumulate (MIPS32): same signed/unsigned 64-bit
+  -- product formation as `mult`/`multu` above, but added to (or subtracted
+  -- from) the *existing* `{hi,lo}` pair instead of overwriting it. The
+  -- 64-bit add/subtract is plain `BitVec 64` arithmetic, which already
+  -- wraps on overflow -- no overflow trap, matching `mult`'s existing
+  -- non-trapping precedent (docs/spec/MIPS-COVERAGE-GAPS.md §3.5). `hi ++ lo`
+  -- reassembles the current 64-bit accumulator (`hi` is the high word).
+  | .madd rs rt =>
+    let a := asSigned (readReg s (regIdx rs))
+    let b := asSigned (readReg s (regIdx rt))
+    let prod64 : BitVec 64 := BitVec.ofInt 64 (a * b)
+    let acc64 : BitVec 64 := s.hi ++ s.lo
+    let sum64 := acc64 + prod64
+    mkNext s { s with lo := sum64.extractLsb 31 0, hi := sum64.extractLsb 63 32 }
+  | .maddu rs rt =>
+    let a := (readReg s (regIdx rs)).toNat
+    let b := (readReg s (regIdx rt)).toNat
+    let prod64 : BitVec 64 := BitVec.ofNat 64 (a * b)
+    let acc64 : BitVec 64 := s.hi ++ s.lo
+    let sum64 := acc64 + prod64
+    mkNext s { s with lo := sum64.extractLsb 31 0, hi := sum64.extractLsb 63 32 }
+  | .msub rs rt =>
+    let a := asSigned (readReg s (regIdx rs))
+    let b := asSigned (readReg s (regIdx rt))
+    let prod64 : BitVec 64 := BitVec.ofInt 64 (a * b)
+    let acc64 : BitVec 64 := s.hi ++ s.lo
+    let diff64 := acc64 - prod64
+    mkNext s { s with lo := diff64.extractLsb 31 0, hi := diff64.extractLsb 63 32 }
+  | .msubu rs rt =>
+    let a := (readReg s (regIdx rs)).toNat
+    let b := (readReg s (regIdx rt)).toNat
+    let prod64 : BitVec 64 := BitVec.ofNat 64 (a * b)
+    let acc64 : BitVec 64 := s.hi ++ s.lo
+    let diff64 := acc64 - prod64
+    mkNext s { s with lo := diff64.extractLsb 31 0, hi := diff64.extractLsb 63 32 }
   | .mflo rd => mkNext s (writeReg s (regIdx rd) s.lo)
   | .mfhi rd => mkNext s (writeReg s (regIdx rd) s.hi)
+  -- R-type move, write direction: the write-direction counterparts to
+  -- `mfhi`/`mflo` above (docs/spec/MIPS-COVERAGE-GAPS.md §3.5).
+  | .mthi rs => mkNext s { s with hi := readReg s (regIdx rs) }
+  | .mtlo rs => mkNext s { s with lo := readReg s (regIdx rs) }
   -- SPECIAL2 bit-count (MIPS32)
   | .clo rs rd =>
     mkNext s (writeReg s (regIdx rd) (BitVec.ofNat 32 (countLeadingOnes (readReg s (regIdx rs)))))
@@ -939,6 +978,49 @@ private def seededHiLo : State := { regs0 with hi := 0xdeadbeef#32, lo := 0xcafe
 #guard nextHiLoEq (step (prog1 (.mul 8#32 9#32 10#32)) (setRegs seededHiLo [(8, 6#32), (9, 7#32)]))
   0xdeadbeef#32 0xcafef00d#32  -- hi/lo unchanged by mul
 #guard nextRegEq (step (prog1 (.mul 8#32 9#32 10#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 2#32)])) 10 0xfffffffe#32  -- (-1) * 2 = -2, wraps
+
+-- ### madd/maddu/msub/msubu/mthi/mtlo (MIPS32 multiply-accumulate and HI/LO
+-- register moves; docs/spec/MIPS-COVERAGE-GAPS.md §3.5). The key property
+-- that distinguishes these from mult/multu/mul: starting from a nonzero
+-- `seededHiLo` accumulator, the result must be the *sum* (or difference) of
+-- the prior accumulator and the product, never just the product alone.
+
+-- madd: positive × positive (product 42, same pair as the plain mult test
+-- above) accumulated on top of seededHiLo instead of overwriting it
+#guard nextHiLoEq (step (prog1 (.madd 8#32 9#32)) (setRegs seededHiLo [(8, 6#32), (9, 7#32)]))
+  0xdeadbeef#32 0xcafef037#32
+-- madd: negative × negative (same pair as the mult test whose product is
+-- 0x3782dace_9d900000), accumulated onto seededHiLo with a 64-bit carry
+-- into the hi word
+#guard nextHiLoEq (step (prog1 (.madd 8#32 9#32)) (setRegs seededHiLo [(8, 0x88ca6c00#32), (9, 0x88ca6c00#32)]))
+  0x163099be#32 0x688ef00d#32
+-- maddu: unsigned operands > 2^31 (same pair as the multu test above)
+#guard nextHiLoEq (step (prog1 (.maddu 8#32 9#32)) (setRegs seededHiLo [(8, 0xb2d05e00#32), (9, 0xb2d05e00#32)]))
+  0x5b942b40#32 0xad82f00d#32
+-- msub: subtracts the product from the prior accumulator (inverse of the
+-- positive madd case above)
+#guard nextHiLoEq (step (prog1 (.msub 8#32 9#32)) (setRegs seededHiLo [(8, 6#32), (9, 7#32)]))
+  0xdeadbeef#32 0xcafeefe3#32
+-- msubu: unsigned subtract
+#guard nextHiLoEq (step (prog1 (.msubu 8#32 9#32)) (setRegs seededHiLo [(8, 0xb2d05e00#32), (9, 0xb2d05e00#32)]))
+  0x61c7529e#32 0xe87af00d#32
+
+-- mthi/mtlo: write-direction counterparts to mfhi/mflo. Each sets only its
+-- own half, leaving the other half (0 on regs0) untouched
+#guard nextHiLoEq (step (prog1 (.mthi 8#32)) (setRegs regs0 [(8, 0x12345678#32)])) 0x12345678#32 0#32
+#guard nextHiLoEq (step (prog1 (.mtlo 8#32)) (setRegs regs0 [(8, 0x87654321#32)])) 0#32 0x87654321#32
+-- round trip through the register file: mthi $8 then mfhi $9 reads back
+-- $8's original value (symmetric for mtlo/mflo)
+#guard (match stepState (prog1 (.mthi 8#32)) (setRegs regs0 [(8, 0x12345678#32)]) with
+        | some s' =>
+          let s'' := { s' with pc := textBase }
+          nextRegEq (step (prog1 (.mfhi 9#32)) s'') 9 0x12345678#32
+        | none => false)
+#guard (match stepState (prog1 (.mtlo 8#32)) (setRegs regs0 [(8, 0x87654321#32)]) with
+        | some s' =>
+          let s'' := { s' with pc := textBase }
+          nextRegEq (step (prog1 (.mflo 9#32)) s'') 9 0x87654321#32
+        | none => false)
 
 -- ### clo/clz/movn/movz/seb/seh (MIPS32/MIPS32r2 additions; see
 -- docs/spec/INSTRUCTION-REF.md)

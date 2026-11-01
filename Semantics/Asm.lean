@@ -34,7 +34,11 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   `jr $rs` is one-operand, `jalr $rd, $rs` is two-operand with `rd` first per
   real MIPS32 assembly syntax (opposite order from the `rs`-then-`rd` field
   layout); `jalr $rs` -- the one-operand sugar for `jalr $ra, $rs` -- is also
-  supported).
+  supported); `madd`/`maddu`/`msub`/`msubu` (`rs, rt` -- same shape as `mult`/
+  `div`, but SPECIAL2-opcoded like `mul`, so hand-encoded alongside it); and
+  `mthi`/`mtlo` (`rs` -- opcode 0, funct 0x11/0x13, the write-direction
+  counterparts to `mfhi`/`mflo`, same one-operand shape as `jr` so
+  hand-encoded alongside it).
 - The coprocessor-0 trap/exception family (real MIPS32 ISA, added on top of
   the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): `teq`/`tne`/
   `tlt`/`tge`/`tltu`/`tgeu` (`rs, rt` operands, same shape as `mult`/`div`),
@@ -414,6 +418,14 @@ like `clo`/`clz` rather than plain SPECIAL (opcode 0), so it is hand-encoded
 here too rather than via `rTable`. -/
 private def bshflMnemonics : List String := ["clo", "clz", "seb", "seh", "mul"]
 
+/-- SPECIAL2 multiply-accumulate (MIPS32): `madd`/`maddu`/`msub`/`msubu` have
+the same `rs, rt` operand shape as `mult`/`multu`/`div`/`divu` (`RForm.
+multdiv`), but unlike those, are SPECIAL2-opcoded (0x1c) like `mul`/`clo`/
+`clz` above, so they can't go through the opcode-0 `rTable` either; hand-
+encoded directly in `encodeInstruction` below (docs/spec/MIPS-COVERAGE-GAPS.md
+§3.5). -/
+private def multAccumMnemonics : List String := ["madd", "maddu", "msub", "msubu"]
+
 /-- Real MIPS32 register-indirect jump/call (opcode 0, funct 0x08/0x09):
 `jr $rs` (one operand) and `jalr $rd, $rs` (two operands, also accepting the
 `jalr $rs` one-operand sugar for `jalr $ra, $rs`) don't fit any existing
@@ -421,10 +433,20 @@ private def bshflMnemonics : List String := ["clo", "clz", "seb", "seh", "mul"]
 `encodeInstruction` below, the same way `bshflMnemonics` are. -/
 private def jrJalrMnemonics : List String := ["jr", "jalr"]
 
+/-- Write-direction HI/LO register moves (real MIPS32 `mthi`/`mtlo`, opcode
+0, funct 0x11/0x13): single-operand `rs` only, the same shape as `jr`, so
+like `jrJalrMnemonics` they don't fit any existing `RForm`'s fixed operand
+count and are hand-encoded directly in `encodeInstruction` below. The
+write-direction counterparts to `mfhi`/`mflo` (`RForm.hilo`), needed for OS
+context switching and setjmp/longjmp to save/restore `hi`/`lo` (see
+docs/spec/MIPS-COVERAGE-GAPS.md §3.5). -/
+private def hiLoMoveMnemonics : List String := ["mthi", "mtlo"]
+
 private def isKnownMnemonic (m : String) : Bool :=
   rTable.any (·.1 == m) ∨ iTable.any (·.1 == m) ∨ jTable.any (·.1 == m) ∨
     bTable.any (·.1 == m) ∨ cop1Table.any (·.1 == m) ∨ pseudoSet.contains m ∨
-    directiveSet.contains m ∨ bshflMnemonics.contains m ∨ jrJalrMnemonics.contains m
+    directiveSet.contains m ∨ bshflMnemonics.contains m ∨ jrJalrMnemonics.contains m ∨
+    multAccumMnemonics.contains m ∨ hiLoMoveMnemonics.contains m
 
 /-- Number of 32-bit words a `li $rt, v` expansion emits, per
 `PseudoOps.txt` lines 245-247: sign-extendable-16-bit values use a single
@@ -874,6 +896,39 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
         let rt ← parseRegister rtT item.lineNo
         pure [opRtWord 0x1c rs rt rd 0 0x02]
     | _ => throw (.badOperand s!"mul expects 'rd, rs, rt'" item.lineNo)
+  -- SPECIAL2 multiply-accumulate (MIPS32): `madd $rs, $rt` / `maddu $rs, $rt`
+  -- / `msub $rs, $rt` / `msubu $rs, $rt`. Same `rs, rt` shape as `mult`/
+  -- `div` (RForm.multdiv), but SPECIAL2-opcoded like `mul` above, so it
+  -- needs `opRtWord` rather than `rTable` (docs/spec/MIPS-COVERAGE-GAPS.md
+  -- §3.5).
+  | "madd" =>
+    match item.operands with
+    | [rsT, rtT] => do
+        let rs ← parseRegister rsT item.lineNo
+        let rt ← parseRegister rtT item.lineNo
+        pure [opRtWord 0x1c rs rt 0 0 0x00]
+    | _ => throw (.badOperand s!"madd expects 'rs, rt'" item.lineNo)
+  | "maddu" =>
+    match item.operands with
+    | [rsT, rtT] => do
+        let rs ← parseRegister rsT item.lineNo
+        let rt ← parseRegister rtT item.lineNo
+        pure [opRtWord 0x1c rs rt 0 0 0x01]
+    | _ => throw (.badOperand s!"maddu expects 'rs, rt'" item.lineNo)
+  | "msub" =>
+    match item.operands with
+    | [rsT, rtT] => do
+        let rs ← parseRegister rsT item.lineNo
+        let rt ← parseRegister rtT item.lineNo
+        pure [opRtWord 0x1c rs rt 0 0 0x04]
+    | _ => throw (.badOperand s!"msub expects 'rs, rt'" item.lineNo)
+  | "msubu" =>
+    match item.operands with
+    | [rsT, rtT] => do
+        let rs ← parseRegister rsT item.lineNo
+        let rt ← parseRegister rtT item.lineNo
+        pure [opRtWord 0x1c rs rt 0 0 0x05]
+    | _ => throw (.badOperand s!"msubu expects 'rs, rt'" item.lineNo)
   -- SPECIAL3 BSHFL sign-extend (MIPS32r2): `seb $rd, $rt` / `seh $rd, $rt`.
   -- `rs` is unused/fixed 0; the shamt-position field (0x10/0x18) selects
   -- which BSHFL sub-op this is.
@@ -912,6 +967,21 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
         let rs ← parseRegister rsT item.lineNo
         pure [rtWord rs 0 31 0 0x09]
     | _ => throw (.badOperand s!"jalr expects 'rd, rs' or 'rs'" item.lineNo)
+  -- Write-direction HI/LO moves (real MIPS32 `mthi`/`mtlo`, opcode 0, funct
+  -- 0x11/0x13 -- the next funct values immediately after `mfhi`'s 0x10/
+  -- `mflo`'s 0x12; see `Instruction.lean`'s `.mthi`/`.mtlo` docstrings).
+  | "mthi" =>
+    match item.operands with
+    | [rsT] => do
+        let rs ← parseRegister rsT item.lineNo
+        pure [rtWord rs 0 0 0 0x11]
+    | _ => throw (.badOperand s!"mthi expects 'rs'" item.lineNo)
+  | "mtlo" =>
+    match item.operands with
+    | [rsT] => do
+        let rs ← parseRegister rsT item.lineNo
+        pure [rtWord rs 0 0 0 0x13]
+    | _ => throw (.badOperand s!"mtlo expects 'rs'" item.lineNo)
   | "break" =>
     match item.operands with
     | [] => pure [0x0000000D#32]              -- all fields zero except funct = 0x0d
@@ -1139,6 +1209,25 @@ def mulProg : Program :=
 #guard mulProg.getD textBase 0 = (natToW32 0x1c <<< 26) ||| mkRT (9#32) (10#32) (8#32) (0#32) (0x02#32)
 #guard decode (mulProg.getD textBase 0) = some (.mul 9#32 10#32 8#32)
 
+-- `madd`/`maddu`/`msub`/`msubu $rs, $rt`: SPECIAL2 opcode 0x1c, `rs, rt`
+-- shape (no `rd` field), cross-checked against `Instruction.encode`.
+def multAccumSrc : String := "madd $t0, $t1\nmaddu $t0, $t1\nmsub $t0, $t1\nmsubu $t0, $t1\n"
+def multAccumProg : Program :=
+  match assemble multAccumSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard multAccumProg.getD textBase 0 = encode (.madd 8#32 9#32)
+#guard multAccumProg.getD (textBase + 4#32) 0 = encode (.maddu 8#32 9#32)
+#guard multAccumProg.getD (textBase + 8#32) 0 = encode (.msub 8#32 9#32)
+#guard multAccumProg.getD (textBase + 12#32) 0 = encode (.msubu 8#32 9#32)
+#guard decode (multAccumProg.getD textBase 0) = some (.madd 8#32 9#32)
+#guard decode (multAccumProg.getD (textBase + 4#32) 0) = some (.maddu 8#32 9#32)
+#guard decode (multAccumProg.getD (textBase + 8#32) 0) = some (.msub 8#32 9#32)
+#guard decode (multAccumProg.getD (textBase + 12#32) 0) = some (.msubu 8#32 9#32)
+#guard (assemble "madd $t0, $t1, $t2\n").isOk = false
+#guard (assemble "madd $t0\n").isOk = false
+
 -- `seb $rd, $rt` / `seh $rd, $rt`: SPECIAL3 opcode 0x1f, funct 0x20, the
 -- shamt-position sub-field (0x10/0x18) selects seb vs seh.
 def sebSehSrc : String := "seb $t0, $t1\nseh $t0, $t1\n"
@@ -1172,6 +1261,21 @@ def jrJalrProg : Program :=
 #guard (assemble "jr $t0, $t1\n").isOk = false
 #guard (assemble "jalr\n").isOk = false
 #guard (assemble "jalr $t0, $t1, $t2\n").isOk = false
+
+-- `mthi`/`mtlo $rs`: opcode 0, funct 0x11/0x13, single-operand `rs` shape
+-- (same as `jr`), cross-checked against `Instruction.encode`.
+def mthiMtloSrc : String := "mthi $t0\nmtlo $t0\n"
+def mthiMtloProg : Program :=
+  match assemble mthiMtloSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard mthiMtloProg.getD textBase 0 = encode (.mthi 8#32)
+#guard mthiMtloProg.getD (textBase + 4#32) 0 = encode (.mtlo 8#32)
+#guard decode (mthiMtloProg.getD textBase 0) = some (.mthi 8#32)
+#guard decode (mthiMtloProg.getD (textBase + 4#32) 0) = some (.mtlo 8#32)
+#guard (assemble "mthi\n").isOk = false
+#guard (assemble "mthi $t0, $t1\n").isOk = false
 
 -- `break`: zero operands, all fields zero except funct = 0x0d (0x0000000D);
 -- real MIPS32 encoding (the funct value immediately after `syscall`'s

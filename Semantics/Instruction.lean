@@ -27,6 +27,15 @@ Field-shape summary (see each constructor's docstring for details):
   `docs/spec/MIPS-COVERAGE-GAPS.md` §3.4).
 - R-type mult/div (`rs rt`): `mult multu div divu` — `rd`/`shamt` unused.
 - R-type move (`rd`): `mflo mfhi` — `rs`/`rt`/`shamt` unused.
+- R-type move, write direction (`rs`): `mthi mtlo` — `rt`/`rd`/`shamt`
+  unused; the write-direction counterparts to `mfhi`/`mflo` above (MIPS32
+  addition; see `docs/spec/MIPS-COVERAGE-GAPS.md` §3.5), needed for OS
+  context switching and setjmp/longjmp to save/restore `hi`/`lo`.
+- R-type multiply-accumulate (`rs rt`), SPECIAL2 (opcode 0x1c): `madd
+  maddu msub msubu` — same `rs rt` shape as `mult`/`multu` (`rd`/`shamt`
+  unused), accumulating into (or subtracting from) the *existing* `hi`/`lo`
+  pair rather than overwriting it (MIPS32 addition; see
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.5).
 - R-type jump register (`rs`): `jr` — `rt`/`rd`/`shamt` unused. (`rs rd`): `jalr`
   — `rt`/`shamt` unused. Real MIPS32 register-indirect jump/call (MD00086
   §3.2); like `j`/`jal`, these get the standard one-instruction delay slot
@@ -170,6 +179,17 @@ inductive Instruction where
   | mflo (rd : W32)
   /-- `$rd = hi` (opcode 0, funct 0x10). -/
   | mfhi (rd : W32)
+  -- R-type move, write direction (rt, rd/shamt unused): the write-direction
+  -- counterparts to `mfhi`/`mflo` above (opcode 0, funct 0x11/0x13 — the
+  -- next funct values immediately after `mfhi`'s 0x10/`mflo`'s 0x12, the
+  -- same adjacency pattern as `syscall` 0x0c/`break` 0x0d). Real MIPS32
+  -- (MD00086 Rev 2.50 §3.2, Table 3-7); needed for OS context switching and
+  -- setjmp/longjmp to save/restore `hi`/`lo` (see
+  -- `docs/spec/MIPS-COVERAGE-GAPS.md` §3.5).
+  /-- `hi = $rs` (opcode 0, funct 0x11). MIPS32. -/
+  | mthi (rs : W32)
+  /-- `lo = $rs` (opcode 0, funct 0x13). MIPS32. -/
+  | mtlo (rs : W32)
   -- R-type jump register (rt, rd/shamt unused as noted per-constructor). Real
   -- MIPS32 register-indirect jump/call family — shares opcode 0 (SPECIAL)
   -- with the R-type arithmetic instructions above, distinguished by funct.
@@ -204,6 +224,24 @@ inductive Instruction where
   see `docs/spec/INSTRUCTION-REF.md` for the documented dialect choice).
   MIPS32. -/
   | mul (rs rt rd : W32)
+  -- R-type multiply-accumulate, SPECIAL2 (MIPS32). Same `rs rt` field shape
+  -- as `mult`/`multu` (`rd`/`shamt` unused) -- these accumulate into the
+  -- *existing* `hi`/`lo` 64-bit pair instead of overwriting it, the core
+  -- loop instruction in DSP filters, vector dot-products, and numerical
+  -- libraries (see `docs/spec/MIPS-COVERAGE-GAPS.md` §3.5). Ground truth:
+  -- MD00086 Rev 2.50 §3.2, Table 3-1.
+  /-- `{hi,lo} += $rs * $rt`, signed 64-bit, wrapping on overflow like
+  `mult` (SPECIAL2 opcode 0x1c, funct 0x00). MIPS32. -/
+  | madd  (rs rt : W32)
+  /-- `{hi,lo} += $rs * $rt`, unsigned 64-bit, wrapping on overflow (SPECIAL2
+  opcode 0x1c, funct 0x01). MIPS32. -/
+  | maddu (rs rt : W32)
+  /-- `{hi,lo} -= $rs * $rt`, signed 64-bit, wrapping on overflow (SPECIAL2
+  opcode 0x1c, funct 0x04). MIPS32. -/
+  | msub  (rs rt : W32)
+  /-- `{hi,lo} -= $rs * $rt`, unsigned 64-bit, wrapping on overflow (SPECIAL2
+  opcode 0x1c, funct 0x05). MIPS32. -/
+  | msubu (rs rt : W32)
   -- R-type SPECIAL3 BSHFL sign-extend (MIPS32r2). `rs` is unused/fixed 0;
   -- `funct` is 0x20 for the whole BSHFL sub-op family, and the shamt-position
   -- 5-bit sub-field (not a real shift amount here) selects which one.
@@ -447,6 +485,8 @@ def decode (w : W32) : Option Instruction :=
     | 0x1b => some (.divu rs rt)
     | 0x12 => some (.mflo rd)
     | 0x10 => some (.mfhi rd)
+    | 0x11 => some (.mthi rs)
+    | 0x13 => some (.mtlo rs)
     | 0x08 => some (.jr rs)
     | 0x09 => some (.jalr rs rd)
     | 0x0c => some .syscall
@@ -463,6 +503,10 @@ def decode (w : W32) : Option Instruction :=
     | 0x21 => some (.clo rs rd)
     | 0x20 => some (.clz rs rd)
     | 0x02 => some (.mul rs rt rd)
+    | 0x00 => some (.madd rs rt)
+    | 0x01 => some (.maddu rs rt)
+    | 0x04 => some (.msub rs rt)
+    | 0x05 => some (.msubu rs rt)
     | _ => none
   | 0x1f =>  -- SPECIAL3: BSHFL sign-extend family, selected by the shamt sub-field
     match (functOf w).toNat with
@@ -566,12 +610,18 @@ def encode (i : Instruction) : W32 :=
   | .divu  rs rt => mkRT rs rt 0#32 0#32 0x1b#32
   | .mflo rd => mkRT 0#32 0#32 rd 0#32 0x12#32
   | .mfhi rd => mkRT 0#32 0#32 rd 0#32 0x10#32
+  | .mthi rs => mkRT rs 0#32 0#32 0#32 0x11#32
+  | .mtlo rs => mkRT rs 0#32 0#32 0#32 0x13#32
   | .jr   rs => mkRT rs 0#32 0#32 0#32 0x08#32
   | .jalr rs rd => mkRT rs 0#32 rd 0#32 0x09#32
   -- SPECIAL2: duplicate rd into the rt-position field per the real encoding.
   | .clo rs rd => (0x1c#32 <<< 26) ||| mkRT rs rd rd 0#32 0x21#32
   | .clz rs rd => (0x1c#32 <<< 26) ||| mkRT rs rd rd 0#32 0x20#32
   | .mul rs rt rd => (0x1c#32 <<< 26) ||| mkRT rs rt rd 0#32 0x02#32
+  | .madd  rs rt => (0x1c#32 <<< 26) ||| mkRT rs rt 0#32 0#32 0x00#32
+  | .maddu rs rt => (0x1c#32 <<< 26) ||| mkRT rs rt 0#32 0#32 0x01#32
+  | .msub  rs rt => (0x1c#32 <<< 26) ||| mkRT rs rt 0#32 0#32 0x04#32
+  | .msubu rs rt => (0x1c#32 <<< 26) ||| mkRT rs rt 0#32 0#32 0x05#32
   -- SPECIAL3 BSHFL: rs fixed 0, shamt-position field selects seb/seh.
   | .seb rd rt => (0x1f#32 <<< 26) ||| mkRT 0#32 rt rd 0x10#32 0x20#32
   | .seh rd rt => (0x1f#32 <<< 26) ||| mkRT 0#32 rt rd 0x18#32 0x20#32
@@ -669,6 +719,10 @@ example : decode (mkRT 29#32 8#32 0#32 0#32 0x1b#32) = some (.divu 29#32 8#32) :
 example : decode (mkRT 0#32 0#32 3#32 0#32 0x12#32) = some (.mflo 3#32) := by decide
 example : decode (mkRT 0#32 0#32 3#32 0#32 0x10#32) = some (.mfhi 3#32) := by decide
 
+-- R-type move, write direction: rs=29 (same field shape as jr)
+example : decode (mkRT 29#32 0#32 0#32 0#32 0x11#32) = some (.mthi 29#32) := by decide
+example : decode (mkRT 29#32 0#32 0#32 0#32 0x13#32) = some (.mtlo 29#32) := by decide
+
 -- syscall: opcode 0, funct 0x0c, all other fields 0
 example : decode (mkRT 0#32 0#32 0#32 0#32 0x0c#32) = some .syscall := by decide
 
@@ -681,6 +735,12 @@ example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 17#32 3#32 0#32 0x21#32) = som
 
 -- SPECIAL2 GPR multiply: rs=29, rt=8, rd=3 (plain rs/rt/rd shape, no duplication quirk)
 example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 8#32 3#32 0#32 0x02#32) = some (.mul 29#32 8#32 3#32) := by decide
+
+-- SPECIAL2 multiply-accumulate: rs=29, rt=8 (same rs/rt shape as mult/multu)
+example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 8#32 0#32 0#32 0x00#32) = some (.madd 29#32 8#32) := by decide
+example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 8#32 0#32 0#32 0x01#32) = some (.maddu 29#32 8#32) := by decide
+example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 8#32 0#32 0#32 0x04#32) = some (.msub 29#32 8#32) := by decide
+example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 8#32 0#32 0#32 0x05#32) = some (.msubu 29#32 8#32) := by decide
 
 -- SPECIAL3 BSHFL sign-extend: rd=3, rt=8, sub-field selects seb vs seh
 example : decode ((0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x10#32 0x20#32) = some (.seb 3#32 8#32) := by decide
@@ -797,6 +857,12 @@ example : encode (.clo 29#32 3#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 3#32 3#32 0
 example : encode (.seb 3#32 8#32) = (0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x10#32 0x20#32 := by decide
 example : encode (.sllv 3#32 8#32 29#32) = mkRT 29#32 8#32 3#32 0#32 0x04#32 := by decide
 example : encode (.mul 29#32 8#32 3#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 8#32 3#32 0#32 0x02#32 := by decide
+example : encode (.madd 29#32 8#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 8#32 0#32 0#32 0x00#32 := by decide
+example : encode (.maddu 29#32 8#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 8#32 0#32 0#32 0x01#32 := by decide
+example : encode (.msub 29#32 8#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 8#32 0#32 0#32 0x04#32 := by decide
+example : encode (.msubu 29#32 8#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 8#32 0#32 0#32 0x05#32 := by decide
+example : encode (.mthi 29#32) = mkRT 29#32 0#32 0#32 0#32 0x11#32 := by decide
+example : encode (.mtlo 29#32) = mkRT 29#32 0#32 0#32 0#32 0x13#32 := by decide
 example : encode (.jr 29#32) = mkRT 29#32 0#32 0#32 0#32 0x08#32 := by decide
 example : encode (.jalr 29#32 3#32) = mkRT 29#32 0#32 3#32 0#32 0x09#32 := by decide
 -- full round trip for every new instruction (decode ∘ encode = id on the field values we store)
@@ -810,6 +876,12 @@ example : decode (encode (.sllv 3#32 8#32 29#32)) = some (.sllv 3#32 8#32 29#32)
 example : decode (encode (.srlv 3#32 8#32 29#32)) = some (.srlv 3#32 8#32 29#32) := by decide
 example : decode (encode (.srav 3#32 8#32 29#32)) = some (.srav 3#32 8#32 29#32) := by decide
 example : decode (encode (.mul 29#32 8#32 3#32)) = some (.mul 29#32 8#32 3#32) := by decide
+example : decode (encode (.madd 29#32 8#32)) = some (.madd 29#32 8#32) := by decide
+example : decode (encode (.maddu 29#32 8#32)) = some (.maddu 29#32 8#32) := by decide
+example : decode (encode (.msub 29#32 8#32)) = some (.msub 29#32 8#32) := by decide
+example : decode (encode (.msubu 29#32 8#32)) = some (.msubu 29#32 8#32) := by decide
+example : decode (encode (.mthi 29#32)) = some (.mthi 29#32) := by decide
+example : decode (encode (.mtlo 29#32)) = some (.mtlo 29#32) := by decide
 example : decode (encode (.jr 29#32)) = some (.jr 29#32) := by decide
 example : decode (encode (.jalr 29#32 3#32)) = some (.jalr 29#32 3#32) := by decide
 example : encode .break = mkRT 0#32 0#32 0#32 0#32 0x0d#32 := by decide
@@ -862,7 +934,9 @@ example : decode (encode (.sc 29#32 8#32 0x1234#32)) = some (.sc 29#32 8#32 0x12
 #guard decode (mkIT 0x11#32 0x1f#32 0#32 0#32) = none
 #guard decode (mkIT 0x16#32 0#32 0#32 0#32) = none
 #guard decode (mkIT 0x17#32 0#32 0#32 0#32) = none
-#guard decode (mkIT 0x1c#32 0#32 0#32 0#32) = none
+-- opcode 0x1c (SPECIAL2) funct 0x00/0x01/0x02/0x04/0x05/0x20/0x21 are now
+-- assigned (madd/maddu/mul/msub/msubu/clz/clo); funct 0x3f remains unassigned.
+#guard decode (mkIT 0x1c#32 0#32 0#32 0x3f#32) = none
 #guard decode (mkIT 0x1d#32 0#32 0#32 0#32) = none
 
 -- unknown functs under opcode 0 → none
