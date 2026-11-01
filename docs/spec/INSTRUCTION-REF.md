@@ -37,6 +37,13 @@ linked/store-conditional) have since been added on top of the v1 set, along
 with a new `State.llBit` field; see the dedicated
 ["Atomic synchronization (`ll`/`sc`)"](#atomic-synchronization-llsc--v1x-addition)
 section near the end of this document.
+Finally, the real MIPS32 immediate-operand trap family `teqi`/`tnei`/
+`tgei`/`tgeiu`/`tlti`/`tltiu` has been added as the sign-extended-16-bit-
+immediate counterpart of the `teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu` family
+above (docs/spec/MIPS-COVERAGE-GAPS.md section 3.8), sharing the REGIMM
+opcode with `bltz`/`bgez`/`bltzal`/`bgezal`; see the dedicated
+["REGIMM trap-immediate family"](#regimm-trap-immediate-family-real-mips32-isa--v1x-addition)
+section just after the REGIMM zero-comparison branches below.
 
 Conventions pinned elsewhere and assumed here (see
 [`SPEC-NOTES.md`](SPEC-NOTES.md)): one real-MIPS32 branch delay slot per
@@ -111,6 +118,12 @@ execution logic (method `populate()`, lines 77–3236).
 | `tltu` | R | `if ($rs < $rt) trap`, unsigned |
 | `tgeu` | R | `if ($rs >= $rt) trap`, unsigned |
 | `break` | R | unconditional trap |
+| `teqi` | I-branch (REGIMM) | `if ($rs == sext16(imm)) trap`, signed |
+| `tnei` | I-branch (REGIMM) | `if ($rs != sext16(imm)) trap`, signed |
+| `tgei` | I-branch (REGIMM) | `if ($rs >= sext16(imm)) trap`, signed |
+| `tgeiu` | I-branch (REGIMM) | `if ($rs >= sext16(imm)) trap`, unsigned compare on sign-extended imm |
+| `tlti` | I-branch (REGIMM) | `if ($rs < sext16(imm)) trap`, signed |
+| `tltiu` | I-branch (REGIMM) | `if ($rs < sext16(imm)) trap`, unsigned compare on sign-extended imm |
 | `ll` | I | `$rt = MEM32[$rs + offset]`, word-aligned; sets `llBit` |
 | `sc` | I | if `llBit`: `MEM32[$rs + offset] = $rt`, `$rt := 1`; else `$rt := 0`; clears `llBit` either way |
 
@@ -933,6 +946,65 @@ displacement, identical convention to `blez`/`bgtz`).
 - **UNPREDICTABLE case**: same `rs = $ra` (31) UNPREDICTABLE case and
   pre-link-value resolution as `bltzal`.
 - **Source**: MD00086 Rev 2.50, `BGEZAL`, p. 75.
+
+## REGIMM trap-immediate family (real MIPS32 ISA) — v1.x addition
+
+The six instructions in this section (`teqi`, `tnei`, `tgei`, `tgeiu`,
+`tlti`, `tltiu`) are the sign-extended-16-bit-immediate counterpart of the
+`teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu` register-register trap family
+documented in the
+["Coprocessor 0 / traps and exceptions"](#coprocessor-0--traps-and-exceptions-real-mips32-isa)
+section below, identified as a coverage gap in
+[`MIPS-COVERAGE-GAPS.md`](MIPS-COVERAGE-GAPS.md) §3.8. Per this addition's
+house rule (same precedent as the REGIMM zero-comparison branches above),
+their semantics/encodings are grounded directly in the **real MIPS32
+architecture** — MIPS32 Architecture For Programmers, Volume II-A
+(`MD00086` Rev 2.50), §3.2, Table 3-9, p. 27 (`TEQI` p. 296, `TNEI` p. 308,
+`TGEI` p. 298, `TGEIU` p. 299, `TLTI` p. 302, `TLTIU` p. 304) — not
+derived from `InstructionSet.java`, even though MARS does also implement
+all six (per this track's process requirements, MARS is not consulted as
+the spec source).
+
+All six share **opcode `0x01`** (the same `REGIMM` major opcode as
+`bltz`/`bgez`/`bltzal`/`bgezal`): the 5-bit `rt` field (bits 20–16) again
+carries no register operand, instead selecting which of the ten REGIMM
+instructions this is. Field layout: `000001 fffff ttttt ssssssssssssssss`
+→ `rs=fffff` (operand 0, the register tested), `rt=ttttt` (sub-opcode
+selector, not a register), `imm=ssss...` (operand 1, 16-bit immediate,
+sign-extended — **not** a PC-relative branch displacement, unlike every
+other REGIMM instruction's `offset` field of the same bit position).
+
+| Mnemonic | `rt` field | Semantics |
+|---|---|---|
+| `teqi` | `0x0c` | `if ($rs == sext16(imm)) trap`, signed |
+| `tnei` | `0x0e` | `if ($rs != sext16(imm)) trap`, signed |
+| `tgei` | `0x08` | `if ($rs >= sext16(imm)) trap`, signed |
+| `tgeiu` | `0x09` | `if ($rs >=u sext16(imm)) trap`, unsigned compare on sign-extended imm |
+| `tlti` | `0x0a` | `if ($rs < sext16(imm)) trap`, signed |
+| `tltiu` | `0x0b` | `if ($rs <u sext16(imm)) trap`, unsigned compare on sign-extended imm |
+
+- **Semantics**: evaluate the named condition on `$rs` vs. `sext16(imm)` —
+  `teqi`: `$rs == sext16(imm)`; `tnei`: `$rs != sext16(imm)`; `tgei`:
+  `$rs >=s sext16(imm)` (signed); `tlti`: `$rs <s sext16(imm)` (signed).
+  `tgeiu`/`tltiu` sign-extend the 16-bit immediate to 32 bits **first**,
+  then compare the resulting bit pattern against `$rs` as **unsigned** —
+  the same "sign-extend, then compare unsigned" convention this codebase's
+  `sltiu` already uses (see the `slti`/`sltiu` section above), not a
+  zero-extend. If the condition holds, take the exception described in the
+  "Coprocessor 0 / traps and exceptions" section below with
+  `excCode = excCodeTr` (identical mechanism to `teq`/`tne`/etc. —
+  `Step.lean`'s `takeException` helper). If the condition does not hold,
+  the instruction is a complete no-op other than the ordinary fall-through
+  to `pc + 4` — no CP0 state is touched at all.
+- **Errors/halts**: none beyond the exception transition itself (which is
+  `StepResult.next`, not a halt).
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  MARS does implement this family in its own `InstructionSet.java`, but per
+  this track's process requirements the ground truth cited here is the real
+  MIPS32 ISA, not MARS's implementation of it.
+- **Source**: MD00086 Rev 2.50, §3.2, Table 3-9, p. 27; per-instruction
+  pages `TEQI` p. 296, `TNEI` p. 308, `TGEI` p. 298, `TGEIU` p. 299,
+  `TLTI` p. 302, `TLTIU` p. 304.
 
 ---
 

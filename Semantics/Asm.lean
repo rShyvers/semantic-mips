@@ -39,7 +39,10 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): `teq`/`tne`/
   `tlt`/`tge`/`tltu`/`tgeu` (`rs, rt` operands, same shape as `mult`/`div`),
   and `break` (zero operands, like `syscall`; funct = 0x0d, word
-  `0x0000000D`).
+  `0x0000000D`). Plus the immediate-operand trap family
+  (docs/spec/MIPS-COVERAGE-GAPS.md section 3.8): `teqi`/`tnei`/`tgei`/
+  `tgeiu`/`tlti`/`tltiu` (`rs, imm` operands; REGIMM opcode 0x01, same
+  opcode as `bltz`/`bgez`/etc. below, distinguished by the `rt` field).
 - `ll`/`sc` (real MIPS32 atomic synchronization primitives, added on top of
   the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): identical
   `rt, offset(rs)` shape and parsing to `lw`/`sw`, table-driven the same way
@@ -324,6 +327,7 @@ private inductive IForm
   | arith    -- rt, rs, imm
   | lui      -- rt, imm
   | mem      -- rt, offset(rs)
+  | trapImm (rtField : Nat)  -- rs, imm (rt field fixed to the given REGIMM trap selector)
 
 private inductive BForm
   | two          -- rs, rt, target
@@ -359,7 +363,14 @@ private def iTable : List (String × Nat × IForm) :=
    -- `ll`/`sc`: real MIPS32 atomic synchronization primitives (opcodes
    -- 0x30/0x38; MD00086 Rev 2.50 §3.2), same `rt, offset(rs)` shape as
    -- `lw`/`sw` (see `Instruction.lean`/`docs/spec/INSTRUCTION-REF.md`).
-   ("ll", 0x30, .mem), ("sc", 0x38, .mem)]
+   ("ll", 0x30, .mem), ("sc", 0x38, .mem),
+   -- Trap-immediate family (REGIMM, real MIPS32 ISA; opcode 0x01, same
+   -- opcode as `bltz`/`bgez`/etc. in `bTable`, distinguished by the `rt`
+   -- field -- see `Instruction.lean`/`docs/spec/MIPS-COVERAGE-GAPS.md` §3.8).
+   -- Operand shape is `rs, imm` (a plain immediate, not a branch target).
+   ("teqi", 0x01, .trapImm 0x0c), ("tnei", 0x01, .trapImm 0x0e),
+   ("tgei", 0x01, .trapImm 0x08), ("tgeiu", 0x01, .trapImm 0x09),
+   ("tlti", 0x01, .trapImm 0x0a), ("tltiu", 0x01, .trapImm 0x0b)]
 
 /-- Static table of J-type mnemonics: (name, opcode). -/
 private def jTable : List (String × Nat) := [("j", 0x02), ("jal", 0x03)]
@@ -700,6 +711,13 @@ private def encodeIForm (name : String) (opcode : Nat) (form : IForm) (operands 
         let (imm, rs) ← parseMemOperand memT lineNo
         pure (itWord opcode rs rt (ofInt32 imm))
     | _ => throw (.badOperand s!"{name} expects 'rt, offset(rs)'" lineNo)
+  | .trapImm rtField =>
+    match operands with
+    | [rsT, immT] => do
+        let rs ← parseRegister rsT lineNo
+        let imm ← parseImmediate immT lineNo
+        pure (itWord opcode rs rtField (ofInt32 imm))
+    | _ => throw (.badOperand s!"{name} expects 'rs, imm'" lineNo)
 
 private def encodeJForm (labels : Std.HashMap String W32) (opcode : Nat) (operands : List String)
     (lineNo : Nat) : Except AsmError W32 :=
@@ -1238,6 +1256,31 @@ def regimmProg : Program :=
 #guard regimmProg.getD (textBase + 12#32) 0 = mkIT (0x01#32) (8#32) (0x11#32) (ofInt32 (-4))
 #guard decode (regimmProg.getD (textBase + 12#32) 0) = some (.bgezal 8#32 0xfffc#32)
 #guard (assemble "bltz $t0\n").isOk = false
+
+-- Trap-immediate family: `rs, imm` operands (a plain immediate, not a
+-- branch target), same REGIMM opcode 0x01 as `bltz`/etc. above, selected
+-- by the `rt` field (docs/spec/MIPS-COVERAGE-GAPS.md section 3.8).
+def trapImmSrc : String :=
+  "teqi $t0, 5\n" ++ "tnei $t0, 5\n" ++ "tgei $t0, 5\n" ++
+  "tgeiu $t0, 5\n" ++ "tlti $t0, 5\n" ++ "tltiu $t0, 5\n"
+def trapImmProg : Program :=
+  match assemble trapImmSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard trapImmProg.getD textBase 0 = mkIT (0x01#32) (8#32) (0x0c#32) (5#32)
+#guard decode (trapImmProg.getD textBase 0) = some (.teqi 8#32 5#32)
+#guard trapImmProg.getD (textBase + 4#32) 0 = mkIT (0x01#32) (8#32) (0x0e#32) (5#32)
+#guard decode (trapImmProg.getD (textBase + 4#32) 0) = some (.tnei 8#32 5#32)
+#guard trapImmProg.getD (textBase + 8#32) 0 = mkIT (0x01#32) (8#32) (0x08#32) (5#32)
+#guard decode (trapImmProg.getD (textBase + 8#32) 0) = some (.tgei 8#32 5#32)
+#guard trapImmProg.getD (textBase + 12#32) 0 = mkIT (0x01#32) (8#32) (0x09#32) (5#32)
+#guard decode (trapImmProg.getD (textBase + 12#32) 0) = some (.tgeiu 8#32 5#32)
+#guard trapImmProg.getD (textBase + 16#32) 0 = mkIT (0x01#32) (8#32) (0x0a#32) (5#32)
+#guard decode (trapImmProg.getD (textBase + 16#32) 0) = some (.tlti 8#32 5#32)
+#guard trapImmProg.getD (textBase + 20#32) 0 = mkIT (0x01#32) (8#32) (0x0b#32) (5#32)
+#guard decode (trapImmProg.getD (textBase + 20#32) 0) = some (.tltiu 8#32 5#32)
+#guard (assemble "teqi $t0\n").isOk = false
 
 -- Coprocessor-1 (FPU) mnemonics: cross-checked word-for-word against
 -- `Instruction.encode` (an independent encoding path from this assembler's

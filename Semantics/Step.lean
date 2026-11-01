@@ -645,6 +645,28 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
   | .tgeu rs rt =>
     if (readReg s (regIdx rs)).toNat ≥ (readReg s (regIdx rt)).toNat
     then takeException s excCodeTr else mkNext s s
+  -- Trap-immediate (REGIMM, real MIPS32 ISA; `docs/spec/MIPS-COVERAGE-GAPS.md`
+  -- §3.8): same coprocessor-0 trap model as `teq`/`tne`/etc. above, but
+  -- comparing `$rs` against a sign-extended 16-bit immediate instead of a
+  -- second register. `tgeiu`/`tltiu` sign-extend the immediate to 32 bits
+  -- first, then compare the resulting bit pattern as unsigned — same
+  -- convention `sltiu` already uses.
+  | .teqi rs imm =>
+    if readReg s (regIdx rs) == signExt16 imm then takeException s excCodeTr else mkNext s s
+  | .tnei rs imm =>
+    if readReg s (regIdx rs) ≠ signExt16 imm then takeException s excCodeTr else mkNext s s
+  | .tgei rs imm =>
+    if asSigned (readReg s (regIdx rs)) ≥ asSigned (signExt16 imm)
+    then takeException s excCodeTr else mkNext s s
+  | .tgeiu rs imm =>
+    if (readReg s (regIdx rs)).toNat ≥ (signExt16 imm).toNat
+    then takeException s excCodeTr else mkNext s s
+  | .tlti rs imm =>
+    if asSigned (readReg s (regIdx rs)) < asSigned (signExt16 imm)
+    then takeException s excCodeTr else mkNext s s
+  | .tltiu rs imm =>
+    if (readReg s (regIdx rs)).toNat < (signExt16 imm).toNat
+    then takeException s excCodeTr else mkNext s s
   -- break: unconditional trap (coprocessor-0 exception model).
   | .break => takeException s excCodeBp
 
@@ -1316,6 +1338,53 @@ private def cp0Untouched (r : StepResult) (before : State) : Bool :=
 -- so it is never `<u` anything and always `>=u` everything)
 #guard isNext (step (prog1 (.tltu 8#32 9#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 1#32)]))
 #guard cp0Eq (step (prog1 (.tgeu 8#32 9#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 1#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+
+-- ### Trap-immediate family (REGIMM, real MIPS32 ISA;
+-- docs/spec/MIPS-COVERAGE-GAPS.md §3.8): teqi/tnei/tgei/tgeiu/tlti/tltiu,
+-- the sign-extended-16-bit-immediate counterpart of teq/tne/tlt/tge/tltu/tgeu.
+
+-- teqi: trap-taken when `$rs == sext16(imm)`; trap-not-taken behaves like
+-- an ordinary instruction and leaves all CP0 state untouched.
+#guard cp0Eq (step (prog1 (.teqi 8#32 5#32)) (setRegs regs0 [(8, 5#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+#guard isNext (step (prog1 (.teqi 8#32 5#32)) (setRegs regs0 [(8, 6#32)]))
+#guard cp0Untouched (step (prog1 (.teqi 8#32 5#32)) (setRegs regs0 [(8, 6#32)])) regs0
+
+-- tnei: trap on not-equal (opposite condition from teqi)
+#guard cp0Eq (step (prog1 (.tnei 8#32 5#32)) (setRegs regs0 [(8, 6#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+#guard isNext (step (prog1 (.tnei 8#32 5#32)) (setRegs regs0 [(8, 5#32)]))
+
+-- tgei/tlti: signed comparison against `sext16(imm)`; imm = 0xffff sign-
+-- extends to -1.
+#guard cp0Eq (step (prog1 (.tgei 8#32 0xffff#32)) (setRegs regs0 [(8, 0xffffffff#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr  -- -1 >= -1
+#guard isNext (step (prog1 (.tgei 8#32 0xffff#32)) (setRegs regs0 [(8, 0xfffffffe#32)]))  -- -2 >= -1 false
+#guard cp0Eq (step (prog1 (.tlti 8#32 1#32)) (setRegs regs0 [(8, 0xffffffff#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr  -- -1 < 1
+#guard isNext (step (prog1 (.tlti 8#32 1#32)) (setRegs regs0 [(8, 1#32)]))  -- 1 < 1 false
+
+-- tgeiu/tltiu: the immediate is sign-extended to 32 bits first, *then* the
+-- comparison is unsigned on the resulting bit pattern -- same convention
+-- `sltiu` already uses. Edge case where the signed and unsigned
+-- interpretations of the same `$rs` bit pattern disagree: $rs = 0xffffffff
+-- (signed -1, unsigned max) against imm = 1 (sext16(1) = 1); unsigned
+-- 0xffffffff >=u 1 is true (traps), even though a signed read of the same
+-- bits (-1 >= 1) would be false.
+#guard cp0Eq (step (prog1 (.tgeiu 8#32 1#32)) (setRegs regs0 [(8, 0xffffffff#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+#guard isNext (step (prog1 (.tltiu 8#32 1#32)) (setRegs regs0 [(8, 0xffffffff#32)]))  -- 0xffffffff <u 1 false
+#guard cp0Eq (step (prog1 (.tltiu 8#32 1#32)) (setRegs regs0 [(8, 0#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr  -- 0 <u 1 true
+
+-- a negative-immediate edge case: imm = 0xffff (sext16 = -1, i.e. bit
+-- pattern 0xffffffff) compared *unsigned* against $rs = 1 does NOT trap
+-- (1 >=u 0xffffffff is false) under tgeiu, unlike the signed tgei case
+-- with the exact same operands (1 >= -1 is true, traps) -- demonstrating
+-- tgeiu really does compare unsigned, not just sign-extend-and-reuse-tgei.
+#guard isNext (step (prog1 (.tgeiu 8#32 0xffff#32)) (setRegs regs0 [(8, 1#32)]))
+#guard cp0Eq (step (prog1 (.tgei 8#32 0xffff#32)) (setRegs regs0 [(8, 1#32)]))
   textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
 
 -- break: unconditional trap, distinct `ExcCode` (`excCodeBp` ≠ `excCodeTr`)
