@@ -14,10 +14,11 @@ v1 subset. Those six are grounded directly in the standard MIPS32 ISA rather
 than the MARS source (see that section's header note for why).
 
 Conventions pinned elsewhere and assumed here (see
-[`SPEC-NOTES.md`](SPEC-NOTES.md)): no branch delay slots (`DelayedBranching`
-default `false`); execution starts at `0x00400000`; big-endian memory;
-32 GPRs plus separate 64-bit `hi`/`lo` pair (internally registers 33/34);
-`$zero` write-ignored.
+[`SPEC-NOTES.md`](SPEC-NOTES.md)): one real-MIPS32 branch delay slot per
+branch/jump (not MARS's default `DelayedBranching=false` no-delay-slot
+config — see Global rule 3); execution starts at `0x00400000`; big-endian
+memory; 32 GPRs plus separate 64-bit `hi`/`lo` pair (internally registers
+33/34); `$zero` write-ignored.
 
 All line numbers below refer to
 `vendor/mars-src/mars/mips/instructions/InstructionSet.java` unless otherwise
@@ -100,26 +101,29 @@ Source: `vendor/mars-src/mars/simulator/Simulator.java`, lines 325–327
   (`PC_next` in this document).
 - **Non-control-flow instructions** (arith/logic/mem): PC is left at
   `PC_next`; execution continues there.
-- **Branches** (`beq`,`bne`,`blez`,`bgtz`): on taken condition,
-  `processBranch(displacement)` sets
+- **Branches** (`beq`,`bne`,`blez`,`bgtz`): the *target address formula* is
   `PC = PC_next + (displacement << 2)` (`InstructionSet.java` line ~3272,
-  the delayed-branching-off path; the comment literally reads "Decrement
-  needed because PC has already been incremented" and that decrement is
-  commented out). `displacement` is the instruction's signed 16-bit offset
-  field, i.e. the branch target is PC-relative to the instruction *after*
-  the branch, scaled by 4 — standard MIPS branch-target arithmetic, but
-  **with no delay slot executed** (see rule 3).
-- **Jumps** (`j`,`jal`): `processJump(targetAddress)` sets
-  `PC = targetAddress` directly, where
+  `processBranch`; `displacement` is the instruction's signed 16-bit offset
+  field) — standard MIPS branch-target arithmetic, PC-relative to the
+  instruction *after* the branch, scaled by 4. **Our semantics overrides
+  MARS's *timing* of when this target is applied**: real MIPS32 always
+  executes one delay-slot instruction first (see rule 3), so a taken branch
+  *schedules* this target rather than jumping to it immediately (MARS's
+  default `DelayedBranching=false` path jumps immediately instead; we do
+  not follow that part of MARS).
+- **Jumps** (`j`,`jal`): the *target address formula* is
   `targetAddress = (PC_next & 0xF0000000) | (target_field << 2)`
-  (`InstructionSet.java` lines ~1207–1211, 1238–1240). Note the top 4 bits
-  come from `PC_next` (the already-incremented PC), not from the jump
-  instruction's own address.
-- **Link instructions** (`jal`): `processReturnAddress(31)` sets
-  `$ra = PC_next` (plus `INSTRUCTION_LENGTH` only if delayed branching is
-  enabled, which is off by default) — `InstructionSet.java` lines
-  3309–3315. With delayed branching off (our v1 scope), `$ra` is exactly the
-  address of the instruction following `jal`.
+  (`InstructionSet.java` lines ~1207–1211, 1238–1240) — the top 4 bits come
+  from `PC_next`, not from the jump instruction's own address. As with
+  branches, our semantics *schedules* this target via the delay slot (rule
+  3) rather than applying it immediately.
+- **Link instructions** (`jal`): the address-*formula* source
+  (`processReturnAddress(31)`, `InstructionSet.java` lines 3309–3315) sets
+  `$ra = PC_next` only when delayed branching is disabled (MARS's default).
+  **Our semantics does not follow that**: since we always execute one
+  delay-slot instruction, `$ra` must be `PC_next + 4` (`pc + 8` relative to
+  `jal`'s own address) — the address *after* the delay slot — matching real
+  MIPS32, not MARS's no-delay-slot default (see rule 3).
 
 ### 2. `$zero` is write-ignored
 
@@ -130,18 +134,48 @@ array. Reads of register 0 always return `0` (it is initialized to 0 and
 never written). Every instruction below that writes `$rd`/`$rt` is silently
 a no-op if that operand is `$zero`.
 
-### 3. No branch delay slot (default configuration)
+### 3. Branch/jump delay slots (real MIPS32 semantics)
 
-Source: `vendor/mars-src/mars/mips/instructions/InstructionSet.java`,
-`processBranch`/`processJump` (lines 3265–3306), gated on
-`Globals.getSettings().getDelayedBranchingEnabled()`, and
-`vendor/mars-src/mars/Settings.java` (`DelayedBranching` defaults to
-`false`, per `SPEC-NOTES.md` §3). With the default setting, a taken
-branch/jump updates `PC` immediately to the target; the next instruction
-fetched is the one at the target, **not** the instruction physically
-following the branch/jump in memory. **This differs from real MIPS
-hardware**, which always executes one delay-slot instruction after every
-branch/jump. Flagged per-instruction below.
+Ground truth: the real MIPS32 architecture (not MARS). Every branch
+(`beq`,`bne`,`blez`,`bgtz`) and jump (`j`,`jal`) has exactly **one**
+architecturally-mandated delay slot: the single instruction immediately
+following it in program order always executes — whether or not the branch
+is taken — *before* control transfers to the target.
+
+- **Taken branch/jump**: the delay-slot instruction (at `pc + 4`) executes
+  normally; *after* it retires, `pc` becomes the branch/jump target (not
+  `pc + 4 + 4`). Modeled in `Semantics/Step.lean` as: the branch/jump
+  itself falls through to `pc + 4` and records the real target in
+  `State.pendingBranch : Option W32`; the delay-slot instruction's own step
+  (any ordinary, non-branch-like instruction) commits the scheduled target
+  to `pc` via `advance`/`mkNext`.
+- **Not-taken branch**: behaves exactly like an ordinary instruction (falls
+  through to `pc + 4`, `pendingBranch` stays `none`) — no observable
+  difference from a world without delay slots.
+- **`jal`'s `$ra`** is `pc + 8` (past the delay slot), not `pc + 4` — see
+  rule 1.
+- **A branch/jump occurring itself in another's delay slot** (i.e.
+  immediately after a *taken* branch/jump) is architecturally
+  discouraged/implementation-defined on real MIPS32. Rather than guess,
+  `step` halts with `HaltReason.branchInDelaySlot` whenever the instruction
+  about to execute is itself one of the six branch/jump instructions and
+  `State.pendingBranch` is still `some _` from the previous step — this
+  keeps `step` total and the condition diagnosable instead of silently
+  picking an arbitrary (and likely wrong) behavior.
+
+This **overrides MARS's own default configuration**
+(`vendor/mars-src/mars/mips/instructions/InstructionSet.java`,
+`processBranch`/`processJump`, lines 3265–3306, gated on
+`Globals.getSettings().getDelayedBranchingEnabled()`;
+`vendor/mars-src/mars/Settings.java`'s `DelayedBranching` defaults to
+`false`), under which a taken branch/jump updates `PC` to the target
+*immediately*, with no delay-slot instruction executed at all. MARS is only
+ever used by this project as a differential-testing oracle, not as the spec
+source (`SPEC-NOTES.md` §9 item 1); on this point we deliberately diverge
+from MARS's default to match the real architecture instead. (MARS *can*
+model delay slots if `DelayedBranching` is enabled, which would then agree
+with this rule — but that MARS setting is not why we implement it this
+way.)
 
 ### 4. Big-endian load/store byte order
 
@@ -604,31 +638,40 @@ Source: `vendor/mars-src/mars/mips/hardware/Memory.java`:
   `000010 ffffffffffffffffffffffffff` → `target=ffff...`(26-bit field,
   operand index 0; assembled from an absolute word address shifted right 2,
   per `ProgramStatement.java` line ~357).
-- **Semantics**: `PC = (PC_next & 0xF0000000) | (target << 2)`. `PC_next`
-  is the PC *after* this instruction's fetch-increment (rule 1), so the top
-  4 bits of the jump target come from the region containing the
-  instruction *after* `j`, not `j` itself (normal MIPS pseudo-direct
-  jump semantics).
+- **Semantics**: schedules `PC = (PC_next & 0xF0000000) | (target << 2)`
+  as the delay-slot transfer (Global rule 3) rather than applying it
+  immediately; `j` itself falls through to `PC_next` so the delay-slot
+  instruction executes first. `PC_next` is the PC *after* this
+  instruction's fetch-increment (rule 1), so the top 4 bits of the jump
+  target come from the region containing the instruction *after* `j`, not
+  `j` itself (normal MIPS pseudo-direct jump semantics).
 - **Errors/halts**: none directly; a bad target can later cause an
-  instruction-fetch `AddressErrorException` on the next fetch.
-- **MARS note**: **DEVIATION** — no delay slot executed (Global rule 3);
-  `PC` becomes the target immediately rather than after one more
-  sequential instruction, differing from real MIPS hardware's defined
-  delay-slot semantics.
+  instruction-fetch `AddressErrorException` on the next fetch; a branch/jump
+  occupying `j`'s own delay slot halts with `HaltReason.branchInDelaySlot`
+  (Global rule 3).
+- **MARS note**: our semantics **overrides MARS's default**
+  (`DelayedBranching=false`) and executes one delay-slot instruction before
+  `PC` becomes the target, matching real MIPS hardware's architecturally
+  mandated delay-slot semantics (Global rule 3) rather than MARS's
+  immediate-jump default.
 - **Source**: `InstructionSet.java`, lines 1200–1216;
   `processJump` at lines 3288–3298.
 
 ### jal (J)
 - **Encoding**: `opcode=000011` (0x03). Same field layout as `j`.
-- **Semantics**: `$ra ($31) = PC_next` (via `processReturnAddress(31)`,
-  with delayed branching off this adds no extra offset); then
-  `PC = (PC_next & 0xF0000000) | (target << 2)`, identical target
-  computation to `j`.
-- **Errors/halts**: none directly.
-- **MARS note**: **DEVIATION** — same no-delay-slot behavior as `j` (Global
-  rule 3). Link-address value itself (`PC_next`, i.e. address of the
-  instruction textually following `jal`) matches textbook MIPS; only the
-  absence of delay-slot execution differs.
+- **Semantics**: `$ra ($31) = PC_next + 4` (i.e. `pc + 8`, the address
+  *after* the delay slot — see Global rule 1/3, since the delay-slot
+  instruction still executes before `jal` can return); then schedules
+  `PC = (PC_next & 0xF0000000) | (target << 2)` as the delay-slot transfer,
+  identical target computation to `j`. `jal` itself falls through to
+  `PC_next` so the delay-slot instruction executes first.
+- **Errors/halts**: none directly; a branch/jump occupying `jal`'s own
+  delay slot halts with `HaltReason.branchInDelaySlot` (Global rule 3).
+- **MARS note**: our semantics **overrides MARS's default**
+  (`DelayedBranching=false`, under which `$ra = PC_next` with no delay slot
+  executed) to match real MIPS32: one delay-slot instruction always
+  executes, so `$ra` must be `PC_next + 4` rather than `PC_next` (Global
+  rule 1/3).
 - **Source**: `InstructionSet.java`, lines 1228–1244;
   `processReturnAddress` at lines 3309–3316.
 
@@ -637,21 +680,29 @@ Source: `vendor/mars-src/mars/mips/hardware/Memory.java`:
   `000100 fffff sssss tttttttttttttttt` → `rs=fffff`($t1, operand 0),
   `rt=sssss`($t2, operand 1), `offset=tttt...`(operand 2, 16-bit signed
   word displacement).
-- **Semantics**: if `$rs == $rt` (32-bit equality), `PC = PC_next +
-  (offset << 2)` via `processBranch`; otherwise PC stays at `PC_next`.
+- **Semantics**: if `$rs == $rt` (32-bit equality), schedules
+  `PC = PC_next + (offset << 2)` as the delay-slot transfer (Global rule 3)
+  — `beq` itself still falls through to `PC_next` so the delay-slot
+  instruction executes first; otherwise PC stays at `PC_next` with no
+  scheduled transfer (ordinary fallthrough).
 - **Errors/halts**: none directly from the comparison; a bad target can
-  cause a later fetch error.
-- **MARS note**: **DEVIATION** — no delay slot (Global rule 3): the branch,
-  if taken, redirects fetch to the target on the very next cycle instead of
-  executing one more sequential instruction first.
+  cause a later fetch error; a branch/jump occupying `beq`'s own delay slot
+  (only possible when `beq` is taken) halts with
+  `HaltReason.branchInDelaySlot` (Global rule 3).
+- **MARS note**: our semantics **overrides MARS's default**
+  (`DelayedBranching=false`) and executes one delay-slot instruction before
+  the target takes effect, matching real MIPS hardware (Global rule 3)
+  rather than MARS's immediate-branch default.
 - **Source**: `InstructionSet.java`, lines 858–875;
   `processBranch` at lines 3265–3281.
 
 ### bne (I-branch)
 - **Encoding**: `opcode=000101` (0x05). Same layout as `beq`.
-- **Semantics**: if `$rs != $rt`, `PC = PC_next + (offset << 2)`.
-- **Errors/halts**: none directly.
-- **MARS note**: **DEVIATION** — no delay slot, same as `beq`.
+- **Semantics**: if `$rs != $rt`, schedules `PC = PC_next + (offset << 2)`
+  as the delay-slot transfer, same as `beq` (Global rule 3).
+- **Errors/halts**: none directly; same delay-slot halt condition as `beq`.
+- **MARS note**: same real-MIPS32 delay-slot override as `beq` (Global
+  rule 3).
 - **Source**: `InstructionSet.java`, lines 876–891.
 
 ### blez (I-branch)
@@ -659,17 +710,21 @@ Source: `vendor/mars-src/mars/mips/hardware/Memory.java`:
   `000110 fffff 00000 ssssssssssssssss` → `rs=fffff`($t1, operand 0),
   `rt=00000`(fixed/unused), `offset=ssss...`(operand 1).
 - **Semantics**: if `$rs <= 0` (signed comparison, includes zero),
-  `PC = PC_next + (offset << 2)`.
-- **Errors/halts**: none directly.
-- **MARS note**: **DEVIATION** — no delay slot, same as `beq`.
+  schedules `PC = PC_next + (offset << 2)` as the delay-slot transfer, same
+  as `beq` (Global rule 3).
+- **Errors/halts**: none directly; same delay-slot halt condition as `beq`.
+- **MARS note**: same real-MIPS32 delay-slot override as `beq` (Global
+  rule 3).
 - **Source**: `InstructionSet.java`, lines 942–958.
 
 ### bgtz (I-branch)
 - **Encoding**: `opcode=000111` (0x07). Same layout as `blez`.
-- **Semantics**: if `$rs > 0` (signed, strictly positive), `PC = PC_next +
-  (offset << 2)`.
-- **Errors/halts**: none directly.
-- **MARS note**: **DEVIATION** — no delay slot, same as `beq`.
+- **Semantics**: if `$rs > 0` (signed, strictly positive), schedules
+  `PC = PC_next + (offset << 2)` as the delay-slot transfer, same as `beq`
+  (Global rule 3).
+- **Errors/halts**: none directly; same delay-slot halt condition as `beq`.
+- **MARS note**: same real-MIPS32 delay-slot override as `beq` (Global
+  rule 3).
 - **Source**: `InstructionSet.java`, lines 926–941.
 
 ---
@@ -858,10 +913,14 @@ convention: `$v0` = service number, `$a0` = register 4 (first argument).
 1. **`div`/`divu` by zero**: no exception, `hi`/`lo` left unchanged
    (explicit source comment citing the MIPS32 spec over the COD3 textbook
    framing). `Exceptions.DIVIDE_BY_ZERO_EXCEPTION` exists but is dead code.
-2. **No branch delay slot by default** (`j`, `jal`, `beq`, `bne`, `blez`,
-   `bgtz`): `DelayedBranching` setting defaults to `false`; PC jumps to the
-   target immediately with no delay-slot instruction executed, unlike real
-   MIPS hardware's architecturally-mandated delay slot.
+2. **Branch delay slots** (`j`, `jal`, `beq`, `bne`, `blez`, `bgtz`):
+   MARS's `DelayedBranching` setting defaults to `false`, so by default PC
+   jumps to the target immediately with no delay-slot instruction executed.
+   Our semantics does **not** follow that default: it implements real
+   MIPS32's architecturally-mandated one-instruction delay slot instead
+   (Global rule 3; SPEC-NOTES \u00a79 item 1) \u2014 the one case in this reference
+   where we deliberately diverge from MARS's default configuration rather
+   than documenting it as a quirk to match.
 3. **`lw`/`sw` offset sign-extension asymmetry** (flagged as a source
    ambiguity requiring a Lean-spec decision, not a confirmed intentional
    deviation): unlike `lb`/`lh`/`lhu`/`lbu`/`sh`/`addi`/`addiu`/`slti`/
