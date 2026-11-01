@@ -88,6 +88,289 @@ Deliberately, permanently out of scope: MIPS64, the DSP ASE, and MSA SIMD
 memory and privileged-mode execution (kernel territory, a different
 project).
 
+## Instruction coverage and proof status
+
+Every row is one real MIPS32 instruction this project implements. **Proven**
+means a `StepSpec.lean` `_spec_raw` theorem states that instruction's exact
+behavior and the proof is complete (no `sorry`), independently kernel-checked
+(`#print axioms`). **Stalled** means a theorem is written but not yet closed
+(the gap is a documented `sorry` with a written-up reason, not a gap in
+understanding, plus a closed weaker `#guard` substitute). **Not yet** means
+the instruction is implemented, tested (`#guard`/`example` unit tests in its
+own module), and documented in `docs/spec/INSTRUCTION-REF.md`, but has no
+`StepSpec.lean` theorem yet.
+
+**120 of 157 instructions formally proven, 1 stalled (documented `sorry`), 36 implemented but not yet proven.**
+
+<details><summary><strong>R-type arithmetic / logic / compare / conditional move</strong> — 12/12 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `add` | ✅ Proven |
+| `addu` | ✅ Proven |
+| `sub` | ✅ Proven |
+| `subu` | ✅ Proven |
+| `and` | ✅ Proven |
+| `or` | ✅ Proven |
+| `xor` | ✅ Proven |
+| `nor` | ✅ Proven |
+| `slt` | ✅ Proven |
+| `sltu` | ✅ Proven |
+| `movn` | ✅ Proven |
+| `movz` | ✅ Proven |
+
+</details>
+
+<details><summary><strong>Shifts and rotate</strong> — 8/8 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `sll` | ✅ Proven |
+| `srl` | ✅ Proven |
+| `sra` | ✅ Proven |
+| `sllv` | ✅ Proven |
+| `srlv` | ✅ Proven |
+| `srav` | ✅ Proven |
+| `rotr` | ✅ Proven |
+| `rotrv` | ✅ Proven |
+
+</details>
+
+<details><summary><strong>Multiply / divide and HI/LO register moves</strong> — 8/8 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `mult` | ✅ Proven |
+| `multu` | ✅ Proven |
+| `div` | ✅ Proven |
+| `divu` | ✅ Proven |
+| `mflo` | ✅ Proven |
+| `mfhi` | ✅ Proven |
+| `mthi` | ✅ Proven |
+| `mtlo` | ✅ Proven |
+
+</details>
+
+<details><summary><strong>Multiply-accumulate</strong> — 4/4 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `madd` | ✅ Proven |
+| `maddu` | ✅ Proven |
+| `msub` | ✅ Proven |
+| `msubu` | ✅ Proven |
+
+</details>
+
+<details><summary><strong>Bit manipulation (SPECIAL2/SPECIAL3)</strong> — 8/8 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `clo` | ✅ Proven |
+| `clz` | ✅ Proven |
+| `mul` | ✅ Proven |
+| `seb` | ✅ Proven |
+| `seh` | ✅ Proven |
+| `wsbh` | ✅ Proven |
+| `ext` | ✅ Proven |
+| `ins` | ✅ Proven |
+
+</details>
+
+<details><summary><strong>I-type immediate</strong> — 8/8 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `addi` | ✅ Proven |
+| `addiu` | ✅ Proven |
+| `slti` | ✅ Proven |
+| `sltiu` | ✅ Proven |
+| `andi` | ✅ Proven |
+| `ori` | ✅ Proven |
+| `xori` | ✅ Proven |
+| `lui` | ✅ Proven |
+
+</details>
+
+<details><summary><strong>Memory, aligned</strong> — 9/9 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `lw` | ✅ Proven |
+| `sw` | ✅ Proven |
+| `lb` | ✅ Proven |
+| `lbu` | ✅ Proven |
+| `lh` | ✅ Proven |
+| `lhu` | ✅ Proven |
+| `sh` | ✅ Proven |
+| `ll` | ✅ Proven |
+| `sc` | ✅ Proven |
+
+</details>
+
+<details><summary><strong>Memory, unaligned (classic MIPS)</strong> — 4/4 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `lwl` | ✅ Proven |
+| `lwr` | ✅ Proven |
+| `swl` | ✅ Proven |
+| `swr` | ✅ Proven |
+
+</details>
+
+<details><summary><strong>Branches and jumps (real delay slots)</strong> — 12/12 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `beq` | ✅ Proven |
+| `bne` | ✅ Proven |
+| `blez` | ✅ Proven |
+| `bgtz` | ✅ Proven |
+| `bltz` | ✅ Proven |
+| `bgez` | ✅ Proven |
+| `bltzal` | ✅ Proven |
+| `bgezal` | ✅ Proven |
+| `j` | ✅ Proven |
+| `jal` | ✅ Proven |
+| `jr` | ✅ Proven |
+| `jalr` | ✅ Proven |
+
+</details>
+
+<details><summary><strong>"Branch likely" (deprecated in MIPS32, removed in Release 6)</strong> — 0/8 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `beql` | ⬜ Implemented, not yet proven |
+| `bnel` | ⬜ Implemented, not yet proven |
+| `blezl` | ⬜ Implemented, not yet proven |
+| `bgtzl` | ⬜ Implemented, not yet proven |
+| `bltzl` | ⬜ Implemented, not yet proven |
+| `bgezl` | ⬜ Implemented, not yet proven |
+| `bltzall` | ⬜ Implemented, not yet proven |
+| `bgezall` | ⬜ Implemented, not yet proven |
+
+</details>
+
+<details><summary><strong>Traps, register-register</strong> — 6/6 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `teq` | ✅ Proven |
+| `tne` | ✅ Proven |
+| `tlt` | ✅ Proven |
+| `tge` | ✅ Proven |
+| `tltu` | ✅ Proven |
+| `tgeu` | ✅ Proven |
+
+</details>
+
+<details><summary><strong>Traps, immediate</strong> — 6/6 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `teqi` | ✅ Proven |
+| `tnei` | ✅ Proven |
+| `tgei` | ✅ Proven |
+| `tgeiu` | ✅ Proven |
+| `tlti` | ✅ Proven |
+| `tltiu` | ✅ Proven |
+
+</details>
+
+<details><summary><strong>Syscall, breakpoint, and minimal coprocessor-0 exception model</strong> — 5/6 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `syscall` | ⚠️ Stalled (`sorry`, documented) |
+| `break` | ✅ Proven |
+| `mfc0` | ✅ Proven |
+| `mtc0` | ✅ Proven |
+| `eret` | ✅ Proven |
+| `wait` | ✅ Proven |
+
+</details>
+
+<details><summary><strong>Memory-ordering / cache-hint (no-ops in this single-hart, cacheless model)</strong> — 0/2 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `sync` | ⬜ Implemented, not yet proven |
+| `synci` | ⬜ Implemented, not yet proven |
+
+</details>
+
+<details><summary><strong>Floating point, coprocessor 1, single precision</strong> — 30/32 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `mfc1` | ✅ Proven |
+| `mtc1` | ✅ Proven |
+| `lwc1` | ✅ Proven |
+| `swc1` | ✅ Proven |
+| `add.s` | ✅ Proven |
+| `sub.s` | ✅ Proven |
+| `mul.s` | ✅ Proven |
+| `div.s` | ✅ Proven |
+| `mov.s` | ✅ Proven |
+| `cvt.s.w` | ✅ Proven |
+| `cvt.w.s` | ✅ Proven |
+| `sqrt.s` | ✅ Proven |
+| `abs.s` | ✅ Proven |
+| `neg.s` | ✅ Proven |
+| `round.w.s` | ✅ Proven |
+| `trunc.w.s` | ✅ Proven |
+| `ceil.w.s` | ✅ Proven |
+| `floor.w.s` | ✅ Proven |
+| `cfc1` | ✅ Proven |
+| `ctc1` | ✅ Proven |
+| `c.eq.s` | ✅ Proven |
+| `c.lt.s` | ✅ Proven |
+| `c.le.s` | ✅ Proven |
+| `c.f.s` | ✅ Proven |
+| `c.un.s` | ✅ Proven |
+| `c.ueq.s` | ✅ Proven |
+| `c.olt.s` | ✅ Proven |
+| `c.ult.s` | ✅ Proven |
+| `c.ole.s` | ✅ Proven |
+| `c.ule.s` | ✅ Proven |
+| `bc1t` | ⬜ Implemented, not yet proven |
+| `bc1f` | ⬜ Implemented, not yet proven |
+
+</details>
+
+<details><summary><strong>Floating point, coprocessor 1, double precision</strong> — 0/24 proven</summary>
+
+| Instruction | Status |
+|---|---|
+| `ldc1` | ⬜ Implemented, not yet proven |
+| `sdc1` | ⬜ Implemented, not yet proven |
+| `add.d` | ⬜ Implemented, not yet proven |
+| `sub.d` | ⬜ Implemented, not yet proven |
+| `mul.d` | ⬜ Implemented, not yet proven |
+| `div.d` | ⬜ Implemented, not yet proven |
+| `mov.d` | ⬜ Implemented, not yet proven |
+| `cvt.d.s` | ⬜ Implemented, not yet proven |
+| `cvt.s.d` | ⬜ Implemented, not yet proven |
+| `cvt.d.w` | ⬜ Implemented, not yet proven |
+| `cvt.w.d` | ⬜ Implemented, not yet proven |
+| `sqrt.d` | ⬜ Implemented, not yet proven |
+| `abs.d` | ⬜ Implemented, not yet proven |
+| `neg.d` | ⬜ Implemented, not yet proven |
+| `c.eq.d` | ⬜ Implemented, not yet proven |
+| `c.lt.d` | ⬜ Implemented, not yet proven |
+| `c.le.d` | ⬜ Implemented, not yet proven |
+| `c.f.d` | ⬜ Implemented, not yet proven |
+| `c.un.d` | ⬜ Implemented, not yet proven |
+| `c.ueq.d` | ⬜ Implemented, not yet proven |
+| `c.olt.d` | ⬜ Implemented, not yet proven |
+| `c.ult.d` | ⬜ Implemented, not yet proven |
+| `c.ole.d` | ⬜ Implemented, not yet proven |
+| `c.ule.d` | ⬜ Implemented, not yet proven |
+
+</details>
+
 ## Equivalence corpus (`tests/equiv/`, `EquivHarness.lean`)
 
 The original plan was to unseal a real hand-written MIPS program, find a
@@ -188,15 +471,17 @@ Two gates decide whether a proof counts as "done" (see the parent project's
   (the spec file) is excluded from this target by design (see below) but is
   still built by `lake build Semantics` and still checked, theorem-by-theorem,
   by `lake comparator` above.
-- **Proof coverage**: 123 implemented instruction variants; 145 theorems
-  in `StepSpec.lean`, covering 85 of those 123 instructions with at least
-  one `_spec_raw`-style theorem (every proven theorem independently
-  verified to use only the three permitted axioms, or none). The remaining
-  38 — mostly floating-point, bit-manipulation, and immediate-trap
-  instructions that landed in later ISA-expansion passes — are implemented
-  and tested (`#guard`/`example` unit tests in their own module) but don't
-  yet have a formal `StepSpec.lean` theorem; that gap is tracked as
-  ongoing work, not hidden.
+- **Proof coverage**: 157 implemented instruction variants; 184 theorems
+  in `StepSpec.lean`, with a complete, `sorry`-free `_spec_raw` theorem for
+  120 of those 157 instructions (every proven theorem independently
+  verified to use only the three permitted axioms, or none). See
+  ["Instruction coverage and proof status"](#instruction-coverage-and-proof-status)
+  below for the full per-instruction table. The remaining 36 — mostly
+  double-precision floating point, branch-likely, and the memory-ordering/
+  cache-hint no-ops, all landed in the most recent ISA-expansion pass — are
+  implemented and tested (`#guard`/`example` unit tests in their own
+  module) but don't yet have a formal `StepSpec.lean` theorem; that gap is
+  tracked as ongoing work, not hidden.
 
 ### Open items: 4 documented `sorry`s
 
@@ -208,11 +493,14 @@ on, including what was tried and why it didn't close:
 1. **`step_preserves_zero_register`** — "`$zero` always reads `0` after any
    instruction," for every instruction kind at once. Closed substitute:
    `step_preserves_zero_register_nontrivial`, the same claim closed for
-   every instruction that has a `_spec_raw` theorem (around 70 of 123),
+   every instruction that has a `_spec_raw` theorem (114 of 120 proven
+   instructions dispatch cleanly; `lwl`/`lwr`/`swl`/`swr` and `mfc0`/`mtc0`
+   are proven but still pending here specifically, since each needs a
+   multi-branch `match`-split proof this closing pass didn't yet do),
    dispatching case-by-case and proving each via that instruction's own
    equation plus `writeReg_preserves_zero_slot`. Its own trailing case for
-   the remaining ~40 instructions (no `_spec_raw` theorem to dispatch to
-   yet) is the second, narrower documented `sorry`.
+   the remaining families (including `syscall` and the 36 not-yet-proven
+   instructions) is the second, narrower documented `sorry`.
 2. **`syscall1_spec`** — "syscall 1 prints `$a0`'s signed decimal value."
    Genuinely stalled on a chicken-and-egg: the hypothesis pinning the
    syscall number can't be used to reduce `step`'s private dispatch match
