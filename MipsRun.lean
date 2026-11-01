@@ -31,23 +31,42 @@ one JSON object to stdout and nothing else. Exit codes:
 - `2` — usage/IO error (unreadable file, etc.) — no JSON is printed (there is
   nothing to report: we never even got a `.asm` to try).
 
-## Known v1 limitation: `.data` is never materialized into `State.mem`
+## `.data` materialization (issue #12)
 
-Per the issue, this wraps `Asm.assemble`, `initialState textBase`, and `run`
-**only**. `Asm.assemble` places `.data` segment words into the same
-`Program` map as `.text` (word-addressed); `run`'s `lw`/`lb`/`sh`/etc.
-instructions read from `State.mem` instead, which `initialState` always
-starts empty. `DiffHarness.lean`'s `materialize` step exists specifically to
-copy `Program`'s `.data` entries into `State.mem` before running — intentionally
-not reused here, since this issue's contract pins the pipeline to exactly
-those three functions. The practical effect: a submitted program that loads
-from `.data` (e.g. `la $a0, msg` then `syscall 4` to print a string) will see
-all-zero memory at that address rather than the declared bytes. This is a
-real limitation for VibeCheck's demo UI (`.data`-based "hello world" idioms
-will not work as expected) and is flagged here rather than silently worked
-around, since fixing it (wiring in something like `materialize`) is outside
-this issue's stated scope.
+`Asm.assemble` places `.data` segment words into the same `Program` map as
+`.text` (word-addressed); `run`'s `lw`/`lb`/`sh`/etc. instructions read from
+`State.mem` instead, which `initialState` always starts empty. Without a
+materialization step, a submitted program that loads from `.data` (e.g.
+`la $a0, msg` then `syscall 4` to print a string) would see all-zero memory
+at that address rather than the declared bytes — this was flagged and
+deliberately left unfixed as the original v1 scope of this file (see
+issue #1), and is now fixed per issue #12: `materializeSpec` below (copied
+from `DiffHarness.lean`'s `materialize`, not imported, since `DiffHarness`
+and this file each define their own `main` and Lean can't combine two `main`
+definitions into one import graph — see `lakefile.toml`'s `defaultTargets`
+note) is run once, right after `assemble` and before `run`, exactly the way
+`DiffHarness` already does on every one of its 12/12 MARS-agreement corpus
+programs — so this is reusing an already-proven-correct code path, not new
+logic.
 -/
+
+/-- Copies every `.data` word `Asm.assemble` placed in `Program` into
+`State.mem`, one byte at a time, big-endian (matching `readMemWord`/
+`writeMemWord`'s convention elsewhere in this project). Byte-for-byte
+identical to `DiffHarness.lean`'s `materialize` (duplicated rather than
+imported — see the module docstring above for why); run once before `run`
+so `.data`-based programs (e.g. `la $a0, msg` + `syscall 4`) see the bytes
+they declared instead of zeroed memory. -/
+def materializeSpec (p : Program) (s0 : State) : State :=
+  p.fold (fun (acc : State) (addr word : W32) =>
+    let b0 : UInt8 := ((word >>> 24) &&& 0xff#32).toNat.toUInt8
+    let b1 : UInt8 := ((word >>> 16) &&& 0xff#32).toNat.toUInt8
+    let b2 : UInt8 := ((word >>> 8) &&& 0xff#32).toNat.toUInt8
+    let b3 : UInt8 := (word &&& 0xff#32).toNat.toUInt8
+    { acc with
+        mem := (((acc.mem.insert addr b0).insert (addr + 1#32) b1).insert
+                  (addr + 2#32) b2).insert (addr + 3#32) b3 })
+    s0
 
 /-- Convert a word to its full-width (zero-padded), lowercase hex digits,
 without the `0x` prefix. Used for `illegal_instruction`/`address_error`
@@ -174,7 +193,7 @@ def main (args : List String) : IO UInt32 := do
       return 1
     | .ok prog =>
       let maxSteps : Nat := 1000000
-      let result := run prog (initialState textBase) maxSteps
+      let result := run prog (materializeSpec prog (initialState textBase)) maxSteps
       IO.println (renderRunResult result)
       return 0
 
@@ -208,11 +227,32 @@ private def cleanExitSrc : String :=
 
 private def cleanExitResult : RunResult :=
   match assemble cleanExitSrc with
-  | .ok prog => run prog (initialState textBase) 1000000
+  | .ok prog => run prog (materializeSpec prog (initialState textBase)) 1000000
   | .error _ => .limitReached (initialState textBase) 0 -- unreachable: assembles fine
 
 #guard (match cleanExitResult with | .halted .exit _ _ => true | _ => false)
 #guard (match cleanExitResult with | .halted .exit s _ => s.out == "42" | _ => false)
+
+/-- Regression test for issue #12: a `.data`-declared string, loaded via
+`la` + `syscall 4` (print string), must read the declared bytes rather
+than `initialState`'s all-zero memory. Before `materializeSpec` was wired
+in, this produced an empty/garbage `out` instead of `"hi"`. -/
+private def dataSegmentSrc : String :=
+".data\n" ++
+"msg: .asciiz \"hi\"\n" ++
+".text\n" ++
+"    la   $a0, msg\n" ++
+"    li   $v0, 4\n" ++
+"    syscall\n" ++
+"    li   $v0, 10\n" ++
+"    syscall\n"
+
+private def dataSegmentResult : RunResult :=
+  match assemble dataSegmentSrc with
+  | .ok prog => run prog (materializeSpec prog (initialState textBase)) 1000000
+  | .error _ => .limitReached (initialState textBase) 0 -- unreachable: assembles fine
+
+#guard (match dataSegmentResult with | .halted .exit s _ => s.out == "hi" | _ => false)
 
 /-- Not MIPS at all — `assemble` must reject it with an error, not throw. -/
 private def notMipsSrc : String := "not mips at all"
@@ -229,7 +269,7 @@ private def illegalInstrSrc : String :=
 
 private def illegalInstrResult : RunResult :=
   match assemble illegalInstrSrc with
-  | .ok prog => run prog (initialState textBase) 1000000
+  | .ok prog => run prog (materializeSpec prog (initialState textBase)) 1000000
   | .error _ => .limitReached (initialState textBase) 0 -- unreachable: assembles fine
 
 #guard (match illegalInstrResult with | .halted (.illegalInstruction _) _ _ => true | _ => false)
@@ -257,7 +297,7 @@ private def infiniteLoopSrc : String :=
 
 private def infiniteLoopResult : RunResult :=
   match assemble infiniteLoopSrc with
-  | .ok prog => run prog (initialState textBase) 50
+  | .ok prog => run prog (materializeSpec prog (initialState textBase)) 50
   | .error _ => .halted .exit (initialState textBase) 0 -- unreachable: assembles fine
 
 #guard (match infiniteLoopResult with | .limitReached _ steps => steps == 50 | _ => false)
