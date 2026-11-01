@@ -32,6 +32,17 @@ Float32`), which implements IEEE-754 binary32 exactly, including
 operations propagate IEEE-754 Infinity/NaN naturally, the same precedent as
 integer `div`/`divu` by zero (SPEC-NOTES §9 item 2).
 
+`ll`/`sc` (v1.x addition; real MIPS32 atomic synchronization primitives, not
+part of the original v1 instruction set) are grounded directly in the real
+MIPS32 ISA (MD00086 Rev 2.50 §3.2), per `docs/spec/INSTRUCTION-REF.md`'s
+dedicated section. Real hardware's `LLbit` is cleared by `sc` and by several
+events this single-hart simulator has no notion of (context switches,
+multi-core cache-coherence traffic); the one documented simplification this
+model makes is that `State.llBit` is cleared by *any* store-class
+instruction (`sw`/`sh`/`swc1`; this model has no `sb`) executing after `ll`,
+which is the one part of the real semantics that is both architecturally
+mandated and observable on a single core.
+
 ## Design notes
 
 - `step` is total: every input `(p, s)` produces a `StepResult`, never `panic`
@@ -83,15 +94,17 @@ it). -/
 private def mkNext (orig result : State) : StepResult :=
   StepResult.next (advance orig result)
 
-/-- Whether `instr` is one of the six branch/jump instructions that
-schedule a delay-slot transfer (`beq`,`bne`,`blez`,`bgtz`,`j`,`jal`). Used
-to detect a branch/jump occurring itself inside another's delay slot (real
-MIPS32 leaves this architecturally discouraged/implementation-defined), so
-`execInstr` can halt with `HaltReason.branchInDelaySlot` instead of
-guessing. -/
+/-- Whether `instr` is one of the twelve branch/jump instructions that
+schedule a delay-slot transfer (`beq`,`bne`,`blez`,`bgtz`,`bltz`,`bgez`,
+`bltzal`,`bgezal`,`j`,`jal`,`jr`,`jalr`). Used to detect a branch/jump
+occurring itself inside another's delay slot (real MIPS32 leaves this
+architecturally discouraged/implementation-defined), so `execInstr` can
+halt with `HaltReason.branchInDelaySlot` instead of guessing. -/
 private def isBranchLike (instr : Instruction) : Bool :=
   match instr with
-  | .beq _ _ _ | .bne _ _ _ | .blez _ _ | .bgtz _ _ | .j _ | .jal _ => true
+  | .beq _ _ _ | .bne _ _ _ | .blez _ _ | .bgtz _ _
+  | .bltz _ _ | .bgez _ _ | .bltzal _ _ | .bgezal _ _
+  | .j _ | .jal _ | .jr _ | .jalr _ _ => true
   | _ => false
 
 /-- Signed-overflow predicate for `add`/`addi`, following INSTRUCTION-REF's
@@ -210,7 +223,7 @@ instruction word (needed only to report `illegalInstruction` for an unknown
 
 Before dispatching, checks whether `s` already has a branch/jump delay-slot
 transfer pending (`s.pendingBranch = some _`) *and* `instr` is itself one of
-the six branch/jump instructions (`isBranchLike`) — i.e. a branch/jump
+the eight branch/jump instructions (`isBranchLike`) — i.e. a branch/jump
 occurring in another's delay slot. Real MIPS32 leaves that
 architecturally discouraged/implementation-defined, so rather than pick an
 arbitrary behavior this halts with `HaltReason.branchInDelaySlot`, keeping
@@ -277,6 +290,19 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rt) >>> shamt.toNat))
   | .sra rd rt shamt =>
     mkNext s (writeReg s (regIdx rd) ((readReg s (regIdx rt)).sshiftRight shamt.toNat))
+  -- R-type variable shifts (MIPS32): the shift amount comes from `$rs`'s
+  -- low 5 bits (`extractLsb 4 0`), not a fixed `shamt` field \u2014 so e.g. a
+  -- shift-amount register holding 33 (0b100001) behaves identically to one
+  -- holding 1, per the real MIPS32 ISA (docs/spec/MIPS-COVERAGE-GAPS.md \u00a73.4).
+  | .sllv rd rt rs =>
+    let amt := ((readReg s (regIdx rs)).extractLsb 4 0).toNat
+    mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rt) <<< amt))
+  | .srlv rd rt rs =>
+    let amt := ((readReg s (regIdx rs)).extractLsb 4 0).toNat
+    mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rt) >>> amt))
+  | .srav rd rt rs =>
+    let amt := ((readReg s (regIdx rs)).extractLsb 4 0).toNat
+    mkNext s (writeReg s (regIdx rd) ((readReg s (regIdx rt)).sshiftRight amt))
   -- R-type mult/div
   | .mult rs rt =>
     let a := asSigned (readReg s (regIdx rs))
@@ -310,6 +336,17 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     mkNext s (writeReg s (regIdx rd) (BitVec.ofNat 32 (countLeadingOnes (readReg s (regIdx rs)))))
   | .clz rs rd =>
     mkNext s (writeReg s (regIdx rd) (BitVec.ofNat 32 (countLeadingZeros (readReg s (regIdx rs)))))
+  -- SPECIAL2 GPR multiply (MIPS32): `$rd` gets the low 32 bits of the
+  -- signed product, exactly the bits `mult`+`mflo` would leave in `lo`
+  -- (two's-complement multiplication's low bits don't depend on the sign
+  -- interpretation of the operands, so plain `W32` `*` already wraps
+  -- correctly here \u2014 no need to go through `asSigned`/`BitVec.ofInt` the
+  -- way `.mult` does). `hi`/`lo` are deliberately left **unchanged**: real
+  -- MIPS32 hardware leaves them unpredictable after `mul`, and this is the
+  -- simplest deterministic choice for this model (see `Instruction.mul`'s
+  -- docstring and `docs/spec/INSTRUCTION-REF.md`).
+  | .mul rs rt rd =>
+    mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rs) * readReg s (regIdx rt)))
   -- SPECIAL3 BSHFL sign-extend (MIPS32r2)
   | .seb rd rt =>
     mkNext s (writeReg s (regIdx rd) (signExtLowByte (readReg s (regIdx rt))))
@@ -353,7 +390,7 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     let addr := readReg s (regIdx rs) + signExt16 imm
     match writeMemWord s addr (readReg s (regIdx rt)) with
     | none => StepResult.halt (.addressError addr)
-    | some s' => mkNext s s'
+    | some s' => mkNext s { s' with llBit := false }
   | .lb rs rt imm =>
     let addr := readReg s (regIdx rs) + signExt16 imm
     match readMemByte s addr with
@@ -378,7 +415,32 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     let addr := readReg s (regIdx rs) + signExt16 imm
     match writeMemHalf s addr (readReg s (regIdx rt)) with
     | none => StepResult.halt (.addressError addr)
-    | some s' => mkNext s s'
+    | some s' => mkNext s { s' with llBit := false }
+  -- `ll`/`sc`: real MIPS32 atomic synchronization primitives (opcodes
+  -- 0x30/0x38; MD00086 Rev 2.50 §3.2). `ll` loads like `lw` and additionally
+  -- sets `llBit`; `sc` performs its store only if `llBit` is set (checked
+  -- *before* clearing it), writing success/failure back to `$rt`, and
+  -- always clears `llBit` afterward -- see `Types.lean`'s `llBit` docstring
+  -- for this model's single-hart simplification.
+  | .ll rs rt imm =>
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    match readMemWord s addr with
+    | none => StepResult.halt (.addressError addr)
+    | some v => mkNext s { (writeReg s (regIdx rt) v) with llBit := true }
+  | .sc rs rt imm =>
+    -- The effective-address alignment check happens unconditionally, exactly
+    -- as for `sw` (real MIPS32 computes/validates the memory reference
+    -- regardless of whether `LLbit` ends up permitting the store); only
+    -- *committing* `writeMemWord`'s result is conditional on `s.llBit`,
+    -- which is checked before it is cleared below.
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    match writeMemWord s addr (readReg s (regIdx rt)) with
+    | none => StepResult.halt (.addressError addr)
+    | some stored =>
+      if s.llBit then
+        mkNext s { (writeReg stored (regIdx rt) 1#32) with llBit := false }
+      else
+        mkNext s { (writeReg s (regIdx rt) 0#32) with llBit := false }
   -- Control flow: one architectural delay slot per branch/jump, matching
   -- real MIPS32 (SPEC-NOTES §9 item 1 — not MARS's default no-delay-slot
   -- config; INSTRUCTION-REF Global rule 3). A taken branch/jump never jumps
@@ -414,6 +476,39 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
       StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
     else
       mkNext s s
+  -- REGIMM zero-comparison branches (opcode 0x01; MD00086 Rev 2.50 \u00a73.2,
+  -- Table 3-2). `bltz`/`bgez` are plain conditional branches, same shape as
+  -- `blez`/`bgtz` above. `bltzal`/`bgezal` additionally link `$ra` to
+  -- `pcNext + 4` (`pc + 8`, past the delay slot, same convention as `jal`)
+  -- -- real MIPS32 performs this link **unconditionally**, on every
+  -- execution of the instruction, regardless of whether the branch itself
+  -- is taken; only the branch transfer is conditional.
+  | .bltz rs imm =>
+    let pcNext := s.pc + 4#32
+    if asSigned (readReg s (regIdx rs)) < 0 then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      mkNext s s
+  | .bgez rs imm =>
+    let pcNext := s.pc + 4#32
+    if 0 ≤ asSigned (readReg s (regIdx rs)) then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      mkNext s s
+  | .bltzal rs imm =>
+    let pcNext := s.pc + 4#32
+    let s' := writeReg s 31 (pcNext + 4#32)
+    if asSigned (readReg s (regIdx rs)) < 0 then
+      StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      mkNext s s'
+  | .bgezal rs imm =>
+    let pcNext := s.pc + 4#32
+    let s' := writeReg s 31 (pcNext + 4#32)
+    if 0 ≤ asSigned (readReg s (regIdx rs)) then
+      StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      mkNext s s'
   | .j target =>
     let pcNext := s.pc + 4#32
     StepResult.next
@@ -428,6 +523,25 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     let s' := writeReg s 31 linkVal
     StepResult.next
       { s' with pc := pcNext, pendingBranch := some ((pcNext &&& 0xf0000000#32) ||| (target <<< 2)) }
+  -- Register-indirect jump/call (real MIPS32 `jr`/`jalr`, MD00086 §3.2):
+  -- same one-instruction delay-slot scheduling as `j`/`jal` above, but the
+  -- target is the raw 32-bit value read from `$rs` instead of composed from
+  -- the 26-bit `target` field. A misaligned `$rs` value is not special-cased
+  -- here: it becomes an ordinary `addressError` halt the next time `step`
+  -- tries to fetch from it (`fetchWord`'s existing alignment check), exactly
+  -- like any other misaligned `pc`.
+  | .jr rs =>
+    let pcNext := s.pc + 4#32
+    StepResult.next { s with pc := pcNext, pendingBranch := some (readReg s (regIdx rs)) }
+  | .jalr rs rd =>
+    -- `$rd` links to `pc + 8` — past the delay slot — the same `jal` link-value
+    -- convention as above. The link target is read before `$rd` is written,
+    -- so `jalr $rs, $rs` (rd = rs) still reads the pre-write `$rs` value.
+    let pcNext := s.pc + 4#32
+    let linkVal := pcNext + 4#32
+    let target := readReg s (regIdx rs)
+    let s' := writeReg s (regIdx rd) linkVal
+    StepResult.next { s' with pc := pcNext, pendingBranch := some target }
   -- Coprocessor 1 (FPU), single-precision subset (docs/spec/INSTRUCTION-REF.md
   -- floating-point section). `mtc1`/`mfc1`/`lwc1`/`swc1` move/transfer raw
   -- bit patterns with no numeric conversion; arithmetic/compare/convert go
@@ -445,7 +559,7 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     let addr := readReg s (regIdx rs) + signExt16 imm
     match writeMemWord s addr (readFpReg s (regIdx ft)) with
     | none => StepResult.halt (.addressError addr)
-    | some s' => mkNext s s'
+    | some s' => mkNext s { s' with llBit := false }
   | .addS fd fs ft =>
     let v := (floatOfBits (readFpReg s (regIdx fs))).add (floatOfBits (readFpReg s (regIdx ft)))
     mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat v))
@@ -662,6 +776,11 @@ private def nextPendingEq (r : StepResult) (pb : Option W32) : Bool :=
   | .next s => s.pendingBranch == pb
   | .halt _ => false
 
+private def nextLlBitEq (r : StepResult) (b : Bool) : Bool :=
+  match r with
+  | .next s => s.llBit == b
+  | .halt _ => false
+
 -- `sll $zero, $zero, 0` — the canonical MIPS encoding of `nop` (word
 -- `0x00000000`) — used as an inert delay-slot filler instruction below.
 private def nopInstr : Instruction := .sll 0#32 0#32 0#32
@@ -809,6 +928,18 @@ private def seededHiLo : State := { regs0 with hi := 0xdeadbeef#32, lo := 0xcafe
 -- divu: zero divisor unchanged, no halt
 #guard isNext (step (prog1 (.divu 8#32 9#32)) (setRegs seededHiLo [(8, 10#32), (9, 0#32)]))
 
+-- ### mul (MIPS32 SPECIAL2 GPR multiply; docs/spec/MIPS-COVERAGE-GAPS.md §3.5)
+-- `mul`'s result must match the low 32 bits `mult`+`mflo` would produce, for
+-- the same operand pairs already exercised above -- including one whose
+-- 64-bit product overflows 32 bits signed, confirming the wraparound -- and
+-- `mul` must leave `hi`/`lo` unchanged (the pinned dialect choice).
+#guard nextRegEq (step (prog1 (.mul 8#32 9#32 10#32)) (setRegs regs0 [(8, 6#32), (9, 7#32)])) 10 42#32  -- matches mult/mflo's lo above (0#32 42#32)
+#guard nextRegEq (step (prog1 (.mul 8#32 9#32 10#32)) (setRegs regs0 [(8, 0x88ca6c00#32), (9, 0x88ca6c00#32)]))
+  10 0x9d900000#32  -- matches mult/mflo's lo above (overflows 32-bit signed: hi was nonzero, 0x3782dace)
+#guard nextHiLoEq (step (prog1 (.mul 8#32 9#32 10#32)) (setRegs seededHiLo [(8, 6#32), (9, 7#32)]))
+  0xdeadbeef#32 0xcafef00d#32  -- hi/lo unchanged by mul
+#guard nextRegEq (step (prog1 (.mul 8#32 9#32 10#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 2#32)])) 10 0xfffffffe#32  -- (-1) * 2 = -2, wraps
+
 -- ### clo/clz/movn/movz/seb/seh (MIPS32/MIPS32r2 additions; see
 -- docs/spec/INSTRUCTION-REF.md)
 
@@ -827,6 +958,33 @@ private def seededHiLo : State := { regs0 with hi := 0xdeadbeef#32, lo := 0xcafe
 -- seh: sign-extends only the low halfword of $rt
 #guard nextRegEq (step (prog1 (.seh 10#32 8#32)) (setRegs regs0 [(8, 0x1234ffff#32)])) 10 0xffffffff#32
 #guard nextRegEq (step (prog1 (.seh 10#32 8#32)) (setRegs regs0 [(8, 0x12347fff#32)])) 10 0x00007fff#32
+
+-- ### sllv/srlv/srav (MIPS32 variable shifts; docs/spec/MIPS-COVERAGE-GAPS.md
+-- §3.4): the shift amount is `$rs`'s low 5 bits, not a `shamt` field --
+-- these mirror the sll/srl/sra shamt-0/31 cases above but via a register,
+-- and a shift-amount register holding 33 (0x21, i.e. 32 + 1) must behave
+-- identically to one holding 1 (the masking test).
+#guard nextRegEq (step (prog1 (.sllv 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x12345678#32), (9, 0#32)]))
+  10 0x12345678#32
+#guard nextRegEq (step (prog1 (.sllv 10#32 8#32 9#32)) (setRegs regs0 [(8, 1#32), (9, 31#32)]))
+  10 0x80000000#32
+#guard nextRegEq (step (prog1 (.srlv 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 31#32)]))
+  10 1#32
+#guard nextRegEq (step (prog1 (.srav 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 31#32)]))
+  10 0xffffffff#32
+-- masking: shift-amount register holding 33 behaves identically to holding 1
+#guard nextRegEq (step (prog1 (.sllv 10#32 8#32 9#32)) (setRegs regs0 [(8, 1#32), (9, 33#32)]))
+  10 2#32
+#guard nextRegEq (step (prog1 (.sllv 10#32 8#32 9#32)) (setRegs regs0 [(8, 1#32), (9, 1#32)]))
+  10 2#32
+#guard nextRegEq (step (prog1 (.srlv 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 33#32)]))
+  10 0x40000000#32
+#guard nextRegEq (step (prog1 (.srlv 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 1#32)]))
+  10 0x40000000#32
+#guard nextRegEq (step (prog1 (.srav 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 33#32)]))
+  10 0xc0000000#32
+#guard nextRegEq (step (prog1 (.srav 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 1#32)]))
+  10 0xc0000000#32
 
 -- ### addi overflow trap vs addiu wrap; andi/ori/xori high-imm-bits; lui
 
@@ -872,6 +1030,63 @@ private def memTestState : State :=
 #guard (stepState (prog1 (.sw 8#32 9#32 0xfffc#32)) (setRegs regs0 [(8, 0x10010010#32), (9, 0x2a#32)])).bind
         (fun s' => readMemWord s' 0x1001000c#32) = some 0x2a#32
 
+-- ### ll/sc: load-linked/store-conditional (real MIPS32 atomic
+-- synchronization primitives; see `Types.lean`'s `llBit` docstring for the
+-- single-hart simplification). Same addressing/alignment as lw/sw.
+
+/-- Step through `p` from `s` exactly `n` times, threading the state;
+`none` if any intermediate step halts. Used below to exercise `ll`/`sc`
+multi-instruction sequences (ordinary fallthrough, no delay slot involved). -/
+private def stepN (p : Program) : Nat → State → Option State
+  | 0, s => some s
+  | n + 1, s => (stepState p s).bind (stepN p n)
+
+-- `ll`: loads like `lw` and sets `llBit`.
+#guard nextRegEq (step (prog1 (.ll 8#32 9#32 4#32)) memTestState) 9 0x8001ff00#32
+#guard nextLlBitEq (step (prog1 (.ll 8#32 9#32 4#32)) memTestState) true
+-- misaligned ll/sc → addressError, same as lw/sw
+#guard isHaltAddr (step (prog1 (.ll 8#32 9#32 1#32)) (setRegs regs0 [(8, 0x10010000#32)])) 0x10010001#32
+#guard isHaltAddr (step (prog1 (.sc 8#32 9#32 1#32)) (setRegs regs0 [(8, 0x10010000#32)])) 0x10010001#32
+
+-- `sc` right after a matching `ll` succeeds: writes 1 to `$rt` and the store
+-- commits.
+private def llscAddr : W32 := 0x10010000#32
+private def llscSuccessProg : Program := buildProg textBase [.ll 8#32 9#32 0#32, .sc 8#32 10#32 0#32]
+private def llscSuccessState : State := setRegs regs0 [(8, llscAddr), (10, 0xdeadbeef#32)]
+#guard (stepN llscSuccessProg 2 llscSuccessState).bind (fun s => readMemWord s llscAddr)
+  = some 0xdeadbeef#32
+#guard (stepN llscSuccessProg 2 llscSuccessState).bind (fun s => some (readReg s 10))
+  = some 1#32
+#guard (stepN llscSuccessProg 2 llscSuccessState).bind (fun s => some s.llBit) = some false
+
+-- `sc` after an intervening `sw` to *any* address (not just the `ll`'s own
+-- address) fails: writes 0, the store does not commit, memory unchanged.
+private def llscOtherAddr : W32 := 0x20000000#32
+private def llscFailProg : Program :=
+  buildProg textBase [.ll 8#32 9#32 0#32, .sw 11#32 12#32 0#32, .sc 8#32 10#32 0#32]
+private def llscFailState : State :=
+  setRegs regs0 [(8, llscAddr), (10, 0xdeadbeef#32), (11, llscOtherAddr), (12, 0x5555#32)]
+#guard (stepN llscFailProg 3 llscFailState).bind (fun s => some (readReg s 10)) = some 0#32
+#guard (stepN llscFailProg 3 llscFailState).bind (fun s => some s.llBit) = some false
+-- the `ll`'s own address was never written by `sc` (it reads back as the
+-- zero-fill default, not the attempted `0xdeadbeef` store)
+#guard (stepN llscFailProg 3 llscFailState).bind (fun s => readMemWord s llscAddr) = some 0#32
+-- the intervening `sw` itself did commit, to its own (different) address
+#guard (stepN llscFailProg 3 llscFailState).bind (fun s => readMemWord s llscOtherAddr)
+  = some 0x5555#32
+
+-- `sc` always clears `llBit`, even on success, so a second immediate `sc`
+-- (no intervening `ll`) fails: writes 0 and does not re-commit a new value.
+private def llscDoubleProg : Program :=
+  buildProg textBase [.ll 8#32 9#32 0#32, .sc 8#32 10#32 0#32, .sc 8#32 10#32 0#32]
+private def llscDoubleState : State := setRegs regs0 [(8, llscAddr), (10, 0xaaaa5555#32)]
+#guard (stepN llscDoubleProg 3 llscDoubleState).bind (fun s => some (readReg s 10)) = some 0#32
+#guard (stepN llscDoubleProg 3 llscDoubleState).bind (fun s => some s.llBit) = some false
+-- memory still holds the first `sc`'s committed value, not the second
+-- (failed) attempt's
+#guard (stepN llscDoubleProg 3 llscDoubleState).bind (fun s => readMemWord s llscAddr)
+  = some 0xaaaa5555#32
+
 -- ### beq/bne/blez/bgtz: taken schedules a `pendingBranch` and falls
 -- through to the delay slot; not-taken behaves exactly as before (SPEC-NOTES
 -- §9 item 1). `stepThroughDelaySlot` executes the branch *and* an inert
@@ -906,6 +1121,47 @@ private def memTestState : State :=
 #guard nextPcEq (step (prog1 (.bgtz 8#32 2#32)) (setRegs regs0 [(8, 0#32)]))  -- 0 > 0 is false
   (textBase + 4#32)
 
+-- ### bltz/bgez/bltzal/bgezal (REGIMM, opcode 0x01): same `pendingBranch`
+-- delay-slot scheduling as blez/bgtz, taken/not-taken for each; the `al`
+-- variants additionally link `$ra` unconditionally.
+
+-- bltz: taken on a negative $rs, not taken on zero/positive
+#guard stepThroughDelaySlot textBase (.bltz 8#32 2#32) (setRegs regs0 [(8, 0xfffffffb#32)])  -- -5 < 0
+  = some (textBase + 4#32 + 8#32)
+#guard nextPcEq (step (prog1 (.bltz 8#32 2#32)) (setRegs regs0 [(8, 0#32)]))  -- 0 < 0 is false
+  (textBase + 4#32)
+#guard nextPcEq (step (prog1 (.bltz 8#32 2#32)) (setRegs regs0 [(8, 5#32)]))  -- 5 < 0 is false
+  (textBase + 4#32)
+
+-- bgez: taken on zero/positive $rs, not taken on negative
+#guard stepThroughDelaySlot textBase (.bgez 8#32 2#32) (setRegs regs0 [(8, 0#32)])  -- 0 >= 0
+  = some (textBase + 4#32 + 8#32)
+#guard stepThroughDelaySlot textBase (.bgez 8#32 2#32) (setRegs regs0 [(8, 5#32)])  -- 5 >= 0
+  = some (textBase + 4#32 + 8#32)
+#guard nextPcEq (step (prog1 (.bgez 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)]))  -- -5 >= 0 is false
+  (textBase + 4#32)
+
+-- bltzal: link into $ra is unconditional (pc + 8, past the delay slot),
+-- whether or not the branch itself is taken.
+#guard nextRegEq (step (prog1 (.bltzal 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)])) 31
+  (textBase + 8#32)  -- taken: -5 < 0
+#guard nextRegEq (step (prog1 (.bltzal 8#32 2#32)) (setRegs regs0 [(8, 5#32)])) 31
+  (textBase + 8#32)  -- not taken: 5 < 0 is false, $ra still linked
+#guard stepThroughDelaySlot textBase (.bltzal 8#32 2#32) (setRegs regs0 [(8, 0xfffffffb#32)])
+  = some (textBase + 4#32 + 8#32)
+#guard nextPcEq (step (prog1 (.bltzal 8#32 2#32)) (setRegs regs0 [(8, 5#32)]))
+  (textBase + 4#32)
+
+-- bgezal: same unconditional-link convention as bltzal, >= 0 condition.
+#guard nextRegEq (step (prog1 (.bgezal 8#32 2#32)) (setRegs regs0 [(8, 5#32)])) 31
+  (textBase + 8#32)  -- taken: 5 >= 0
+#guard nextRegEq (step (prog1 (.bgezal 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)])) 31
+  (textBase + 8#32)  -- not taken: -5 >= 0 is false, $ra still linked
+#guard stepThroughDelaySlot textBase (.bgezal 8#32 2#32) (setRegs regs0 [(8, 5#32)])
+  = some (textBase + 4#32 + 8#32)
+#guard nextPcEq (step (prog1 (.bgezal 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)]))
+  (textBase + 4#32)
+
 -- ### j/jal: exact targets including top-4-bit preservation from `pc_next`;
 -- jal $ra links to `pc + 8` (past the delay slot), not `pc + 4`
 
@@ -919,6 +1175,50 @@ private def crossRegionState : State := { regs0 with pc := 0x90400000#32 }
 -- the delay slot.
 #guard nextRegEq (step (progAt 0x90400000#32 (.jal 0x1000#32)) crossRegionState) 31 0x90400008#32
 #guard stepThroughDelaySlot 0x90400000#32 (.jal 0x1000#32) crossRegionState = some 0x90004000#32
+
+-- ### jr/jalr: register-indirect jump/call, same one-delay-slot scheduling
+-- as j/jal, but the target comes from a register read. `jr $ra` is the
+-- canonical function-return idiom; `jalr $rd, $rs` additionally links `$rd`
+-- to `pc + 8`, exactly like `jal`'s link-value convention.
+
+-- `jr`'s own step falls through to the delay slot, scheduling `$rs`'s raw
+-- value as the target (no top-4-bit composition, unlike `j`).
+#guard (match step (progAt 0x90400000#32 (.jr 8#32)) (setRegs crossRegionState [(8, 0x80020000#32)]) with
+        | .next s => s.pc == 0x90400004#32 && s.pendingBranch == some 0x80020000#32
+        | .halt _ => false)
+#guard stepThroughDelaySlot 0x90400000#32 (.jr 8#32) (setRegs crossRegionState [(8, 0x80020000#32)])
+  = some 0x80020000#32
+-- the classic `jr $ra` function-return idiom: landing on whatever address
+-- was previously linked into `$ra`.
+#guard stepThroughDelaySlot textBase (.jr 31#32) (setRegs regs0 [(31, 0x00400040#32)])
+  = some 0x00400040#32
+
+-- `jalr $rd, $rs`: `$rd` is `pc + 8` (past the delay slot, same convention
+-- as `jal`), and the target lands the same way as `jr` after the delay slot.
+#guard nextRegEq (step (progAt 0x90400000#32 (.jalr 8#32 9#32)) (setRegs crossRegionState [(8, 0x80020000#32)]))
+  9 0x90400008#32
+#guard stepThroughDelaySlot 0x90400000#32 (.jalr 8#32 9#32) (setRegs crossRegionState [(8, 0x80020000#32)])
+  = some 0x80020000#32
+-- `jalr $t9, $t9` (rd = rs): the link value overwrites `$rs` only *after*
+-- its pre-write value has been captured as the jump target.
+#guard nextRegEq (step (progAt 0x90400000#32 (.jalr 9#32 9#32)) (setRegs crossRegionState [(9, 0x80020000#32)]))
+  9 0x90400008#32
+#guard stepThroughDelaySlot 0x90400000#32 (.jalr 9#32 9#32) (setRegs crossRegionState [(9, 0x80020000#32)])
+  = some 0x80020000#32
+
+-- a `jr` target that isn't 4-byte-aligned is not special-cased: the branch
+-- step itself still schedules it as an ordinary `pendingBranch`, and the
+-- misalignment only surfaces as the existing `addressError` halt on the
+-- *next* fetch attempt, once `pc` actually becomes that value.
+#guard stepThroughDelaySlot 0x90400000#32 (.jr 8#32) (setRegs crossRegionState [(8, 0x80020001#32)])
+  = some 0x80020001#32
+#guard (match stepState (buildProg 0x90400000#32 [.jr 8#32, nopInstr])
+          (setRegs crossRegionState [(8, 0x80020001#32)]) with
+        | some s1 =>
+          (match stepState (buildProg 0x90400000#32 [.jr 8#32, nopInstr]) s1 with
+           | some s2 => isHaltAddr (step (buildProg 0x90400000#32 [.jr 8#32, nopInstr]) s2) 0x80020001#32
+           | none => false)
+        | none => false)
 
 -- ### branch/jump in a delay slot: diagnosable halt, not arbitrary behavior
 
@@ -944,6 +1244,14 @@ private def crossRegionState : State := { regs0 with pc := 0x90400000#32 }
           (setRegs regs0 [(8, 5#32), (9, 5#32)]) with
         | some s1 =>
           isHaltBranchInDelaySlot (step (buildProg textBase [.beq 8#32 9#32 1#32, .j 0x1000#32]) s1)
+        | none => false)
+-- `bltz` right after a taken `beq` halts the same way (confirms the REGIMM
+-- branches are included in `isBranchLike`).
+#guard (match stepState (buildProg textBase [.beq 8#32 9#32 1#32, .bltz 8#32 0#32])
+          (setRegs regs0 [(8, 5#32), (9, 5#32)]) with
+        | some s1 =>
+          isHaltBranchInDelaySlot
+            (step (buildProg textBase [.beq 8#32 9#32 1#32, .bltz 8#32 0#32]) s1)
         | none => false)
 
 -- ### syscalls

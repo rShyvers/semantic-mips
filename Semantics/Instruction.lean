@@ -20,12 +20,26 @@ Field-shape summary (see each constructor's docstring for details):
   movn movz` — `movn`/`movz` share the exact add/sub field shape but write
   `$rd` only conditionally on `$rt`.
 - R-type shift (`rd rt shamt`): `sll srl sra` — note `rs` is unused/ignored.
+- R-type variable shift (`rd rt rs`), MIPS32 (opcode 0, funct 0x04/0x06/0x07):
+  `sllv srlv srav` — the shift amount is the *register* `$rs`'s low 5 bits
+  (masked at execution time by `Step`), not a fixed `shamt` field; `shamt`
+  itself is unused/fixed 0 in the encoding (v1.x addition; see
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.4).
 - R-type mult/div (`rs rt`): `mult multu div divu` — `rd`/`shamt` unused.
 - R-type move (`rd`): `mflo mfhi` — `rs`/`rt`/`shamt` unused.
+- R-type jump register (`rs`): `jr` — `rt`/`rd`/`shamt` unused. (`rs rd`): `jalr`
+  — `rt`/`shamt` unused. Real MIPS32 register-indirect jump/call (MD00086
+  §3.2); like `j`/`jal`, these get the standard one-instruction delay slot
+  via `pendingBranch`, but the target comes from a register read instead of
+  the 26-bit `target` field.
 - R-type bit-count (`rs rd`), SPECIAL2 (opcode 0x1c): `clo clz` — the raw 32-bit
   encoding's `rt` field duplicates `rd` (a real MIPS32 hardware quirk; see each
   constructor's docstring), so it is not modeled as a separate `Instruction`
   field.
+- R-type GPR multiply (`rs rt rd`), SPECIAL2 (opcode 0x1c, funct 0x02): `mul`
+  — same `rs rt rd` field shape as `add`, but SPECIAL2-opcoded like `clo`/
+  `clz`; writes the low 32 bits of the signed product directly to `$rd`
+  (v1.x addition; see `docs/spec/MIPS-COVERAGE-GAPS.md` §3.5).
 - R-type sign-extend (`rd rt`), SPECIAL3 BSHFL (opcode 0x1f, funct 0x20):
   `seb seh` — `rs` unused/fixed 0; distinguished from each other (and from
   other BSHFL sub-ops, none of which are in scope here) by the
@@ -35,6 +49,11 @@ Field-shape summary (see each constructor's docstring for details):
 - I-type load/store (`rs rt imm`): `lw sw lb lbu lh lhu sh` — `rs` is the base
   register, `rt` is the destination (loads) or source (stores) register,
   `imm` is the raw 16-bit offset field (not yet sign-extended).
+- I-type load-linked/store-conditional (`rs rt imm`), same field shape as
+  `lw`/`sw`: `ll sc` — real MIPS32 atomic synchronization primitives (opcodes
+  0x30/0x38); not part of the original v1 instruction set, added as the
+  `State.llBit` single-hart model (see `Types.lean`'s `llBit` docstring and
+  `docs/spec/INSTRUCTION-REF.md`).
 - I-type branch reg/reg (`rs rt imm`): `beq bne`.
 - I-type branch reg-only (`rs imm`): `blez bgtz` — `rt` is unused/fixed 0.
 - J-type (`target`): `j jal` — raw 26-bit target field (not yet shifted/combined
@@ -124,6 +143,19 @@ inductive Instruction where
   | srl  (rd rt shamt : W32)
   /-- `$rd = $rt >> shamt`, arithmetic/sign-fill (opcode 0, funct 0x03). -/
   | sra  (rd rt shamt : W32)
+  -- R-type variable shift (opcode 0; shamt field unused/fixed 0). MIPS32
+  -- v1.x addition: compilers emit these (not `sll`/`srl`/`sra`) whenever
+  -- the shift amount is a runtime value rather than a compile-time
+  -- constant (`docs/spec/MIPS-COVERAGE-GAPS.md` §3.4).
+  /-- `$rd = $rt << ($rs & 0x1f)`, logical, shift amount from a register's
+  low 5 bits (opcode 0, funct 0x04). MIPS32. -/
+  | sllv (rd rt rs : W32)
+  /-- `$rd = $rt >> ($rs & 0x1f)`, logical/zero-fill, shift amount from a
+  register's low 5 bits (opcode 0, funct 0x06). MIPS32. -/
+  | srlv (rd rt rs : W32)
+  /-- `$rd = $rt >> ($rs & 0x1f)`, arithmetic/sign-fill, shift amount from a
+  register's low 5 bits (opcode 0, funct 0x07). MIPS32. -/
+  | srav (rd rt rs : W32)
   -- R-type mult/div (rd, shamt unused)
   /-- `{hi,lo} = $rs * $rt`, signed 64-bit (opcode 0, funct 0x18). -/
   | mult   (rs rt : W32)
@@ -138,6 +170,21 @@ inductive Instruction where
   | mflo (rd : W32)
   /-- `$rd = hi` (opcode 0, funct 0x10). -/
   | mfhi (rd : W32)
+  -- R-type jump register (rt, rd/shamt unused as noted per-constructor). Real
+  -- MIPS32 register-indirect jump/call family — shares opcode 0 (SPECIAL)
+  -- with the R-type arithmetic instructions above, distinguished by funct.
+  /-- `PC = $rs`, after the usual one-instruction delay slot (opcode 0,
+  funct 0x08). Real MIPS32 register-indirect jump (MD00086 §3.2); `rt`/`rd`/
+  `shamt` are 0 in the real encoding and carry no information. The canonical
+  function-return idiom is `jr $ra`. -/
+  | jr (rs : W32)
+  /-- `$rd = PC_next + 4` (the address of the instruction *after* the delay
+  slot — same `pc + 8` link-value convention as `jal`); `PC = $rs`, after
+  the usual one-instruction delay slot (opcode 0, funct 0x09). Real MIPS32
+  register-indirect call (MD00086 §3.2), used for indirect procedure calls
+  and function pointers (e.g. `jalr $t9`); `rt`/`shamt` are 0 in the real
+  encoding and carry no information. -/
+  | jalr (rs rd : W32)
   -- R-type SPECIAL2 bit-count (MIPS32). The real 32-bit encoding's `rt` field
   -- (bits 20..16) duplicates `rd` (bits 15..11) "because both fields hold the
   -- same register number" per the ISA; hardware does not read `rt` for these
@@ -149,6 +196,14 @@ inductive Instruction where
   /-- `$rd = ` the number of leading zero bits in `$rs`, counted from the MSB
   (32 if `$rs` is all-zero) (SPECIAL2 opcode 0x1c, funct 0x20). MIPS32. -/
   | clz (rs rd : W32)
+  -- R-type GPR multiply, SPECIAL2 (MIPS32). Unlike `clo`/`clz`, this is a
+  -- plain `rs rt rd` shape with no duplicated-field quirk.
+  /-- `$rd = ` low 32 bits of `$rs * $rt`, signed (SPECIAL2 opcode 0x1c,
+  funct 0x02). `hi`/`lo` are left **unchanged** by this dialect (real
+  MIPS32 hardware leaves them architecturally unpredictable after `mul`;
+  see `docs/spec/INSTRUCTION-REF.md` for the documented dialect choice).
+  MIPS32. -/
+  | mul (rs rt rd : W32)
   -- R-type SPECIAL3 BSHFL sign-extend (MIPS32r2). `rs` is unused/fixed 0;
   -- `funct` is 0x20 for the whole BSHFL sub-op family, and the shamt-position
   -- 5-bit sub-field (not a real shift amount here) selects which one.
@@ -191,6 +246,19 @@ inductive Instruction where
   | lhu (rs rt imm : W32)
   /-- `MEM16[$rs + offset] = $rt[15:0]`, halfword-aligned (opcode 0x29). -/
   | sh  (rs rt imm : W32)
+  /-- `$rt = MEM32[$rs + offset]`, word-aligned, and sets `State.llBit`
+  (real MIPS32 "Load Linked Word", opcode 0x30; MD00086 Rev 2.50 §3.2,
+  Table 3-4). Identical addressing/alignment to `lw`; see
+  `docs/spec/INSTRUCTION-REF.md` for the paired `sc` semantics and this
+  model's single-hart `llBit` simplification. -/
+  | ll  (rs rt imm : W32)
+  /-- Conditionally `MEM32[$rs + offset] = $rt`, word-aligned, based on
+  `State.llBit`: if set, performs the store and writes `1` to `$rt`;
+  otherwise the store does not happen and `0` is written to `$rt`. Either
+  way, clears `llBit` (real MIPS32 "Store Conditional Word", opcode 0x38;
+  MD00086 Rev 2.50 §3.2, Table 3-4). Identical addressing/alignment to
+  `sw`. -/
+  | sc  (rs rt imm : W32)
   -- I-type branch reg/reg
   /-- `if $rs == $rt then PC = PC_next + (sext16(imm) << 2)` (opcode 0x04). -/
   | beq (rs rt imm : W32)
@@ -201,6 +269,33 @@ inductive Instruction where
   | blez (rs imm : W32)
   /-- `if $rs > 0 then PC = PC_next + (sext16(imm) << 2)` (opcode 0x07). -/
   | bgtz (rs imm : W32)
+  -- I-type REGIMM zero-comparison branches (MIPS32 ISA; opcode 0x01). All
+  -- four share this one opcode; the `rt` field (not a separate opcode)
+  -- selects which instruction it is (ground truth: MD00086 Rev 2.50 §3.2,
+  -- Table 3-2, p. 25; see docs/spec/INSTRUCTION-REF.md for the full
+  -- citation). Same `rs, offset` field shape as `blez`/`bgtz`.
+  /-- `if $rs < 0 then PC = PC_next + (sext16(imm) << 2)`, signed
+  (opcode 0x01, `rt` field = 0x00 `BLTZ`). -/
+  | bltz (rs imm : W32)
+  /-- `if $rs >= 0 then PC = PC_next + (sext16(imm) << 2)`, signed
+  (opcode 0x01, `rt` field = 0x01 `BGEZ`). -/
+  | bgez (rs imm : W32)
+  /-- `$ra = PC_next + 4` unconditionally, **then** `if $rs < 0 then
+  PC = PC_next + (sext16(imm) << 2)`, signed (opcode 0x01, `rt` field = 0x10
+  `BLTZAL`). Real MIPS32: the link into `$ra` always happens (it is not
+  conditional on the branch being taken), same convention as `jal`'s link —
+  see docs/spec/INSTRUCTION-REF.md for the citation. The real ISA
+  pseudocode links `$ra` one cycle before testing `$rs`, so `rs = $ra` (31)
+  is architecturally UNPREDICTABLE (the test could observe either the old
+  or the freshly-linked value); `Step.lean` resolves this by testing the
+  pre-link value of `$rs`, a documented, defensible choice for an
+  explicitly-unspecified case rather than an oversight. -/
+  | bltzal (rs imm : W32)
+  /-- `$ra = PC_next + 4` unconditionally, **then** `if $rs >= 0 then
+  PC = PC_next + (sext16(imm) << 2)`, signed (opcode 0x01, `rt` field = 0x11
+  `BGEZAL`). Same unconditional-link convention and `rs = $ra`
+  UNPREDICTABLE-case resolution as `bltzal`. -/
+  | bgezal (rs imm : W32)
   -- J-type
   /-- `PC = (PC_next & 0xF0000000) | (target << 2)` (opcode 0x02). -/
   | j   (target : W32)
@@ -343,12 +438,17 @@ def decode (w : W32) : Option Instruction :=
     | 0x00 => some (.sll rd rt shamt)
     | 0x02 => some (.srl rd rt shamt)
     | 0x03 => some (.sra rd rt shamt)
+    | 0x04 => some (.sllv rd rt rs)
+    | 0x06 => some (.srlv rd rt rs)
+    | 0x07 => some (.srav rd rt rs)
     | 0x18 => some (.mult rs rt)
     | 0x19 => some (.multu rs rt)
     | 0x1a => some (.div rs rt)
     | 0x1b => some (.divu rs rt)
     | 0x12 => some (.mflo rd)
     | 0x10 => some (.mfhi rd)
+    | 0x08 => some (.jr rs)
+    | 0x09 => some (.jalr rs rd)
     | 0x0c => some .syscall
     | 0x0d => some .break
     | 0x34 => some (.teq rs rt)
@@ -362,6 +462,7 @@ def decode (w : W32) : Option Instruction :=
     match (functOf w).toNat with
     | 0x21 => some (.clo rs rd)
     | 0x20 => some (.clz rs rd)
+    | 0x02 => some (.mul rs rt rd)
     | _ => none
   | 0x1f =>  -- SPECIAL3: BSHFL sign-extend family, selected by the shamt sub-field
     match (functOf w).toNat with
@@ -386,10 +487,19 @@ def decode (w : W32) : Option Instruction :=
   | 0x21 => some (.lh rs rt imm)
   | 0x25 => some (.lhu rs rt imm)
   | 0x29 => some (.sh rs rt imm)
+  | 0x30 => some (.ll rs rt imm)
+  | 0x38 => some (.sc rs rt imm)
   | 0x04 => some (.beq rs rt imm)
   | 0x05 => some (.bne rs rt imm)
   | 0x06 => some (.blez rs imm)
   | 0x07 => some (.bgtz rs imm)
+  | 0x01 =>  -- REGIMM: rt field (not the opcode) selects bltz/bgez/bltzal/bgezal
+    match rt.toNat with
+    | 0x00 => some (.bltz rs imm)
+    | 0x01 => some (.bgez rs imm)
+    | 0x10 => some (.bltzal rs imm)
+    | 0x11 => some (.bgezal rs imm)
+    | _ => none
   | 0x02 => some (.j target)
   | 0x03 => some (.jal target)
   | 0x31 => some (.lwc1 rs rt imm)
@@ -447,15 +557,21 @@ def encode (i : Instruction) : W32 :=
   | .sll  rd rt shamt => mkRT 0#32 rt rd shamt 0x00#32
   | .srl  rd rt shamt => mkRT 0#32 rt rd shamt 0x02#32
   | .sra  rd rt shamt => mkRT 0#32 rt rd shamt 0x03#32
+  | .sllv rd rt rs => mkRT rs rt rd 0#32 0x04#32
+  | .srlv rd rt rs => mkRT rs rt rd 0#32 0x06#32
+  | .srav rd rt rs => mkRT rs rt rd 0#32 0x07#32
   | .mult  rs rt => mkRT rs rt 0#32 0#32 0x18#32
   | .multu rs rt => mkRT rs rt 0#32 0#32 0x19#32
   | .div   rs rt => mkRT rs rt 0#32 0#32 0x1a#32
   | .divu  rs rt => mkRT rs rt 0#32 0#32 0x1b#32
   | .mflo rd => mkRT 0#32 0#32 rd 0#32 0x12#32
   | .mfhi rd => mkRT 0#32 0#32 rd 0#32 0x10#32
+  | .jr   rs => mkRT rs 0#32 0#32 0#32 0x08#32
+  | .jalr rs rd => mkRT rs 0#32 rd 0#32 0x09#32
   -- SPECIAL2: duplicate rd into the rt-position field per the real encoding.
   | .clo rs rd => (0x1c#32 <<< 26) ||| mkRT rs rd rd 0#32 0x21#32
   | .clz rs rd => (0x1c#32 <<< 26) ||| mkRT rs rd rd 0#32 0x20#32
+  | .mul rs rt rd => (0x1c#32 <<< 26) ||| mkRT rs rt rd 0#32 0x02#32
   -- SPECIAL3 BSHFL: rs fixed 0, shamt-position field selects seb/seh.
   | .seb rd rt => (0x1f#32 <<< 26) ||| mkRT 0#32 rt rd 0x10#32 0x20#32
   | .seh rd rt => (0x1f#32 <<< 26) ||| mkRT 0#32 rt rd 0x18#32 0x20#32
@@ -474,10 +590,16 @@ def encode (i : Instruction) : W32 :=
   | .lh rs rt imm => mkIT 0x21#32 rs rt imm
   | .lhu rs rt imm => mkIT 0x25#32 rs rt imm
   | .sh rs rt imm => mkIT 0x29#32 rs rt imm
+  | .ll rs rt imm => mkIT 0x30#32 rs rt imm
+  | .sc rs rt imm => mkIT 0x38#32 rs rt imm
   | .beq rs rt imm => mkIT 0x04#32 rs rt imm
   | .bne rs rt imm => mkIT 0x05#32 rs rt imm
   | .blez rs imm => mkIT 0x06#32 rs 0#32 imm
   | .bgtz rs imm => mkIT 0x07#32 rs 0#32 imm
+  | .bltz   rs imm => mkIT 0x01#32 rs 0x00#32 imm
+  | .bgez   rs imm => mkIT 0x01#32 rs 0x01#32 imm
+  | .bltzal rs imm => mkIT 0x01#32 rs 0x10#32 imm
+  | .bgezal rs imm => mkIT 0x01#32 rs 0x11#32 imm
   | .j   target => (0x02#32 <<< 26) ||| mkJT target
   | .jal target => (0x03#32 <<< 26) ||| mkJT target
   | .syscall => mkRT 0#32 0#32 0#32 0#32 0x0c#32
@@ -532,6 +654,11 @@ example : decode (mkRT 0#32 8#32 3#32 5#32 0x00#32) = some (.sll 3#32 8#32 5#32)
 example : decode (mkRT 0#32 8#32 3#32 5#32 0x02#32) = some (.srl 3#32 8#32 5#32) := by decide
 example : decode (mkRT 0#32 8#32 3#32 5#32 0x03#32) = some (.sra 3#32 8#32 5#32) := by decide
 
+-- R-type variable shift: rd=3, rt=8, rs=29 (shamt field unused/0)
+example : decode (mkRT 29#32 8#32 3#32 0#32 0x04#32) = some (.sllv 3#32 8#32 29#32) := by decide
+example : decode (mkRT 29#32 8#32 3#32 0#32 0x06#32) = some (.srlv 3#32 8#32 29#32) := by decide
+example : decode (mkRT 29#32 8#32 3#32 0#32 0x07#32) = some (.srav 3#32 8#32 29#32) := by decide
+
 -- R-type mult/div: rs=29, rt=8
 example : decode (mkRT 29#32 8#32 0#32 0#32 0x18#32) = some (.mult 29#32 8#32) := by decide
 example : decode (mkRT 29#32 8#32 0#32 0#32 0x19#32) = some (.multu 29#32 8#32) := by decide
@@ -551,6 +678,9 @@ example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 3#32 3#32 0#32 0x20#32) = some
 -- decode also accepts the (nonconforming but documented-as-ignored) case
 -- where the raw rt field does *not* match rd, since hardware doesn't read it.
 example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 17#32 3#32 0#32 0x21#32) = some (.clo 29#32 3#32) := by decide
+
+-- SPECIAL2 GPR multiply: rs=29, rt=8, rd=3 (plain rs/rt/rd shape, no duplication quirk)
+example : decode ((0x1c#32 <<< 26) ||| mkRT 29#32 8#32 3#32 0#32 0x02#32) = some (.mul 29#32 8#32 3#32) := by decide
 
 -- SPECIAL3 BSHFL sign-extend: rd=3, rt=8, sub-field selects seb vs seh
 example : decode ((0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x10#32 0x20#32) = some (.seb 3#32 8#32) := by decide
@@ -589,6 +719,11 @@ example : decode (mkIT 0x21#32 29#32 8#32 0x1234#32) = some (.lh 29#32 8#32 0x12
 example : decode (mkIT 0x25#32 29#32 8#32 0x1234#32) = some (.lhu 29#32 8#32 0x1234#32) := by decide
 example : decode (mkIT 0x29#32 29#32 8#32 0x1234#32) = some (.sh 29#32 8#32 0x1234#32) := by decide
 
+-- ll/sc: rs=29 (base), rt=8 (dest/src), imm=0x1234 (offset) -- identical
+-- field layout to lw/sw
+example : decode (mkIT 0x30#32 29#32 8#32 0x1234#32) = some (.ll 29#32 8#32 0x1234#32) := by decide
+example : decode (mkIT 0x38#32 29#32 8#32 0x1234#32) = some (.sc 29#32 8#32 0x1234#32) := by decide
+
 -- branch reg/reg: rs=29, rt=8, imm=0x1234
 example : decode (mkIT 0x04#32 29#32 8#32 0x1234#32) = some (.beq 29#32 8#32 0x1234#32) := by decide
 example : decode (mkIT 0x05#32 29#32 8#32 0x1234#32) = some (.bne 29#32 8#32 0x1234#32) := by decide
@@ -596,6 +731,17 @@ example : decode (mkIT 0x05#32 29#32 8#32 0x1234#32) = some (.bne 29#32 8#32 0x1
 -- branch reg-only: rs=29, imm=0x1234 (rt fixed 0)
 example : decode (mkIT 0x06#32 29#32 0#32 0x1234#32) = some (.blez 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x07#32 29#32 0#32 0x1234#32) = some (.bgtz 29#32 0x1234#32) := by decide
+
+-- REGIMM zero-comparison branches: opcode 0x01, rs=29, imm=0x1234, rt field
+-- selects bltz/bgez/bltzal/bgezal
+example : decode (mkIT 0x01#32 29#32 0x00#32 0x1234#32) = some (.bltz 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x01#32 0x1234#32) = some (.bgez 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x10#32 0x1234#32) = some (.bltzal 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x11#32 0x1234#32) = some (.bgezal 29#32 0x1234#32) := by decide
+-- a REGIMM word with an unrecognized rt field (not 0x00/0x01/0x10/0x11,
+-- e.g. the real MIPS32 `tgei`/`tlti`/etc. trap-immediate family, out of
+-- v1+ scope) decodes to none
+#guard decode (mkIT 0x01#32 29#32 0x08#32 0x1234#32) = none
 
 -- J-type: target = 0x3ffffff (all 26 bits)
 example : decode ((0x02#32 <<< 26) ||| mkJT 0x3ffffff#32) = some (.j 0x3ffffff#32) := by decide
@@ -649,6 +795,10 @@ example : encode (.sll 3#32 8#32 5#32) = mkRT 0#32 8#32 3#32 5#32 0x00#32 := by 
 example : encode (.movn 29#32 8#32 3#32) = mkRT 29#32 8#32 3#32 0#32 0x0b#32 := by decide
 example : encode (.clo 29#32 3#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 3#32 3#32 0#32 0x21#32 := by decide
 example : encode (.seb 3#32 8#32) = (0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x10#32 0x20#32 := by decide
+example : encode (.sllv 3#32 8#32 29#32) = mkRT 29#32 8#32 3#32 0#32 0x04#32 := by decide
+example : encode (.mul 29#32 8#32 3#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 8#32 3#32 0#32 0x02#32 := by decide
+example : encode (.jr 29#32) = mkRT 29#32 0#32 0#32 0#32 0x08#32 := by decide
+example : encode (.jalr 29#32 3#32) = mkRT 29#32 0#32 3#32 0#32 0x09#32 := by decide
 -- full round trip for every new instruction (decode ∘ encode = id on the field values we store)
 example : decode (encode (.movn 29#32 8#32 3#32)) = some (.movn 29#32 8#32 3#32) := by decide
 example : decode (encode (.movz 29#32 8#32 3#32)) = some (.movz 29#32 8#32 3#32) := by decide
@@ -656,6 +806,12 @@ example : decode (encode (.clo 29#32 3#32)) = some (.clo 29#32 3#32) := by decid
 example : decode (encode (.clz 29#32 3#32)) = some (.clz 29#32 3#32) := by decide
 example : decode (encode (.seb 3#32 8#32)) = some (.seb 3#32 8#32) := by decide
 example : decode (encode (.seh 3#32 8#32)) = some (.seh 3#32 8#32) := by decide
+example : decode (encode (.sllv 3#32 8#32 29#32)) = some (.sllv 3#32 8#32 29#32) := by decide
+example : decode (encode (.srlv 3#32 8#32 29#32)) = some (.srlv 3#32 8#32 29#32) := by decide
+example : decode (encode (.srav 3#32 8#32 29#32)) = some (.srav 3#32 8#32 29#32) := by decide
+example : decode (encode (.mul 29#32 8#32 3#32)) = some (.mul 29#32 8#32 3#32) := by decide
+example : decode (encode (.jr 29#32)) = some (.jr 29#32) := by decide
+example : decode (encode (.jalr 29#32 3#32)) = some (.jalr 29#32 3#32) := by decide
 example : encode .break = mkRT 0#32 0#32 0#32 0#32 0x0d#32 := by decide
 example : encode (.teq 29#32 8#32) = mkRT 29#32 8#32 0#32 0#32 0x34#32 := by decide
 
@@ -688,8 +844,19 @@ example : decode (encode (.cLeS 7#32 6#32)) = some (.cLeS 7#32 6#32) := by decid
 example : decode (encode (.bc1t 0x1234#32)) = some (.bc1t 0x1234#32) := by decide
 example : decode (encode (.bc1f 0x1234#32)) = some (.bc1f 0x1234#32) := by decide
 
+-- REGIMM zero-comparison branches: full decode(encode i) = some i round-trips
+example : decode (encode (.bltz 29#32 0x1234#32)) = some (.bltz 29#32 0x1234#32) := by decide
+example : decode (encode (.bgez 29#32 0x1234#32)) = some (.bgez 29#32 0x1234#32) := by decide
+example : decode (encode (.bltzal 29#32 0x1234#32)) = some (.bltzal 29#32 0x1234#32) := by decide
+example : decode (encode (.bgezal 29#32 0x1234#32)) = some (.bgezal 29#32 0x1234#32) := by decide
+-- ll/sc: encode matches the hand-computed opcode, and decode (encode i) = some i
+example : encode (.ll 29#32 8#32 0x1234#32) = mkIT 0x30#32 29#32 8#32 0x1234#32 := by decide
+example : encode (.sc 29#32 8#32 0x1234#32) = mkIT 0x38#32 29#32 8#32 0x1234#32 := by decide
+example : decode (encode (.ll 29#32 8#32 0x1234#32)) = some (.ll 29#32 8#32 0x1234#32) := by decide
+example : decode (encode (.sc 29#32 8#32 0x1234#32)) = some (.sc 29#32 8#32 0x1234#32) := by decide
+
 -- unknown opcodes → none
-#guard decode (mkIT 0x01#32 0#32 0#32 0#32) = none  -- REGIMM, unimplemented
+#guard decode (mkIT 0x3a#32 0#32 0#32 0#32) = none  -- opcode 0x3a, unassigned/not in v1+ scope
 -- opcode 0x11 (COP1) is implemented for the fmt/funct combinations below;
 -- an unrecognized fmt (not MF/MT/BC1/S/W) still decodes to `none`.
 #guard decode (mkIT 0x11#32 0x1f#32 0#32 0#32) = none

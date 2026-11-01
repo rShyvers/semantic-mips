@@ -18,6 +18,25 @@ plus `cp0Status`/`cp0Cause`/`cp0Epc`). That addition is grounded in the real
 MIPS32 ISA, not MARS — see the dedicated
 ["Coprocessor 0 / traps and exceptions"](#coprocessor-0--traps-and-exceptions-real-mips32-isa)
 section below, which is explicit about this difference in sourcing.
+A further v1.x addition ("MIPS32 GPR multiply and variable shifts" section,
+at the end of this document) adds `mul`, `sllv`, `srlv`, and `srav` — also
+grounded directly in the standard MIPS32 ISA, not MARS — per
+`docs/spec/MIPS-COVERAGE-GAPS.md` §§3.4-3.5's finding that real compilers
+essentially never emit this project's existing `mult`+`mflo`/constant-`sll`
+sequences for plain 32-bit multiplication/variable shifts.
+Separately, the real MIPS32 register-indirect jump/call pair `jr`/`jalr`
+(the single highest-priority gap identified in
+[`MIPS-COVERAGE-GAPS.md`](MIPS-COVERAGE-GAPS.md) §3.1 — without them no
+compiled function can return or call through a function pointer) has also
+been added, likewise grounded in the real MIPS32 ISA rather than MARS — see
+the dedicated
+["Register-indirect jump/call"](#register-indirect-jumpcall-real-mips32-isa)
+section below.
+Likewise, the real MIPS32 atomic synchronization primitives `ll`/`sc` (load-
+linked/store-conditional) have since been added on top of the v1 set, along
+with a new `State.llBit` field; see the dedicated
+["Atomic synchronization (`ll`/`sc`)"](#atomic-synchronization-llsc--v1x-addition)
+section near the end of this document.
 
 Conventions pinned elsewhere and assumed here (see
 [`SPEC-NOTES.md`](SPEC-NOTES.md)): one real-MIPS32 branch delay slot per
@@ -77,6 +96,10 @@ execution logic (method `populate()`, lines 77–3236).
 | `bne` | I-branch | `if ($rs != $rt) PC = PC_next + (offset << 2)` |
 | `blez` | I-branch | `if ($rs <= 0) PC = PC_next + (offset << 2)` |
 | `bgtz` | I-branch | `if ($rs > 0) PC = PC_next + (offset << 2)` |
+| `bltz` | I-branch (REGIMM) | `if ($rs < 0) PC = PC_next + (offset << 2)`, signed |
+| `bgez` | I-branch (REGIMM) | `if ($rs >= 0) PC = PC_next + (offset << 2)`, signed |
+| `bltzal` | I-branch (REGIMM) | `$ra = PC_next + 4` unconditionally; `if ($rs < 0) PC = PC_next + (offset << 2)` |
+| `bgezal` | I-branch (REGIMM) | `$ra = PC_next + 4` unconditionally; `if ($rs >= 0) PC = PC_next + (offset << 2)` |
 | syscall 1 | — | print signed decimal integer in `$a0` |
 | syscall 4 | — | print null-terminated byte string starting at address `$a0` |
 | syscall 10 | — | terminate program normally |
@@ -88,6 +111,8 @@ execution logic (method `populate()`, lines 77–3236).
 | `tltu` | R | `if ($rs < $rt) trap`, unsigned |
 | `tgeu` | R | `if ($rs >= $rt) trap`, unsigned |
 | `break` | R | unconditional trap |
+| `ll` | I | `$rt = MEM32[$rs + offset]`, word-aligned; sets `llBit` |
+| `sc` | I | if `llBit`: `MEM32[$rs + offset] = $rt`, `$rt := 1`; else `$rt := 0`; clears `llBit` either way |
 
 `PC_next` denotes the program counter value *after* the fetched instruction
 has been accounted for, i.e. `PC_at_fetch + 4` — see Global rule 1.
@@ -742,6 +767,175 @@ Source: `vendor/mars-src/mars/mips/hardware/Memory.java`:
 
 ---
 
+## Register-indirect jump/call (real MIPS32 ISA)
+
+`jr` and `jalr` are real MIPS32 instructions that were missing from the
+original v1 subset -- per `docs/spec/MIPS-COVERAGE-GAPS.md` §3.1, this was
+the single highest-priority gap, since without `jr` no compiled MIPS
+function can return (`jr $ra`) and without `jalr` no function pointer /
+dynamic-dispatch call can be made. Per this addition's house rule (same as
+the "MIPS32 / MIPS32r2 additions" and "Coprocessor 0" sections below), their
+semantics are grounded directly in the **standard MIPS32 architecture** --
+"MIPS32 Architecture For Programmers, Volume II-A: The MIPS32 Instruction
+Set" (MD00086, Rev 2.50, §3.2, Table 3-2, pp. 150/155/25) -- not against
+the vendored MARS source; MARS is this project's differential-testing
+oracle, not the spec source. Like every other branch/jump in this document,
+both get exactly one architectural delay slot (Global rule 3): `pendingBranch`
+schedules the register-read target, falling through to the delay-slot
+instruction first, exactly like `j`/`jal`.
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `jr` | R | `PC = $rs` |
+| `jalr` | R | `$rd = PC_next + 4; PC = $rs` |
+
+### jr (R)
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=001000` (0x08). Fields:
+  `000000 sssss 00000 00000 00000 001000` → `rs=sssss` (the only field
+  that carries information); `rt`/`rd`/`shamt` are `0` in the real encoding
+  and are not modeled as separate `Instruction` fields (see
+  `Instruction.lean`'s `.jr` docstring).
+- **Semantics**: Jump Register. Schedules `PC = $rs` -- the full raw 32-bit
+  register value, *not* a 26-bit target field composed with `PC_next`'s top
+  4 bits like `j` -- as the delay-slot transfer (Global rule 3); `jr`
+  itself falls through to `PC_next` so the delay-slot instruction executes
+  first. The canonical real-MIPS32 function-return idiom is `jr $ra`
+  (return to the address `jal`/`jalr` linked into `$ra`); it is also used
+  for compiled switch-statement jump tables and other computed branches.
+- **Errors/halts**: none directly from `jr` itself. If `$rs` holds a value
+  that is not 4-byte-aligned, this is **not** special-cased at the point
+  `jr` schedules it: the misalignment surfaces as the ordinary
+  `HaltReason.addressError` the *next* time `step` tries to fetch an
+  instruction at that address (`fetchWord`'s existing alignment check),
+  identical to any other misaligned `PC` (Global rule 5). A branch/jump
+  occupying `jr`'s own delay slot halts with `HaltReason.branchInDelaySlot`
+  (Global rule 3).
+- **ISA note**: standard MIPS32 instruction (MIPS I onward); not MARS-
+  sourced (see this section's header note). MARS itself does implement
+  `jr`, but with its own default `DelayedBranching=false` no-delay-slot
+  timing -- this spec instead gives it the real-MIPS32 one-delay-slot
+  semantics, the same override every other branch/jump in this document
+  already receives (Global rule 3).
+- **Source**: MD00086 Rev 2.50, §3.2, Table 3-2, p. 25 and p. 155 ("JR"
+  instruction page).
+
+### jalr (R)
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=001001` (0x09). Fields:
+  `000000 sssss 00000 ddddd 00000 001001` → `rs=sssss` (jump target
+  source), `rd=ddddd` (link destination); `rt`/`shamt` are `0` in the real
+  encoding and are not modeled as separate `Instruction` fields (see
+  `Instruction.lean`'s `.jalr` docstring). Real MIPS32 assembly syntax also
+  allows the one-operand form `jalr $rs` as sugar for `jalr $ra, $rs`
+  (`rd` defaults to `31`); the assembler (`Asm.lean`) supports this sugar.
+- **Semantics**: Jump and Link Register. `$rd = PC_next + 4` (i.e.
+  `pc + 8`, the address *after* the delay slot -- same link-value
+  convention as `jal`, Global rule 1/3, since the delay-slot instruction
+  still executes before control can return to `$rd`); then schedules
+  `PC = $rs` (the raw register value, same target computation as `jr`) as
+  the delay-slot transfer. `jalr` itself falls through to `PC_next` so the
+  delay-slot instruction executes first. If `rd == rs`, the jump target is
+  read from `$rs` *before* `$rd` is overwritten with the link value, so
+  `jalr $t9, $t9` still jumps to the original `$t9` value. Used for
+  indirect procedure calls, dynamic linking stubs, and calls through a
+  function pointer (the common real-MIPS32 ABI idiom `jalr $t9`).
+- **Errors/halts**: same misaligned-`$rs`-target and delay-slot-in-delay-
+  slot conditions as `jr` above.
+- **ISA note**: standard MIPS32 instruction (MIPS I onward); not MARS-
+  sourced (see this section's header note), same real-MIPS32 one-delay-slot
+  override as `jr`/`j`/`jal` (Global rule 3).
+- **Source**: MD00086 Rev 2.50, §3.2, Table 3-2, p. 25 and p. 150 ("JALR"
+  instruction page).
+## REGIMM zero-comparison branches (real MIPS32 ISA) — v1.x addition
+
+The four instructions in this section (`bltz`, `bgez`, `bltzal`, `bgezal`)
+complete the zero-comparison conditional-branch family alongside `blez`/
+`bgtz` above (identified as a coverage gap in
+[`MIPS-COVERAGE-GAPS.md`](MIPS-COVERAGE-GAPS.md) §3.2). Per this
+addition's house rule (same precedent as the `movn`/`movz`/`clo`/`clz`/
+`seb`/`seh` section below), their semantics/encodings are grounded directly
+in the **real MIPS32 architecture** — MIPS32 Architecture For
+Programmers, Volume II-A (`MD00086` Rev 2.50), §3.2, Table 3-2, p. 25
+(`BLTZ` p. 85, `BGEZ` p. 73, `BLTZAL` p. 87, `BGEZAL` p. 75) — not
+derived from `InstructionSet.java` line citations, even though MARS does
+also implement all four.
+
+All four share **opcode `0x01`** (the `REGIMM` major opcode): unlike every
+other branch in this document, the opcode alone does not identify the
+instruction — the 5-bit `rt` field (bits 20–16), which carries no
+register operand here, instead selects which of the four REGIMM
+instructions it is. Field layout: `000001 fffff ttttt ssssssssssssssss` →
+`rs=fffff` (operand 0, the register tested), `rt=ttttt` (sub-opcode
+selector, not a register), `offset=ssss...` (operand 1, 16-bit signed word
+displacement, identical convention to `blez`/`bgtz`).
+
+| Mnemonic | `rt` field | Semantics |
+|---|---|---|
+| `bltz` | `0x00` | `if ($rs < 0) PC = PC_next + (offset << 2)`, signed |
+| `bgez` | `0x01` | `if ($rs >= 0) PC = PC_next + (offset << 2)`, signed |
+| `bltzal` | `0x10` | `$ra = PC_next + 4`, unconditionally; then same condition as `bltz` |
+| `bgezal` | `0x11` | `$ra = PC_next + 4`, unconditionally; then same condition as `bgez` |
+
+### bltz (I-branch, REGIMM)
+- **Encoding**: `opcode=000001` (0x01), `rt=00000` (0x00). Fields:
+  `000001 fffff 00000 ssssssssssssssss` → `rs=fffff` (operand 0),
+  `offset=ssss...` (operand 1).
+- **Semantics**: if `$rs < 0` (signed), schedules
+  `PC = PC_next + (offset << 2)` as the delay-slot transfer, same
+  one-delay-slot discipline as `beq`/`blez`/`bgtz` (Global rule 3; this
+  codebase's `State.pendingBranch` mechanism).
+- **Errors/halts**: none directly; a branch/jump occupying `bltz`'s own
+  delay slot halts with `HaltReason.branchInDelaySlot` (Global rule 3).
+- **Source**: MD00086 Rev 2.50, `BLTZ`, p. 85.
+
+### bgez (I-branch, REGIMM)
+- **Encoding**: `opcode=000001` (0x01), `rt=00001` (0x01). Same layout as
+  `bltz`.
+- **Semantics**: if `$rs >= 0` (signed, includes zero), schedules
+  `PC = PC_next + (offset << 2)`, same delay-slot discipline as `bltz`.
+- **Errors/halts**: none directly; same delay-slot halt condition as
+  `bltz`.
+- **Source**: MD00086 Rev 2.50, `BGEZ`, p. 73.
+
+### bltzal (I-branch, REGIMM)
+- **Encoding**: `opcode=000001` (0x01), `rt=10000` (0x10). Same field
+  layout as `bltz`.
+- **Semantics**: links `$ra = PC_next + 4` (i.e. `PC + 8`, past the delay
+  slot, identical convention to `jal`'s link value) **unconditionally** —
+  every execution of `bltzal` writes `$ra`, regardless of whether the
+  branch itself is taken — then, independently, if `$rs < 0` (signed),
+  schedules `PC = PC_next + (offset << 2)` as the delay-slot transfer, same
+  as `bltz`. This two-part unconditional-link/conditional-branch structure
+  is the real MIPS32 architectural definition (MD00086 Rev 2.50, `BLTZAL`
+  pseudocode: `GPR[31] <- PC + 8` executes in the instruction's own cycle
+  unconditionally; the branch condition on `GPR[rs]` is evaluated and
+  applied one cycle later, at the delay slot), not an assumption — it was
+  verified against the ISA pseudocode rather than inferred from `jal`.
+- **Errors/halts**: none directly; same delay-slot halt condition as
+  `bltz`.
+- **UNPREDICTABLE case**: the real ISA pseudocode explicitly marks `rs = 31`
+  ($ra) as **UNPREDICTABLE**, since the link into `$31` happens before the
+  branch condition on `$rs` is tested, so testing `$ra` itself could
+  legitimately observe either its old value or the just-written link value.
+  This simulator resolves that UNPREDICTABLE case by testing the *pre-link*
+  value of `$rs` (i.e. `Step.lean` reads `$rs` from the state as it was
+  before `$ra`'s write is applied) — a documented, deliberate choice for
+  an architecturally-unspecified input, not an oversight.
+- **Source**: MD00086 Rev 2.50, `BLTZAL`, p. 87.
+
+### bgezal (I-branch, REGIMM)
+- **Encoding**: `opcode=000001` (0x01), `rt=10001` (0x11). Same field
+  layout and unconditional-link convention as `bltzal`.
+- **Semantics**: links `$ra = PC_next + 4` unconditionally, then if
+  `$rs >= 0` (signed), schedules `PC = PC_next + (offset << 2)`, same as
+  `bgez`.
+- **Errors/halts**: none directly; same delay-slot halt condition as
+  `bltz`.
+- **UNPREDICTABLE case**: same `rs = $ra` (31) UNPREDICTABLE case and
+  pre-link-value resolution as `bltzal`.
+- **Source**: MD00086 Rev 2.50, `BGEZAL`, p. 75.
+
+---
+
 ## MIPS32 / MIPS32r2 additions (beyond the MARS-matched v1 baseline)
 
 The six instructions in this section (`movn`, `movz`, `clo`, `clz`, `seb`,
@@ -1202,4 +1396,220 @@ MARS-specific or implementation-chosen values. No internet access was used to
 write this section; these are well-established, memorized ISA constants, and
 any single value a future reader doubts should be cross-checked against a
 primary MIPS32 ISA reference before relying on it for anything beyond this
+simulator.
+
+---
+
+## MIPS32 GPR multiply and variable shifts (v1.x addition)
+
+This section documents a v1.x addition: four more real MIPS32 instructions
+(`mul`, `sllv`, `srlv`, `srav`) added on top of the v1 scope and the "MIPS32 /
+MIPS32r2 additions" section above. Per `docs/spec/MIPS-COVERAGE-GAPS.md`
+§§3.4-3.5, these were specifically chosen because real-world compilers
+(GCC/Clang) essentially never emit this project's existing `mult`+`mflo`
+sequence for plain 32-bit multiplication, and the existing `sll`/`srl`/`sra`
+only support a *compile-time-constant* shift amount — any C `x << y` / `x >> y`
+with a runtime-valued `y` needs `sllv`/`srlv`/`srav` instead. **Grounding
+note**: like the "MIPS32 / MIPS32r2 additions" and floating-point sections
+above, these four are grounded directly in the **standard MIPS32
+architecture** — specifically MD00086 ("MIPS32 Architecture For Programmers,
+Volume II-A: The MIPS32 Instruction Set"), §3.2, Table 3-1 (`MUL`) and
+Table 3-8 (`SLLV`/`SRLV`/`SRAV`) — not MARS-specific behavior; MARS is this
+project's differential-testing oracle, not the spec source.
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `mul` | R (SPECIAL2) | `$rd = ` low 32 bits of `$rs * $rt`, signed; `hi`/`lo` unchanged |
+| `sllv` | R | `$rd = $rt << ($rs & 0x1f)` (logical, zero-fill) |
+| `srlv` | R | `$rd = $rt >> ($rs & 0x1f)` (logical, zero-fill) |
+| `srav` | R | `$rd = $rt >> ($rs & 0x1f)` (arithmetic, sign-fill) |
+
+### mul (R, SPECIAL2)
+
+- **Encoding**: `opcode=011100` (0x1c, SPECIAL2, same opcode as `clo`/`clz`),
+  `funct=000010` (0x02). Fields: `011100 sssss ttttt ddddd 00000 000010` →
+  `rs=sssss`, `rt=ttttt`, `rd=ddddd` — a plain, undupicated `rs`/`rt`/`rd`
+  R-type shape (unlike `clo`/`clz`, there is no rt-duplicates-rd encoding
+  quirk here).
+- **Semantics**: Multiply Word to GPR. `$rd` = the low 32 bits of the signed
+  64-bit product `$rs * $rt` — i.e. exactly the bit pattern the existing
+  `mult` instruction would leave in `lo` (two's-complement multiplication's
+  low 32 bits are identical whether the operands are read as signed or
+  unsigned, so this is also exactly what `multu`+`mflo` would produce).
+- **`hi`/`lo` dialect decision**: Real MIPS32 hardware leaves `hi` and `lo`
+  **architecturally unpredictable** after `mul` (MD00086 §3.2's `MUL`
+  pseudocode explicitly marks them `UNPREDICTABLE`, in contrast to `mult`'s
+  well-defined `{hi,lo} = $rs * $rt`). Since this is a *deterministic*
+  simulator (`State` has no notion of "unpredictable" register content),
+  this project pins the simplest, most defensible choice: **`hi`/`lo` are
+  left completely unchanged** by `mul`. This is a deliberate dialect
+  decision, not a spec gap — any program relying on `hi`/`lo`'s value after
+  `mul` is already relying on undefined real-hardware behavior, so no
+  simulator choice here could be "more correct" against the real ISA; this
+  one is simply the easiest to state, implement, and test (`$rd`'s own
+  write is the only observable effect).
+- **Errors/halts**: none; no overflow concept (this is the entire point of
+  `mul` over `add`'s trapping behavior — compilers use it precisely because
+  32-bit multiplication has no architecturally-defined overflow trap).
+- **ISA note**: standard MIPS32 instruction (present since MIPS32 Release 1).
+  Real compilers (GCC/Clang `-O0` and above) emit `mul rd, rs, rt` for every
+  plain `int * int` 32-bit multiplication; the `mult`/`mflo` pair is
+  essentially never generated by a modern compiler for this purpose (see
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.5).
+
+### sllv (R)
+
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=000100` (0x04). Fields:
+  `000000 sssss ttttt ddddd 00000 000100` → `rs=sssss` (shift-amount
+  register), `rt=ttttt` (value to shift), `rd=ddddd` (destination); the
+  5-bit shamt-position field (bits 10-6) is unused/fixed `0` in the encoding
+  — unlike `sll`, the shift amount is *not* read from this field.
+- **Semantics**: Shift Word Left Logical Variable. `$rd = $rt << ($rs &
+  0x1f)` — the shift amount is the **low 5 bits of register `$rs`**, masked
+  (not clamped or modulo'd in any other way); e.g. `$rs = 33` (`0b100001`)
+  behaves identically to `$rs = 1`, and `$rs = 32` behaves identically to
+  `$rs = 0` (a full no-op shift, not an all-zero result — a common
+  implementation mistake this spec deliberately avoids testing for). Fill
+  is logical (zero-fill from the right), matching `sll`.
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32 instruction (MIPS I onward). Emitted by every
+  compiler for `x << y` in C whenever `y` is not a compile-time constant
+  (MD00086 §3.2, Table 3-8).
+
+### srlv (R)
+
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=000110` (0x06). Same field
+  layout as `sllv`.
+- **Semantics**: Shift Word Right Logical Variable. `$rd = $rt >> ($rs &
+  0x1f)`, logical (zero-fill from the left), matching `srl`. Same low-5-bit
+  masking behavior as `sllv`.
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32 instruction. Emitted for `(unsigned)x >> y`
+  in C with a non-constant `y`.
+
+### srav (R)
+
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=000111` (0x07). Same field
+  layout as `sllv`/`srlv`.
+- **Semantics**: Shift Word Right Arithmetic Variable. `$rd = $rt >> ($rs &
+  0x1f)`, arithmetic (sign-extending fill from the left, replicating bit 31
+  of `$rt`), matching `sra`. Same low-5-bit masking behavior as `sllv`.
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32 instruction. Emitted for `(signed)x >> y` in
+  C with a non-constant `y`.
+
+### Citation
+
+MIPS32 Architecture For Programmers, Volume II-A: The MIPS32 Instruction Set
+(MD00086, Rev 2.50), §3.2: Table 3-1 (p. 24, entry 217) for `MUL`'s
+`opcode=SPECIAL2`/`funct=0x02` encoding and its `UNPREDICTABLE`-HI/LO
+pseudocode; Table 3-8 (p. 27, entries 265/273/270) for `SLLV`/`SRLV`/`SRAV`'s
+`opcode=SPECIAL`/`funct=0x04`/`0x06`/`0x07` encodings and their register-held
+shift-amount pseudocode (`s = GPR[rs]31..0; s = s4..0` — i.e. the low-5-bit
+mask documented above). No internet access was used to write this section;
+these are well-established, memorized ISA constants, cross-referenced against
+`docs/spec/MIPS-COVERAGE-GAPS.md`'s independent research pass (§§3.4-3.5,
+which cites the same table/page/entry numbers) before being relied upon here.
+## Atomic synchronization (`ll`/`sc`) — v1.x addition
+
+This section documents a v1.x addition: the real MIPS32 load-linked/store-
+conditional pair (`ll`/`sc`), the standard MIPS mechanism for lock-free
+algorithms, spinlocks, and mutexes (identified as a coverage gap in
+`docs/spec/MIPS-COVERAGE-GAPS.md` §3.7). **Grounding note**: like the
+Coprocessor 0 and floating-point additions above, this section is grounded
+directly in the **real MIPS32 architecture** — specifically "MIPS32
+Architecture For Programmers, Volume II-A: The MIPS32 Instruction Set"
+(MD00086, Rev 2.50, §3.2, Table 3-4, pp. 25–26, entries 167 (`LL`) and 253
+(`SC`)) — not against MARS, which was only ever this project's
+differential-testing oracle and (per `MIPS-COVERAGE-GAPS.md` §3.7) does not
+implement `ll`/`sc` at all.
+
+### The `LLbit` single-hart simplification
+
+Real MIPS32 hardware tracks a global "link bit" (`LLbit`) that is set by
+`ll` and cleared by `sc` or by several events this single-threaded simulator
+has no notion of at all: context switches, and cache-coherence traffic
+arriving from other cores in a multiprocessor system (MD00086 §3.2's own
+`LL`/`SC` pseudocode describes `LLbit` as cleared by "any other processor's
+execution of a `SC` to the same block of physical memory", among other
+implementation-defined events). None of that exists in a single-hart
+simulator with no other execution context, so this v1.x addition makes one
+deliberate simplification, modeled as a new `State.llBit : Bool` field
+(`Types.lean`, defaulting to `false` in `initialState`):
+
+- **`llBit` is cleared by any store-class instruction that executes after
+  `ll`** — `sw`, `sh`, and `swc1` (this project's v1 set has no `sb`; see
+  `Instruction.lean`'s module docstring for the full store inventory), to
+  *any* address, not just the `ll`'s own address. This is the one part of
+  the real multi-event `LLbit`-clearing rule that is both architecturally
+  mandated and observable without real concurrency: on real hardware, an
+  intervening store from *this* core to memory between a matching `ll`/`sc`
+  pair is exactly what `sc` is supposed to detect and fail on, even with
+  only one core running. The other real clearing events (context switches,
+  other cores' cache-coherence traffic) have no counterpart in a single-hart
+  model with no OS/scheduler and no other cores, so they are out of scope by
+  construction rather than by oversight.
+- **`sc` itself always clears `llBit`**, whether it succeeds or fails (real
+  MIPS32 architectural behavior, not a simplification) — see the `sc` entry
+  below for the exact order of operations.
+
+### ll (I)
+- **Encoding**: `opcode=110000` (0x30). Same field layout as `lw`:
+  `base=rs` (operand index 2 in this assembler's convention), `rt`
+  (destination, operand index 0), `offset` (operand index 1, sign-extended
+  exactly like `lw`'s offset).
+- **Semantics**: `addr = $base + sext16(offset)`; `$rt = MEM32[addr]`
+  (4 bytes, big-endian — identical to `lw`'s load); additionally,
+  `State.llBit := true`.
+- **Errors/halts**: `addr % 4 != 0` → the same `addressError` halt as `lw`
+  (word-aligned access required).
+- **ISA note**: standard MIPS32 instruction (MD00086 §3.2, Table 3-4, p. 25,
+  entry 167). Real hardware additionally records the physical address
+  range covered by the link for coherence-snooping purposes; this model has
+  no cache/coherence layer, so only the single global `llBit` flag is kept
+  (see the `LLbit` simplification note above).
+
+### sc (I)
+- **Encoding**: `opcode=111000` (0x38). Same field layout as `sw`:
+  `base=rs`, `rt` (source register to conditionally store *and* the
+  destination for the success/failure result), `offset` (sign-extended
+  exactly like `sw`'s offset).
+- **Semantics**: `addr = $base + sext16(offset)`. The effective address is
+  computed and alignment-checked unconditionally (exactly like `sw`), even
+  if the store ends up not committing. Then:
+  1. If `State.llBit` is `true`: perform the store, `MEM32[addr] = $rt`
+     (identical to `sw`'s store), using `$rt`'s value *before* it is
+     overwritten by the next step; then write `$rt := 1` (success).
+  2. If `State.llBit` is `false`: do **not** perform the store; write
+     `$rt := 0` (failure).
+  3. **Either way**, clear `State.llBit := false` afterward — this check
+     happens *before* the clear, not after (clearing first would make every
+     `sc` unconditionally fail).
+- **Errors/halts**: `addr % 4 != 0` → the same `addressError` halt as `sw`,
+  regardless of `llBit` (see above — the address check is unconditional).
+- **ISA note**: standard MIPS32 instruction (MD00086 §3.2, Table 3-4, p. 26,
+  entry 253). Real hardware's success/failure value is written to `rt` as
+  the full ISA-defined "1 = success, 0 = failure" encoding; this model
+  matches that exactly. The real ISA also describes additional
+  implementation-defined conditions under which `sc` may spuriously fail
+  (an "exclusive access" granularity coarser than the one word read by
+  `ll`, for instance); this model never fails spuriously — `llBit` is the
+  only condition checked, matching the simplification note above.
+
+### Encoding summary
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `ll $rt, offset($rs)` | I, opcode 0x30 | `$rt = MEM32[$rs + offset]`; `llBit := true` |
+| `sc $rt, offset($rs)` | I, opcode 0x38 | if `llBit`: `MEM32[$rs + offset] = $rt`, `$rt := 1`; else `$rt := 0`; either way `llBit := false` |
+
+### Citation
+
+"MIPS32 Architecture For Programmers, Volume II-A: The MIPS32 Instruction
+Set" (MD00086, Rev 2.50), §3.2, Table 3-4 (p. 25–26): `LL` (entry 167,
+opcode 0x30) and `SC` (entry 253, opcode 0x38). No internet access was used
+to write this section; these are well-established, memorized ISA constants
+(the same citation already used by `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7),
+and any single value a future reader doubts should be cross-checked against
+a primary MIPS32 ISA reference before relying on it for anything beyond this
 simulator.

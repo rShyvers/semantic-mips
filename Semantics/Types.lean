@@ -47,6 +47,20 @@ structure State where
   `Step.lean`'s `advance`). `none` means no transfer is pending — the
   common case, and the only one `initialState` ever produces. -/
   pendingBranch : Option W32 := none
+  /-- The link bit (`LLbit`) set by `ll` and tested/cleared by `sc` (real
+  MIPS32 `ll`/`sc`, MD00086 Rev 2.50 §3.2; see `docs/spec/INSTRUCTION-REF.md`).
+  Real hardware clears `LLbit` on `sc` execution (success or failure) and on
+  events this single-hart simulator has no notion of (context switches,
+  cache-coherence traffic from other cores). The one such event that *is*
+  observable without real concurrency, and so is the only one modeled here,
+  is architecturally mandated even on a single core: any store instruction
+  that executes after `ll` clears `LLbit`, which is what makes a
+  subsequent `sc` fail if something else wrote memory in between. Every
+  store-class instruction (`sw`, `sh`, `swc1`; this model has no `sb`)
+  clears this field as part of its own effect; `sc` also always clears it,
+  success or fail. Defaults `false`, matching `initialState` (no `ll` has
+  executed yet). -/
+  llBit : Bool := false
   /-- Coprocessor 0 `Status` register. This minimal model only ever sets bit
   1 (`EXL`, exception level) when an exception is taken (see `excCodeBp`/
   `excCodeTr` and `exceptionVectorAddr` below); no interrupt-mask bits, mode
@@ -211,6 +225,9 @@ example : (StepResult.halt HaltReason.exit) = (StepResult.halt HaltReason.exit) 
 -- `State.pendingBranch` defaults to `none` when omitted from a literal
 example : sampleState.pendingBranch = none := by decide
 #guard sampleState.pendingBranch = none
+-- `State.llBit` defaults to `false` when omitted from a literal
+example : sampleState.llBit = false := by decide
+#guard sampleState.llBit = false
 -- CP0 fields: `sampleState` reads back the zero-initialized fields; the
 -- exception constants are distinct small values as documented.
 example : sampleState.cp0Status = 0#32 := by decide

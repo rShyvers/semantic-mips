@@ -24,11 +24,26 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   `movn`/`movz` (fit the `rd, rs, rt` R-type shape exactly, table-driven like
   `add`), and `clo`/`clz`/`seb`/`seh` (SPECIAL2/SPECIAL3 opcodes, hand-encoded
   below since they don't fit any existing `RForm`).
+- Further MIPS32 additions (docs/spec/MIPS-COVERAGE-GAPS.md section 3.4/3.5):
+  `sllv`/`srlv`/`srav` (`rd, rt, rs` -- same opcode-0 shape as `shift` but the
+  shift amount is a register, table-driven via a new `.shiftv` `RForm`), and
+  `mul` (`rd, rs, rt` -- SPECIAL2-opcoded like `clo`/`clz`, hand-encoded
+  alongside them since `rTable` only handles opcode-0 forms); and `jr`/`jalr`
+  (real MIPS32 register-indirect jump/call, opcode 0 funct 0x08/0x09,
+  hand-encoded below since neither fits any existing `RForm` either --
+  `jr $rs` is one-operand, `jalr $rd, $rs` is two-operand with `rd` first per
+  real MIPS32 assembly syntax (opposite order from the `rs`-then-`rd` field
+  layout); `jalr $rs` -- the one-operand sugar for `jalr $ra, $rs` -- is also
+  supported).
 - The coprocessor-0 trap/exception family (real MIPS32 ISA, added on top of
   the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): `teq`/`tne`/
   `tlt`/`tge`/`tltu`/`tgeu` (`rs, rt` operands, same shape as `mult`/`div`),
   and `break` (zero operands, like `syscall`; funct = 0x0d, word
   `0x0000000D`).
+- `ll`/`sc` (real MIPS32 atomic synchronization primitives, added on top of
+  the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): identical
+  `rt, offset(rs)` shape and parsing to `lw`/`sw`, table-driven the same way
+  (opcodes 0x30/0x38).
 - Coprocessor-1 (FPU) single-precision subset (docs/spec/INSTRUCTION-REF.md's
   floating-point section): `mtc1`/`mfc1`, `lwc1`/`swc1`, `add.s`/`sub.s`/
   `mul.s`/`div.s`, `mov.s`, `cvt.s.w`/`cvt.w.s`, `c.eq.s`/`c.lt.s`/`c.le.s`,
@@ -301,6 +316,7 @@ private def parseMemOperand (tok : String) (line : Nat) : Except AsmError (Int �
 private inductive RForm
   | arith3   -- rd, rs, rt
   | shift    -- rd, rt, shamt
+  | shiftv   -- rd, rt, rs (variable shift; shamt field unused/0)
   | multdiv  -- rs, rt
   | hilo     -- rd
 
@@ -310,8 +326,9 @@ private inductive IForm
   | mem      -- rt, offset(rs)
 
 private inductive BForm
-  | two      -- rs, rt, target
-  | one      -- rs, target
+  | two          -- rs, rt, target
+  | one          -- rs, target (rt field fixed 0, e.g. blez/bgtz)
+  | regimm (rt : Nat)  -- rs, target (rt field fixed to the given REGIMM sub-opcode selector)
 
 /-- Static table of R-type mnemonics: (name, funct, form). -/
 private def rTable : List (String × Nat × RForm) :=
@@ -320,6 +337,10 @@ private def rTable : List (String × Nat × RForm) :=
    ("slt", 0x2a, .arith3), ("sltu", 0x2b, .arith3),
    ("movn", 0x0b, .arith3), ("movz", 0x0a, .arith3),  -- MIPS32r2; same opcode-0 `rd, rs, rt` shape as `add`
    ("sll", 0x00, .shift), ("srl", 0x02, .shift), ("sra", 0x03, .shift),
+   -- Variable shifts (MIPS32; docs/spec/MIPS-COVERAGE-GAPS.md section 3.4):
+   -- same opcode-0 `rd, rt, rs` shape as `shift`, but the third operand is a
+   -- register (the shift amount), not an immediate shamt.
+   ("sllv", 0x04, .shiftv), ("srlv", 0x06, .shiftv), ("srav", 0x07, .shiftv),
    ("mult", 0x18, .multdiv), ("multu", 0x19, .multdiv), ("div", 0x1a, .multdiv), ("divu", 0x1b, .multdiv),
    ("mfhi", 0x10, .hilo), ("mflo", 0x12, .hilo),
    -- Trap-on-condition family (same `rs, rt` shape as `mult`/`div`): real
@@ -334,14 +355,24 @@ private def iTable : List (String × Nat × IForm) :=
    ("andi", 0x0c, .arith), ("ori", 0x0d, .arith), ("xori", 0x0e, .arith),
    ("lui", 0x0f, .lui),
    ("lw", 0x23, .mem), ("sw", 0x2b, .mem), ("lb", 0x20, .mem), ("lbu", 0x24, .mem),
-   ("lh", 0x21, .mem), ("lhu", 0x25, .mem), ("sh", 0x29, .mem)]
+   ("lh", 0x21, .mem), ("lhu", 0x25, .mem), ("sh", 0x29, .mem),
+   -- `ll`/`sc`: real MIPS32 atomic synchronization primitives (opcodes
+   -- 0x30/0x38; MD00086 Rev 2.50 §3.2), same `rt, offset(rs)` shape as
+   -- `lw`/`sw` (see `Instruction.lean`/`docs/spec/INSTRUCTION-REF.md`).
+   ("ll", 0x30, .mem), ("sc", 0x38, .mem)]
 
 /-- Static table of J-type mnemonics: (name, opcode). -/
 private def jTable : List (String × Nat) := [("j", 0x02), ("jal", 0x03)]
 
-/-- Static table of branch mnemonics: (name, opcode, form). -/
+/-- Static table of branch mnemonics: (name, opcode, form). The REGIMM
+zero-comparison branches (`bltz`/`bgez`/`bltzal`/`bgezal`) all share opcode
+0x01; the `rt` field (carried in `.regimm`, not a separate opcode) is what
+selects which one, per MD00086 Rev 2.50 §3.2, Table 3-2 (see
+`Instruction.lean`'s decode/encode and `docs/spec/INSTRUCTION-REF.md`). -/
 private def bTable : List (String × Nat × BForm) :=
-  [("beq", 0x04, .two), ("bne", 0x05, .two), ("blez", 0x06, .one), ("bgtz", 0x07, .one)]
+  [("beq", 0x04, .two), ("bne", 0x05, .two), ("blez", 0x06, .one), ("bgtz", 0x07, .one),
+   ("bltz", 0x01, .regimm 0x00), ("bgez", 0x01, .regimm 0x01),
+   ("bltzal", 0x01, .regimm 0x10), ("bgezal", 0x01, .regimm 0x11)]
 
 /-- Coprocessor-1 (FPU) mnemonic operand shapes. The static parameters
 (`fmt`/`opcode`/`funct`/`tf`) needed to build each instruction's word are
@@ -376,14 +407,24 @@ private def directiveSet : List String := [".text", ".data", ".word", ".half", "
 
 /-- SPECIAL2/SPECIAL3 mnemonics with an opcode-bearing R-type-like shape that
 doesn't fit any existing `RForm` (nonzero opcode and/or an operand count
-that doesn't match `arith3`/`shift`/`multdiv`/`hilo`); hand-encoded directly
-in `encodeInstruction` below instead of via `rTable`. -/
-private def bshflMnemonics : List String := ["clo", "clz", "seb", "seh"]
+that doesn't match `arith3`/`shift`/`shiftv`/`multdiv`/`hilo`); hand-encoded
+directly in `encodeInstruction` below instead of via `rTable`. `mul` has the
+same `rd, rs, rt` operand shape as `arith3`, but is SPECIAL2-opcoded (0x1c)
+like `clo`/`clz` rather than plain SPECIAL (opcode 0), so it is hand-encoded
+here too rather than via `rTable`. -/
+private def bshflMnemonics : List String := ["clo", "clz", "seb", "seh", "mul"]
+
+/-- Real MIPS32 register-indirect jump/call (opcode 0, funct 0x08/0x09):
+`jr $rs` (one operand) and `jalr $rd, $rs` (two operands, also accepting the
+`jalr $rs` one-operand sugar for `jalr $ra, $rs`) don't fit any existing
+`RForm`'s fixed operand count, so they're hand-encoded directly in
+`encodeInstruction` below, the same way `bshflMnemonics` are. -/
+private def jrJalrMnemonics : List String := ["jr", "jalr"]
 
 private def isKnownMnemonic (m : String) : Bool :=
   rTable.any (·.1 == m) ∨ iTable.any (·.1 == m) ∨ jTable.any (·.1 == m) ∨
     bTable.any (·.1 == m) ∨ cop1Table.any (·.1 == m) ∨ pseudoSet.contains m ∨
-    directiveSet.contains m ∨ bshflMnemonics.contains m
+    directiveSet.contains m ∨ bshflMnemonics.contains m ∨ jrJalrMnemonics.contains m
 
 /-- Number of 32-bit words a `li $rt, v` expansion emits, per
 `PseudoOps.txt` lines 245-247: sign-extendable-16-bit values use a single
@@ -612,6 +653,14 @@ private def encodeRForm (name : String) (funct : Nat) (form : RForm) (operands :
         if sh < 0 ∨ sh > 31 then throw (.badImmediate s!"{name} shamt out of range (0-31)" lineNo)
         pure (rtWord 0 rt rd sh.toNat funct)
     | _ => throw (.badOperand s!"{name} expects 'rd, rt, shamt'" lineNo)
+  | .shiftv =>
+    match operands with
+    | [rdT, rtT, rsT] => do
+        let rd ← parseRegister rdT lineNo
+        let rt ← parseRegister rtT lineNo
+        let rs ← parseRegister rsT lineNo
+        pure (rtWord rs rt rd 0 funct)
+    | _ => throw (.badOperand s!"{name} expects 'rd, rt, rs'" lineNo)
   | .multdiv =>
     match operands with
     | [rsT, rtT] => do
@@ -693,6 +742,13 @@ private def encodeBForm (labels : Std.HashMap String W32) (name : String) (opcod
         let rs ← parseRegister rsT lineNo
         let off ← branchOffset labels tgt instrAddr lineNo
         pure (itWord opcode rs 0 (ofInt32 off))
+    | _ => throw (.badOperand s!"{name} expects 'rs, target'" lineNo)
+  | .regimm rtField =>
+    match operands with
+    | [rsT, tgt] => do
+        let rs ← parseRegister rsT lineNo
+        let off ← branchOffset labels tgt instrAddr lineNo
+        pure (itWord opcode rs rtField (ofInt32 off))
     | _ => throw (.badOperand s!"{name} expects 'rs, target'" lineNo)
 
 /-- Encode a coprocessor-1 (FPU) mnemonic's operand list into its word, per
@@ -806,6 +862,18 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
         let rs ← parseRegister rsT item.lineNo
         pure [opRtWord 0x1c rs rd rd 0 0x20]
     | _ => throw (.badOperand s!"clz expects 'rd, rs'" item.lineNo)
+  -- SPECIAL2 GPR multiply (MIPS32): `mul $rd, $rs, $rt`. Plain `rs, rt, rd`
+  -- shape, unlike `clo`/`clz` -- no duplicated-field quirk -- but still
+  -- SPECIAL2-opcoded (0x1c), so it needs `opRtWord` rather than plain
+  -- `rtWord`/`rTable` (docs/spec/MIPS-COVERAGE-GAPS.md §3.5).
+  | "mul" =>
+    match item.operands with
+    | [rdT, rsT, rtT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rs ← parseRegister rsT item.lineNo
+        let rt ← parseRegister rtT item.lineNo
+        pure [opRtWord 0x1c rs rt rd 0 0x02]
+    | _ => throw (.badOperand s!"mul expects 'rd, rs, rt'" item.lineNo)
   -- SPECIAL3 BSHFL sign-extend (MIPS32r2): `seb $rd, $rt` / `seh $rd, $rt`.
   -- `rs` is unused/fixed 0; the shamt-position field (0x10/0x18) selects
   -- which BSHFL sub-op this is.
@@ -823,6 +891,27 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
         let rt ← parseRegister rtT item.lineNo
         pure [opRtWord 0x1f 0 rt rd 0x18 0x20]
     | _ => throw (.badOperand s!"seh expects 'rd, rt'" item.lineNo)
+  -- Register-indirect jump/call (real MIPS32 `jr`/`jalr`, opcode 0, funct
+  -- 0x08/0x09; see `Instruction.lean`'s `.jr`/`.jalr` docstrings). `rt`/
+  -- `shamt` are unused/fixed 0 in the real encoding.
+  | "jr" =>
+    match item.operands with
+    | [rsT] => do
+        let rs ← parseRegister rsT item.lineNo
+        pure [rtWord rs 0 0 0 0x08]
+    | _ => throw (.badOperand s!"jr expects 'rs'" item.lineNo)
+  | "jalr" =>
+    match item.operands with
+    | [rdT, rsT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rs ← parseRegister rsT item.lineNo
+        pure [rtWord rs 0 rd 0 0x09]
+    -- One-operand sugar: `jalr $rs` == `jalr $ra, $rs` (rd defaults to 31),
+    -- per real MIPS32 assembly syntax.
+    | [rsT] => do
+        let rs ← parseRegister rsT item.lineNo
+        pure [rtWord rs 0 31 0 0x09]
+    | _ => throw (.badOperand s!"jalr expects 'rd, rs' or 'rs'" item.lineNo)
   | "break" =>
     match item.operands with
     | [] => pure [0x0000000D#32]              -- all fields zero except funct = 0x0d
@@ -1012,6 +1101,21 @@ def movProg : Program :=
 #guard decode (movProg.getD textBase 0) = some (.movn 9#32 10#32 8#32)
 #guard decode (movProg.getD (textBase + 4#32) 0) = some (.movz 9#32 10#32 8#32)
 
+-- `sllv`/`srlv`/`srav $rd, $rt, $rs`: table-driven like `shift`, but the
+-- third operand is a register (the shift amount), opcode 0.
+def shiftvSrc : String := "sllv $t0, $t1, $t2\nsrlv $t0, $t1, $t2\nsrav $t0, $t1, $t2\n"
+def shiftvProg : Program :=
+  match assemble shiftvSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard shiftvProg.getD textBase 0 = mkRT (10#32) (9#32) (8#32) (0#32) (0x04#32)
+#guard shiftvProg.getD (textBase + 4#32) 0 = mkRT (10#32) (9#32) (8#32) (0#32) (0x06#32)
+#guard shiftvProg.getD (textBase + 8#32) 0 = mkRT (10#32) (9#32) (8#32) (0#32) (0x07#32)
+#guard decode (shiftvProg.getD textBase 0) = some (.sllv 8#32 9#32 10#32)
+#guard decode (shiftvProg.getD (textBase + 4#32) 0) = some (.srlv 8#32 9#32 10#32)
+#guard decode (shiftvProg.getD (textBase + 8#32) 0) = some (.srav 8#32 9#32 10#32)
+
 -- `clo $rd, $rs` / `clz $rd, $rs`: SPECIAL2 opcode 0x1c, rt field duplicates rd.
 def cloClzSrc : String := "clo $t0, $t1\nclz $t0, $t1\n"
 def cloClzProg : Program :=
@@ -1023,6 +1127,17 @@ def cloClzProg : Program :=
 #guard cloClzProg.getD (textBase + 4#32) 0 = (natToW32 0x1c <<< 26) ||| mkRT (9#32) (8#32) (8#32) (0#32) (0x20#32)
 #guard decode (cloClzProg.getD textBase 0) = some (.clo 9#32 8#32)
 #guard decode (cloClzProg.getD (textBase + 4#32) 0) = some (.clz 9#32 8#32)
+
+-- `mul $rd, $rs, $rt`: SPECIAL2 opcode 0x1c, plain rs/rt/rd shape (no
+-- duplicated-field quirk, unlike clo/clz).
+def mulSrc : String := "mul $t0, $t1, $t2\n"
+def mulProg : Program :=
+  match assemble mulSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard mulProg.getD textBase 0 = (natToW32 0x1c <<< 26) ||| mkRT (9#32) (10#32) (8#32) (0#32) (0x02#32)
+#guard decode (mulProg.getD textBase 0) = some (.mul 9#32 10#32 8#32)
 
 -- `seb $rd, $rt` / `seh $rd, $rt`: SPECIAL3 opcode 0x1f, funct 0x20, the
 -- shamt-position sub-field (0x10/0x18) selects seb vs seh.
@@ -1036,6 +1151,28 @@ def sebSehProg : Program :=
 #guard sebSehProg.getD (textBase + 4#32) 0 = (natToW32 0x1f <<< 26) ||| mkRT (0#32) (9#32) (8#32) (0x18#32) (0x20#32)
 #guard decode (sebSehProg.getD textBase 0) = some (.seb 8#32 9#32)
 #guard decode (sebSehProg.getD (textBase + 4#32) 0) = some (.seh 8#32 9#32)
+
+-- `jr $rs` / `jalr $rd, $rs`: real MIPS32 register-indirect jump/call,
+-- opcode 0, funct 0x08/0x09. Also covers the `jalr $rs` one-operand sugar
+-- (rd defaults to $ra = 31).
+def jrJalrSrc : String := "jr $ra\njalr $t0, $t1\njalr $t2\n"
+def jrJalrProg : Program :=
+  match assemble jrJalrSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard jrJalrProg.getD textBase 0 = mkRT (31#32) (0#32) (0#32) (0#32) (0x08#32)
+#guard jrJalrProg.getD (textBase + 4#32) 0 = mkRT (9#32) (0#32) (8#32) (0#32) (0x09#32)
+#guard jrJalrProg.getD (textBase + 8#32) 0 = mkRT (10#32) (0#32) (31#32) (0#32) (0x09#32)
+#guard decode (jrJalrProg.getD textBase 0) = some (.jr 31#32)
+#guard decode (jrJalrProg.getD (textBase + 4#32) 0) = some (.jalr 9#32 8#32)
+#guard decode (jrJalrProg.getD (textBase + 8#32) 0) = some (.jalr 10#32 31#32)
+-- operand-count errors: zero/three operands are rejected for both mnemonics.
+#guard (assemble "jr\n").isOk = false
+#guard (assemble "jr $t0, $t1\n").isOk = false
+#guard (assemble "jalr\n").isOk = false
+#guard (assemble "jalr $t0, $t1, $t2\n").isOk = false
+
 -- `break`: zero operands, all fields zero except funct = 0x0d (0x0000000D);
 -- real MIPS32 encoding (the funct value immediately after `syscall`'s
 -- 0x0c) -- see `Instruction.lean`'s `encode .break`.
@@ -1069,6 +1206,39 @@ def trapProg : Program :=
 #guard trapProg.getD (textBase + 20#32) 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x31#32)
 #guard decode (trapProg.getD (textBase + 20#32) 0) = some (.tgeu 8#32 9#32)
 #guard (assemble "teq $t0\n").isOk = false
+
+-- REGIMM zero-comparison branches: `bltz`/`bgez`/`bltzal`/`bgezal` all
+-- share opcode 0x01 (distinguished only by the `rt` field — see
+-- `Instruction.lean`/`docs/spec/INSTRUCTION-REF.md`); operand shape is
+-- `rs, target`, same as `blez`/`bgtz`.
+def regimmSrc : String :=
+"loop: bltz $t0, loop\n" ++
+"bgez $t0, loop\n" ++
+"bltzal $t0, loop\n" ++
+"bgezal $t0, loop\n"
+def regimmProg : Program :=
+  match assemble regimmSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+-- `loop: bltz $t0, loop`: instrAddr = textBase = target; nextPc = +4;
+-- offset = (target - nextPc)/4 = -1.
+#guard regimmProg.getD textBase 0 = mkIT (0x01#32) (8#32) (0x00#32) (ofInt32 (-1))
+#guard decode (regimmProg.getD textBase 0) = some (.bltz 8#32 0xffff#32)
+-- `bgez $t0, loop`: instrAddr = textBase+4, nextPc = textBase+8,
+-- target = textBase (loop); offset = (0 - 8)/4 = -2.
+#guard regimmProg.getD (textBase + 4#32) 0 = mkIT (0x01#32) (8#32) (0x01#32) (ofInt32 (-2))
+#guard decode (regimmProg.getD (textBase + 4#32) 0) = some (.bgez 8#32 0xfffe#32)
+-- `bltzal $t0, loop`: instrAddr = textBase+8, nextPc = textBase+12;
+-- offset = (0 - 12)/4 = -3.
+#guard regimmProg.getD (textBase + 8#32) 0 = mkIT (0x01#32) (8#32) (0x10#32) (ofInt32 (-3))
+#guard decode (regimmProg.getD (textBase + 8#32) 0) = some (.bltzal 8#32 0xfffd#32)
+-- `bgezal $t0, loop`: instrAddr = textBase+12, nextPc = textBase+16;
+-- offset = (0 - 16)/4 = -4.
+#guard regimmProg.getD (textBase + 12#32) 0 = mkIT (0x01#32) (8#32) (0x11#32) (ofInt32 (-4))
+#guard decode (regimmProg.getD (textBase + 12#32) 0) = some (.bgezal 8#32 0xfffc#32)
+#guard (assemble "bltz $t0\n").isOk = false
+
 -- Coprocessor-1 (FPU) mnemonics: cross-checked word-for-word against
 -- `Instruction.encode` (an independent encoding path from this assembler's
 -- `cop1RtWord`/`itWord`), covering registers/`$fN` parsing and every form.
@@ -1124,6 +1294,22 @@ def cop1Prog : Program :=
 #guard decode (cop1Prog.getD (textBase + 56#32) 0) = some (.bc1t 0xffff#32)
 -- an unknown `$f` register is a `badRegister` error
 #guard (assemble "mov.s $f8, $f32\n").isOk = false
+
+-- `ll`/`sc`: identical `rt, offset(rs)` parsing to `lw`/`sw`, cross-checked
+-- against `Instruction.encode`.
+def llscSrc : String :=
+"ll $t0, 4($sp)\n" ++
+"sc $t0, 4($sp)\n"
+
+def llscProg : Program :=
+  match assemble llscSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard llscProg.getD textBase 0 = encode (.ll 29#32 8#32 4#32)
+#guard llscProg.getD (textBase + 4#32) 0 = encode (.sc 29#32 8#32 4#32)
+#guard decode (llscProg.getD textBase 0) = some (.ll 29#32 8#32 4#32)
+#guard decode (llscProg.getD (textBase + 4#32) 0) = some (.sc 29#32 8#32 4#32)
 
 -- One error case per major `AsmError` kind.
 #guard (assemble "frobnicate $t0, $t1\n").isOk = false
