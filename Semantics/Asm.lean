@@ -23,7 +23,13 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   funct = 0x0c, i.e. word `0x0000000C`). Plus the MIPS32/MIPS32r2 additions
   `movn`/`movz` (fit the `rd, rs, rt` R-type shape exactly, table-driven like
   `add`), and `clo`/`clz`/`seb`/`seh` (SPECIAL2/SPECIAL3 opcodes, hand-encoded
-  below since they don't fit any existing `RForm`).
+  below since they don't fit any existing `RForm`); and `jr`/`jalr` (real
+  MIPS32 register-indirect jump/call, opcode 0 funct 0x08/0x09, hand-encoded
+  below since neither fits any existing `RForm` either -- `jr $rs` is
+  one-operand, `jalr $rd, $rs` is two-operand with `rd` first per real
+  MIPS32 assembly syntax (opposite order from the `rs`-then-`rd` field
+  layout); `jalr $rs` -- the one-operand sugar for `jalr $ra, $rs` -- is
+  also supported).
 - The coprocessor-0 trap/exception family (real MIPS32 ISA, added on top of
   the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): `teq`/`tne`/
   `tlt`/`tge`/`tltu`/`tgeu` (`rs, rt` operands, same shape as `mult`/`div`),
@@ -380,10 +386,17 @@ that doesn't match `arith3`/`shift`/`multdiv`/`hilo`); hand-encoded directly
 in `encodeInstruction` below instead of via `rTable`. -/
 private def bshflMnemonics : List String := ["clo", "clz", "seb", "seh"]
 
+/-- Real MIPS32 register-indirect jump/call (opcode 0, funct 0x08/0x09):
+`jr $rs` (one operand) and `jalr $rd, $rs` (two operands, also accepting the
+`jalr $rs` one-operand sugar for `jalr $ra, $rs`) don't fit any existing
+`RForm`'s fixed operand count, so they're hand-encoded directly in
+`encodeInstruction` below, the same way `bshflMnemonics` are. -/
+private def jrJalrMnemonics : List String := ["jr", "jalr"]
+
 private def isKnownMnemonic (m : String) : Bool :=
   rTable.any (·.1 == m) ∨ iTable.any (·.1 == m) ∨ jTable.any (·.1 == m) ∨
     bTable.any (·.1 == m) ∨ cop1Table.any (·.1 == m) ∨ pseudoSet.contains m ∨
-    directiveSet.contains m ∨ bshflMnemonics.contains m
+    directiveSet.contains m ∨ bshflMnemonics.contains m ∨ jrJalrMnemonics.contains m
 
 /-- Number of 32-bit words a `li $rt, v` expansion emits, per
 `PseudoOps.txt` lines 245-247: sign-extendable-16-bit values use a single
@@ -823,6 +836,27 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
         let rt ← parseRegister rtT item.lineNo
         pure [opRtWord 0x1f 0 rt rd 0x18 0x20]
     | _ => throw (.badOperand s!"seh expects 'rd, rt'" item.lineNo)
+  -- Register-indirect jump/call (real MIPS32 `jr`/`jalr`, opcode 0, funct
+  -- 0x08/0x09; see `Instruction.lean`'s `.jr`/`.jalr` docstrings). `rt`/
+  -- `shamt` are unused/fixed 0 in the real encoding.
+  | "jr" =>
+    match item.operands with
+    | [rsT] => do
+        let rs ← parseRegister rsT item.lineNo
+        pure [rtWord rs 0 0 0 0x08]
+    | _ => throw (.badOperand s!"jr expects 'rs'" item.lineNo)
+  | "jalr" =>
+    match item.operands with
+    | [rdT, rsT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rs ← parseRegister rsT item.lineNo
+        pure [rtWord rs 0 rd 0 0x09]
+    -- One-operand sugar: `jalr $rs` == `jalr $ra, $rs` (rd defaults to 31),
+    -- per real MIPS32 assembly syntax.
+    | [rsT] => do
+        let rs ← parseRegister rsT item.lineNo
+        pure [rtWord rs 0 31 0 0x09]
+    | _ => throw (.badOperand s!"jalr expects 'rd, rs' or 'rs'" item.lineNo)
   | "break" =>
     match item.operands with
     | [] => pure [0x0000000D#32]              -- all fields zero except funct = 0x0d
@@ -1036,6 +1070,28 @@ def sebSehProg : Program :=
 #guard sebSehProg.getD (textBase + 4#32) 0 = (natToW32 0x1f <<< 26) ||| mkRT (0#32) (9#32) (8#32) (0x18#32) (0x20#32)
 #guard decode (sebSehProg.getD textBase 0) = some (.seb 8#32 9#32)
 #guard decode (sebSehProg.getD (textBase + 4#32) 0) = some (.seh 8#32 9#32)
+
+-- `jr $rs` / `jalr $rd, $rs`: real MIPS32 register-indirect jump/call,
+-- opcode 0, funct 0x08/0x09. Also covers the `jalr $rs` one-operand sugar
+-- (rd defaults to $ra = 31).
+def jrJalrSrc : String := "jr $ra\njalr $t0, $t1\njalr $t2\n"
+def jrJalrProg : Program :=
+  match assemble jrJalrSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard jrJalrProg.getD textBase 0 = mkRT (31#32) (0#32) (0#32) (0#32) (0x08#32)
+#guard jrJalrProg.getD (textBase + 4#32) 0 = mkRT (9#32) (0#32) (8#32) (0#32) (0x09#32)
+#guard jrJalrProg.getD (textBase + 8#32) 0 = mkRT (10#32) (0#32) (31#32) (0#32) (0x09#32)
+#guard decode (jrJalrProg.getD textBase 0) = some (.jr 31#32)
+#guard decode (jrJalrProg.getD (textBase + 4#32) 0) = some (.jalr 9#32 8#32)
+#guard decode (jrJalrProg.getD (textBase + 8#32) 0) = some (.jalr 10#32 31#32)
+-- operand-count errors: zero/three operands are rejected for both mnemonics.
+#guard (assemble "jr\n").isOk = false
+#guard (assemble "jr $t0, $t1\n").isOk = false
+#guard (assemble "jalr\n").isOk = false
+#guard (assemble "jalr $t0, $t1, $t2\n").isOk = false
+
 -- `break`: zero operands, all fields zero except funct = 0x0d (0x0000000D);
 -- real MIPS32 encoding (the funct value immediately after `syscall`'s
 -- 0x0c) -- see `Instruction.lean`'s `encode .break`.

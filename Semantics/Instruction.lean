@@ -22,6 +22,11 @@ Field-shape summary (see each constructor's docstring for details):
 - R-type shift (`rd rt shamt`): `sll srl sra` — note `rs` is unused/ignored.
 - R-type mult/div (`rs rt`): `mult multu div divu` — `rd`/`shamt` unused.
 - R-type move (`rd`): `mflo mfhi` — `rs`/`rt`/`shamt` unused.
+- R-type jump register (`rs`): `jr` — `rt`/`rd`/`shamt` unused. (`rs rd`): `jalr`
+  — `rt`/`shamt` unused. Real MIPS32 register-indirect jump/call (MD00086
+  §3.2); like `j`/`jal`, these get the standard one-instruction delay slot
+  via `pendingBranch`, but the target comes from a register read instead of
+  the 26-bit `target` field.
 - R-type bit-count (`rs rd`), SPECIAL2 (opcode 0x1c): `clo clz` — the raw 32-bit
   encoding's `rt` field duplicates `rd` (a real MIPS32 hardware quirk; see each
   constructor's docstring), so it is not modeled as a separate `Instruction`
@@ -138,6 +143,21 @@ inductive Instruction where
   | mflo (rd : W32)
   /-- `$rd = hi` (opcode 0, funct 0x10). -/
   | mfhi (rd : W32)
+  -- R-type jump register (rt, rd/shamt unused as noted per-constructor). Real
+  -- MIPS32 register-indirect jump/call family — shares opcode 0 (SPECIAL)
+  -- with the R-type arithmetic instructions above, distinguished by funct.
+  /-- `PC = $rs`, after the usual one-instruction delay slot (opcode 0,
+  funct 0x08). Real MIPS32 register-indirect jump (MD00086 §3.2); `rt`/`rd`/
+  `shamt` are 0 in the real encoding and carry no information. The canonical
+  function-return idiom is `jr $ra`. -/
+  | jr (rs : W32)
+  /-- `$rd = PC_next + 4` (the address of the instruction *after* the delay
+  slot — same `pc + 8` link-value convention as `jal`); `PC = $rs`, after
+  the usual one-instruction delay slot (opcode 0, funct 0x09). Real MIPS32
+  register-indirect call (MD00086 §3.2), used for indirect procedure calls
+  and function pointers (e.g. `jalr $t9`); `rt`/`shamt` are 0 in the real
+  encoding and carry no information. -/
+  | jalr (rs rd : W32)
   -- R-type SPECIAL2 bit-count (MIPS32). The real 32-bit encoding's `rt` field
   -- (bits 20..16) duplicates `rd` (bits 15..11) "because both fields hold the
   -- same register number" per the ISA; hardware does not read `rt` for these
@@ -349,6 +369,8 @@ def decode (w : W32) : Option Instruction :=
     | 0x1b => some (.divu rs rt)
     | 0x12 => some (.mflo rd)
     | 0x10 => some (.mfhi rd)
+    | 0x08 => some (.jr rs)
+    | 0x09 => some (.jalr rs rd)
     | 0x0c => some .syscall
     | 0x0d => some .break
     | 0x34 => some (.teq rs rt)
@@ -453,6 +475,8 @@ def encode (i : Instruction) : W32 :=
   | .divu  rs rt => mkRT rs rt 0#32 0#32 0x1b#32
   | .mflo rd => mkRT 0#32 0#32 rd 0#32 0x12#32
   | .mfhi rd => mkRT 0#32 0#32 rd 0#32 0x10#32
+  | .jr   rs => mkRT rs 0#32 0#32 0#32 0x08#32
+  | .jalr rs rd => mkRT rs 0#32 rd 0#32 0x09#32
   -- SPECIAL2: duplicate rd into the rt-position field per the real encoding.
   | .clo rs rd => (0x1c#32 <<< 26) ||| mkRT rs rd rd 0#32 0x21#32
   | .clz rs rd => (0x1c#32 <<< 26) ||| mkRT rs rd rd 0#32 0x20#32
@@ -649,6 +673,8 @@ example : encode (.sll 3#32 8#32 5#32) = mkRT 0#32 8#32 3#32 5#32 0x00#32 := by 
 example : encode (.movn 29#32 8#32 3#32) = mkRT 29#32 8#32 3#32 0#32 0x0b#32 := by decide
 example : encode (.clo 29#32 3#32) = (0x1c#32 <<< 26) ||| mkRT 29#32 3#32 3#32 0#32 0x21#32 := by decide
 example : encode (.seb 3#32 8#32) = (0x1f#32 <<< 26) ||| mkRT 0#32 8#32 3#32 0x10#32 0x20#32 := by decide
+example : encode (.jr 29#32) = mkRT 29#32 0#32 0#32 0#32 0x08#32 := by decide
+example : encode (.jalr 29#32 3#32) = mkRT 29#32 0#32 3#32 0#32 0x09#32 := by decide
 -- full round trip for every new instruction (decode ∘ encode = id on the field values we store)
 example : decode (encode (.movn 29#32 8#32 3#32)) = some (.movn 29#32 8#32 3#32) := by decide
 example : decode (encode (.movz 29#32 8#32 3#32)) = some (.movz 29#32 8#32 3#32) := by decide
@@ -656,6 +682,8 @@ example : decode (encode (.clo 29#32 3#32)) = some (.clo 29#32 3#32) := by decid
 example : decode (encode (.clz 29#32 3#32)) = some (.clz 29#32 3#32) := by decide
 example : decode (encode (.seb 3#32 8#32)) = some (.seb 3#32 8#32) := by decide
 example : decode (encode (.seh 3#32 8#32)) = some (.seh 3#32 8#32) := by decide
+example : decode (encode (.jr 29#32)) = some (.jr 29#32) := by decide
+example : decode (encode (.jalr 29#32 3#32)) = some (.jalr 29#32 3#32) := by decide
 example : encode .break = mkRT 0#32 0#32 0#32 0#32 0x0d#32 := by decide
 example : encode (.teq 29#32 8#32) = mkRT 29#32 8#32 0#32 0#32 0x34#32 := by decide
 

@@ -18,6 +18,14 @@ plus `cp0Status`/`cp0Cause`/`cp0Epc`). That addition is grounded in the real
 MIPS32 ISA, not MARS — see the dedicated
 ["Coprocessor 0 / traps and exceptions"](#coprocessor-0--traps-and-exceptions-real-mips32-isa)
 section below, which is explicit about this difference in sourcing.
+Separately, the real MIPS32 register-indirect jump/call pair `jr`/`jalr`
+(the single highest-priority gap identified in
+[`MIPS-COVERAGE-GAPS.md`](MIPS-COVERAGE-GAPS.md) §3.1 — without them no
+compiled function can return or call through a function pointer) has also
+been added, likewise grounded in the real MIPS32 ISA rather than MARS — see
+the dedicated
+["Register-indirect jump/call"](#register-indirect-jumpcall-real-mips32-isa)
+section below.
 
 Conventions pinned elsewhere and assumed here (see
 [`SPEC-NOTES.md`](SPEC-NOTES.md)): one real-MIPS32 branch delay slot per
@@ -739,6 +747,87 @@ Source: `vendor/mars-src/mars/mips/hardware/Memory.java`:
 - **MARS note**: same real-MIPS32 delay-slot override as `beq` (Global
   rule 3).
 - **Source**: `InstructionSet.java`, lines 926–941.
+
+---
+
+## Register-indirect jump/call (real MIPS32 ISA)
+
+`jr` and `jalr` are real MIPS32 instructions that were missing from the
+original v1 subset -- per `docs/spec/MIPS-COVERAGE-GAPS.md` §3.1, this was
+the single highest-priority gap, since without `jr` no compiled MIPS
+function can return (`jr $ra`) and without `jalr` no function pointer /
+dynamic-dispatch call can be made. Per this addition's house rule (same as
+the "MIPS32 / MIPS32r2 additions" and "Coprocessor 0" sections below), their
+semantics are grounded directly in the **standard MIPS32 architecture** --
+"MIPS32 Architecture For Programmers, Volume II-A: The MIPS32 Instruction
+Set" (MD00086, Rev 2.50, §3.2, Table 3-2, pp. 150/155/25) -- not against
+the vendored MARS source; MARS is this project's differential-testing
+oracle, not the spec source. Like every other branch/jump in this document,
+both get exactly one architectural delay slot (Global rule 3): `pendingBranch`
+schedules the register-read target, falling through to the delay-slot
+instruction first, exactly like `j`/`jal`.
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `jr` | R | `PC = $rs` |
+| `jalr` | R | `$rd = PC_next + 4; PC = $rs` |
+
+### jr (R)
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=001000` (0x08). Fields:
+  `000000 sssss 00000 00000 00000 001000` → `rs=sssss` (the only field
+  that carries information); `rt`/`rd`/`shamt` are `0` in the real encoding
+  and are not modeled as separate `Instruction` fields (see
+  `Instruction.lean`'s `.jr` docstring).
+- **Semantics**: Jump Register. Schedules `PC = $rs` -- the full raw 32-bit
+  register value, *not* a 26-bit target field composed with `PC_next`'s top
+  4 bits like `j` -- as the delay-slot transfer (Global rule 3); `jr`
+  itself falls through to `PC_next` so the delay-slot instruction executes
+  first. The canonical real-MIPS32 function-return idiom is `jr $ra`
+  (return to the address `jal`/`jalr` linked into `$ra`); it is also used
+  for compiled switch-statement jump tables and other computed branches.
+- **Errors/halts**: none directly from `jr` itself. If `$rs` holds a value
+  that is not 4-byte-aligned, this is **not** special-cased at the point
+  `jr` schedules it: the misalignment surfaces as the ordinary
+  `HaltReason.addressError` the *next* time `step` tries to fetch an
+  instruction at that address (`fetchWord`'s existing alignment check),
+  identical to any other misaligned `PC` (Global rule 5). A branch/jump
+  occupying `jr`'s own delay slot halts with `HaltReason.branchInDelaySlot`
+  (Global rule 3).
+- **ISA note**: standard MIPS32 instruction (MIPS I onward); not MARS-
+  sourced (see this section's header note). MARS itself does implement
+  `jr`, but with its own default `DelayedBranching=false` no-delay-slot
+  timing -- this spec instead gives it the real-MIPS32 one-delay-slot
+  semantics, the same override every other branch/jump in this document
+  already receives (Global rule 3).
+- **Source**: MD00086 Rev 2.50, §3.2, Table 3-2, p. 25 and p. 155 ("JR"
+  instruction page).
+
+### jalr (R)
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=001001` (0x09). Fields:
+  `000000 sssss 00000 ddddd 00000 001001` → `rs=sssss` (jump target
+  source), `rd=ddddd` (link destination); `rt`/`shamt` are `0` in the real
+  encoding and are not modeled as separate `Instruction` fields (see
+  `Instruction.lean`'s `.jalr` docstring). Real MIPS32 assembly syntax also
+  allows the one-operand form `jalr $rs` as sugar for `jalr $ra, $rs`
+  (`rd` defaults to `31`); the assembler (`Asm.lean`) supports this sugar.
+- **Semantics**: Jump and Link Register. `$rd = PC_next + 4` (i.e.
+  `pc + 8`, the address *after* the delay slot -- same link-value
+  convention as `jal`, Global rule 1/3, since the delay-slot instruction
+  still executes before control can return to `$rd`); then schedules
+  `PC = $rs` (the raw register value, same target computation as `jr`) as
+  the delay-slot transfer. `jalr` itself falls through to `PC_next` so the
+  delay-slot instruction executes first. If `rd == rs`, the jump target is
+  read from `$rs` *before* `$rd` is overwritten with the link value, so
+  `jalr $t9, $t9` still jumps to the original `$t9` value. Used for
+  indirect procedure calls, dynamic linking stubs, and calls through a
+  function pointer (the common real-MIPS32 ABI idiom `jalr $t9`).
+- **Errors/halts**: same misaligned-`$rs`-target and delay-slot-in-delay-
+  slot conditions as `jr` above.
+- **ISA note**: standard MIPS32 instruction (MIPS I onward); not MARS-
+  sourced (see this section's header note), same real-MIPS32 one-delay-slot
+  override as `jr`/`j`/`jal` (Global rule 3).
+- **Source**: MD00086 Rev 2.50, §3.2, Table 3-2, p. 25 and p. 150 ("JALR"
+  instruction page).
 
 ---
 
