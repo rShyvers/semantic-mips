@@ -194,7 +194,7 @@ theorem add_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rd) sumBV) with
             pc := (writeReg s (regIdxSpec rd) sumBV).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -236,7 +236,7 @@ theorem sub_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rd) diffBV) with
             pc := (writeReg s (regIdxSpec rd) diffBV).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -262,7 +262,7 @@ theorem addi_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) sumBV) with
             pc := (writeReg s (regIdxSpec rt) sumBV).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -288,7 +288,7 @@ theorem div_spec_raw (p : Program) (s : State) (w rs rt : W32)
         StepResult.next { s with pc := s.pc + 4#32 }
       else
         StepResult.next { s with lo := ofInt32 (a.tdiv b), hi := ofInt32 (a.tmod b), pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -352,7 +352,7 @@ theorem beq_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -371,7 +371,7 @@ theorem bne_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       else
         StepResult.next
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -467,7 +467,7 @@ theorem jal_spec_raw (p : Program) (s : State) (w target : W32)
       StepResult.next
         { (writeReg s 31 (pcNext + 4#32)) with
           pc := pcNext, pendingBranch := some ((pcNext &&& 0xf0000000#32) ||| (target <<< 2)) } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -503,7 +503,7 @@ theorem branch_in_delay_slot_halts (p : Program) (s : State) (w : W32) (instr : 
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some instr)
     (hpb : s.pendingBranch.isSome = true) (hbr : isBranchLikeSpec instr = true) :
     step p s = StepResult.halt .branchInDelaySlot := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   cases pb with
   | none => simp at hpb
@@ -531,7 +531,7 @@ theorem lw_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) v) with
             pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -579,7 +579,7 @@ theorem lb_lbu_spec_raw (p : Program) (s : State) (wb wbu rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)) with
             pc := (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)).pc + 4#32 }) := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   constructor
@@ -934,7 +934,7 @@ theorem addu_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) sumBV) with
           pc := (writeReg s (regIdxSpec rd) sumBV).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -954,7 +954,7 @@ theorem subu_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) diffBV) with
           pc := (writeReg s (regIdxSpec rd) diffBV).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -973,7 +973,7 @@ theorem and_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
       let v := readReg s (regIdxSpec rs) &&& readReg s (regIdxSpec rt)
       StepResult.next
         { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -992,7 +992,7 @@ theorem or_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
       let v := readReg s (regIdxSpec rs) ||| readReg s (regIdxSpec rt)
       StepResult.next
         { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1011,7 +1011,7 @@ theorem xor_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
       let v := readReg s (regIdxSpec rs) ^^^ readReg s (regIdxSpec rt)
       StepResult.next
         { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1030,7 +1030,7 @@ theorem nor_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
       let v := ~~~(readReg s (regIdxSpec rs) ||| readReg s (regIdxSpec rt))
       StepResult.next
         { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1050,7 +1050,7 @@ theorem slt_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
                then 1#32 else 0#32
       StepResult.next
         { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1070,7 +1070,7 @@ theorem sltu_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
                then 1#32 else 0#32
       StepResult.next
         { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1095,7 +1095,7 @@ theorem movn_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
             pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rs))).pc + 4#32 }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1154,7 +1154,7 @@ theorem movz_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
             pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rs))).pc + 4#32 }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1289,7 +1289,7 @@ theorem sll_spec_raw (p : Program) (s : State) (w rd rt shamt : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) <<< shamt.toNat)) with
           pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) <<< shamt.toNat)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1309,7 +1309,7 @@ theorem srl_spec_raw (p : Program) (s : State) (w rd rt shamt : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) >>> shamt.toNat)) with
           pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) >>> shamt.toNat)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1330,7 +1330,7 @@ theorem sra_spec_raw (p : Program) (s : State) (w rd rt shamt : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).sshiftRight shamt.toNat)) with
           pc := (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).sshiftRight shamt.toNat)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1353,7 +1353,7 @@ theorem sllv_spec_raw (p : Program) (s : State) (w rd rt rs : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) <<< amt)) with
           pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) <<< amt)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1374,7 +1374,7 @@ theorem srlv_spec_raw (p : Program) (s : State) (w rd rt rs : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) >>> amt)) with
           pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) >>> amt)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1394,7 +1394,7 @@ theorem srav_spec_raw (p : Program) (s : State) (w rd rt rs : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).sshiftRight amt)) with
           pc := (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).sshiftRight amt)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1415,7 +1415,7 @@ theorem rotr_spec_raw (p : Program) (s : State) (w rd rt sa : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).rotateRight sa.toNat)) with
           pc := (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).rotateRight sa.toNat)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1436,7 +1436,7 @@ theorem rotrv_spec_raw (p : Program) (s : State) (w rd rt rs : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).rotateRight amt)) with
           pc := (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).rotateRight amt)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1569,7 +1569,7 @@ theorem mult_spec_raw (p : Program) (s : State) (w rs rt : W32)
       let prod64 : BitVec 64 := BitVec.ofInt 64 (a * b)
       StepResult.next
         { s with lo := prod64.extractLsb 31 0, hi := prod64.extractLsb 63 32, pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1592,7 +1592,7 @@ theorem multu_spec_raw (p : Program) (s : State) (w rs rt : W32)
       let prod64 : BitVec 64 := BitVec.ofNat 64 (a * b)
       StepResult.next
         { s with lo := prod64.extractLsb 31 0, hi := prod64.extractLsb 63 32, pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1637,7 +1637,7 @@ theorem divu_spec_raw (p : Program) (s : State) (w rs rt : W32)
         StepResult.next { s with pc := s.pc + 4#32 }
       else
         StepResult.next { s with lo := BitVec.ofNat 32 (a / b), hi := BitVec.ofNat 32 (a % b), pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1681,7 +1681,7 @@ theorem mflo_spec_raw (p : Program) (s : State) (w rd : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) s.lo) with
           pc := (writeReg s (regIdxSpec rd) s.lo).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1700,7 +1700,7 @@ theorem mfhi_spec_raw (p : Program) (s : State) (w rd : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) s.hi) with
           pc := (writeReg s (regIdxSpec rd) s.hi).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1717,7 +1717,7 @@ theorem mthi_spec_raw (p : Program) (s : State) (w rs : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.mthi rs))
     (hpb : s.pendingBranch = none) :
     step p s = StepResult.next { s with hi := readReg s (regIdxSpec rs), pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1734,7 +1734,7 @@ theorem mtlo_spec_raw (p : Program) (s : State) (w rs : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.mtlo rs))
     (hpb : s.pendingBranch = none) :
     step p s = StepResult.next { s with lo := readReg s (regIdxSpec rs), pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1807,7 +1807,7 @@ theorem madd_spec_raw (p : Program) (s : State) (w rs rt : W32)
       let sum64 := acc64 + prod64
       StepResult.next
         { s with lo := sum64.extractLsb 31 0, hi := sum64.extractLsb 63 32, pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1833,7 +1833,7 @@ theorem maddu_spec_raw (p : Program) (s : State) (w rs rt : W32)
       let sum64 := acc64 + prod64
       StepResult.next
         { s with lo := sum64.extractLsb 31 0, hi := sum64.extractLsb 63 32, pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1859,7 +1859,7 @@ theorem msub_spec_raw (p : Program) (s : State) (w rs rt : W32)
       let diff64 := acc64 - prod64
       StepResult.next
         { s with lo := diff64.extractLsb 31 0, hi := diff64.extractLsb 63 32, pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1884,7 +1884,7 @@ theorem msubu_spec_raw (p : Program) (s : State) (w rs rt : W32)
       let diff64 := acc64 - prod64
       StepResult.next
         { s with lo := diff64.extractLsb 31 0, hi := diff64.extractLsb 63 32, pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1952,7 +1952,7 @@ theorem sw_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { ({ s' with llBit := false }) with
             pc := ({ s' with llBit := false }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1988,7 +1988,7 @@ theorem lh_lhu_spec_raw (p : Program) (s : State) (wh whu rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) h) with
             pc := (writeReg s (regIdxSpec rt) h).pc + 4#32 }) := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   constructor
@@ -2020,7 +2020,7 @@ theorem sh_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { ({ s' with llBit := false }) with
             pc := ({ s' with llBit := false }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2045,7 +2045,7 @@ theorem ll_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { ({ (writeReg s (regIdxSpec rt) v) with llBit := true }) with
             pc := ({ (writeReg s (regIdxSpec rt) v) with llBit := true }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2082,7 +2082,7 @@ theorem sc_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
           StepResult.next
             { ({ (writeReg s (regIdxSpec rt) 0#32) with llBit := false }) with
               pc := ({ (writeReg s (regIdxSpec rt) 0#32) with llBit := false }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2188,7 +2188,7 @@ theorem blez_spec_raw (p : Program) (s : State) (w rs imm : W32)
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2231,7 +2231,7 @@ theorem bgtz_spec_raw (p : Program) (s : State) (w rs imm : W32)
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2273,7 +2273,7 @@ theorem j_spec_raw (p : Program) (s : State) (w target : W32)
       let pcNext := s.pc + 4#32
       StepResult.next
         { s with pc := pcNext, pendingBranch := some ((pcNext &&& 0xf0000000#32) ||| (target <<< 2)) } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2295,7 +2295,7 @@ theorem jr_spec_raw (p : Program) (s : State) (w rs : W32)
     step p s =
       StepResult.next
         { s with pc := s.pc + 4#32, pendingBranch := some (readReg s (regIdxSpec rs)) } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2320,7 +2320,7 @@ theorem jalr_spec_raw (p : Program) (s : State) (w rs rd : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) (pcNext + 4#32)) with
           pc := pcNext, pendingBranch := some (readReg s (regIdxSpec rs)) } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2377,7 +2377,7 @@ theorem bltz_spec_raw (p : Program) (s : State) (w rs imm : W32)
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2416,7 +2416,7 @@ theorem bgez_spec_raw (p : Program) (s : State) (w rs imm : W32)
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2463,7 +2463,7 @@ theorem bltzal_spec_raw (p : Program) (s : State) (w rs imm : W32)
         StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s' with pc := pcNext } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2523,7 +2523,7 @@ theorem bgezal_spec_raw (p : Program) (s : State) (w rs imm : W32)
         StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s' with pc := pcNext } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2700,7 +2700,7 @@ theorem addiu_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) + signExt16 imm)) with
           pc := (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) + signExt16 imm)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2720,7 +2720,7 @@ theorem slti_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
                then 1#32 else 0#32
       StepResult.next
         { (writeReg s (regIdxSpec rt) v) with pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2744,7 +2744,7 @@ theorem sltiu_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
                then 1#32 else 0#32
       StepResult.next
         { (writeReg s (regIdxSpec rt) v) with pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2765,7 +2765,7 @@ theorem andi_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) &&& zeroExt16 imm)) with
           pc := (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) &&& zeroExt16 imm)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2785,7 +2785,7 @@ theorem ori_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) ||| zeroExt16 imm)) with
           pc := (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) ||| zeroExt16 imm)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2805,7 +2805,7 @@ theorem xori_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) ^^^ zeroExt16 imm)) with
           pc := (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) ^^^ zeroExt16 imm)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2827,7 +2827,7 @@ theorem lui_spec_raw (p : Program) (s : State) (w rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) (zeroExt16 imm <<< 16)) with
           pc := (writeReg s (regIdxSpec rt) (zeroExt16 imm <<< 16)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2920,7 +2920,7 @@ theorem break_spec_raw (p : Program) (s : State) (w : W32)
             cp0Cause := excCodeBp <<< 2
             cp0Status := s.cp0Status ||| statusExlMask
             pc := exceptionVectorAddr } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2955,7 +2955,7 @@ theorem teq_spec_raw (p : Program) (s : State) (w rs rt : W32)
               pc := exceptionVectorAddr }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2980,7 +2980,7 @@ theorem tne_spec_raw (p : Program) (s : State) (w rs rt : W32)
               pc := exceptionVectorAddr }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3006,7 +3006,7 @@ theorem tlt_spec_raw (p : Program) (s : State) (w rs rt : W32)
               pc := exceptionVectorAddr }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3032,7 +3032,7 @@ theorem tge_spec_raw (p : Program) (s : State) (w rs rt : W32)
               pc := exceptionVectorAddr }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3058,7 +3058,7 @@ theorem tltu_spec_raw (p : Program) (s : State) (w rs rt : W32)
               pc := exceptionVectorAddr }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3084,7 +3084,7 @@ theorem tgeu_spec_raw (p : Program) (s : State) (w rs rt : W32)
               pc := exceptionVectorAddr }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3176,7 +3176,7 @@ theorem mfc1_spec_raw (p : Program) (s : State) (w rt fs : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) (readFpReg s (regIdxSpec fs))) with
           pc := (writeReg s (regIdxSpec rt) (readFpReg s (regIdxSpec fs))).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3196,7 +3196,7 @@ theorem mtc1_spec_raw (p : Program) (s : State) (w rt fs : W32)
       StepResult.next
         { (writeFpReg s (regIdxSpec fs) (readReg s (regIdxSpec rt))) with
           pc := (writeFpReg s (regIdxSpec fs) (readReg s (regIdxSpec rt))).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3221,7 +3221,7 @@ theorem lwc1_spec_raw (p : Program) (s : State) (w rs ft imm : W32)
         StepResult.next
           { (writeFpReg s (regIdxSpec ft) v) with
             pc := (writeFpReg s (regIdxSpec ft) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3260,7 +3260,7 @@ theorem swc1_spec_raw (p : Program) (s : State) (w rs ft imm : W32)
         StepResult.next
           { ({ s' with llBit := false }) with
             pc := ({ s' with llBit := false }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3294,7 +3294,7 @@ theorem absS_spec_raw (p : Program) (s : State) (w fd fs : W32)
       StepResult.next
         { (writeFpReg s (regIdxSpec fd) (readFpReg s (regIdxSpec fs) &&& 0x7fffffff#32)) with
           pc := (writeFpReg s (regIdxSpec fd) (readFpReg s (regIdxSpec fs) &&& 0x7fffffff#32)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3315,7 +3315,7 @@ theorem negS_spec_raw (p : Program) (s : State) (w fd fs : W32)
       StepResult.next
         { (writeFpReg s (regIdxSpec fd) (readFpReg s (regIdxSpec fs) ^^^ 0x80000000#32)) with
           pc := (writeFpReg s (regIdxSpec fd) (readFpReg s (regIdxSpec fs) ^^^ 0x80000000#32)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3399,7 +3399,7 @@ theorem mfc0_spec_raw (p : Program) (s : State) (w rt rd : W32)
           { (writeReg s (regIdxSpec rt) s.cp0Epc) with
             pc := (writeReg s (regIdxSpec rt) s.cp0Epc).pc + 4#32 }
       | _ => StepResult.halt (.illegalInstruction w) := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3430,7 +3430,7 @@ theorem mtc0_spec_raw (p : Program) (s : State) (w rt rd : W32)
           { ({ s with cp0Epc := readReg s (regIdxSpec rt) }) with
             pc := ({ s with cp0Epc := readReg s (regIdxSpec rt) }).pc + 4#32 }
       | _ => StepResult.halt (.illegalInstruction w) := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3463,7 +3463,7 @@ theorem eret_spec_raw (p : Program) (s : State) (w : W32)
     (hpb : s.pendingBranch = none) :
     step p s =
       StepResult.next { s with pc := s.cp0Epc, cp0Status := s.cp0Status &&& ~~~statusExlMask } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3489,7 +3489,7 @@ theorem eret_bypasses_delay_slot (p : Program) (s : State) (w t : W32)
     (hpb : s.pendingBranch = some t) :
     step p s =
       StepResult.next { s with pc := s.cp0Epc, cp0Status := s.cp0Status &&& ~~~statusExlMask } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3507,7 +3507,7 @@ theorem wait_spec_raw (p : Program) (s : State) (w : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some .wait)
     (hpb : s.pendingBranch = none) :
     step p s = StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3613,7 +3613,7 @@ theorem addS_spec_raw (p : Program) (s : State) (w fd fs ft : W32)
       StepResult.next
         { (writeFpReg s (regIdxSpec fd) (bitsOfFloatSpec v)) with
           pc := (writeFpReg s (regIdxSpec fd) (bitsOfFloatSpec v)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3679,7 +3679,7 @@ theorem lwl_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) v) with
           pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3726,7 +3726,7 @@ theorem lwr_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) v) with
           pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3764,7 +3764,7 @@ theorem swl_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { ({ s' with llBit := false }) with
           pc := ({ s' with llBit := false }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3805,7 +3805,7 @@ theorem swr_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { ({ s' with llBit := false }) with
           pc := ({ s' with llBit := false }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -4030,7 +4030,7 @@ theorem lb_spec_raw' (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) ((BitVec.ofNat 8 b.toNat).signExtend 32)) with
             pc := (writeReg s (regIdxSpec rt) ((BitVec.ofNat 8 b.toNat).signExtend 32)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -4053,7 +4053,7 @@ theorem lbu_spec_raw' (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)) with
             pc := (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -4076,7 +4076,7 @@ theorem lh_spec_raw' (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) (signExt16 h)) with
             pc := (writeReg s (regIdxSpec rt) (signExt16 h)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -4099,7 +4099,7 @@ theorem lhu_spec_raw' (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) h) with
             pc := (writeReg s (regIdxSpec rt) h).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
