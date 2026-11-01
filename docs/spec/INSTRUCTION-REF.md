@@ -7,11 +7,24 @@ cited against the vendored MARS 4.5 source (`vendor/mars-src/`). Where MARS
 deviates from "textbook" MIPS, or where the source is ambiguous/inconsistent,
 this is flagged explicitly rather than normalized away.
 
+A later, purely-additive extension ("MIPS32 / MIPS32r2 additions" section,
+near the end of this document) adds six more real MIPS32/MIPS32r2 integer
+instructions (`movn`, `movz`, `clo`, `clz`, `seb`, `seh`) beyond the original
+v1 subset. Those six are grounded directly in the standard MIPS32 ISA rather
+than the MARS source (see that section's header note for why).
+On top of that MARS-grounded v1 set, a minimal coprocessor-0 trap/exception
+model has since been added (`teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu`/`break`,
+plus `cp0Status`/`cp0Cause`/`cp0Epc`). That addition is grounded in the real
+MIPS32 ISA, not MARS — see the dedicated
+["Coprocessor 0 / traps and exceptions"](#coprocessor-0--traps-and-exceptions-real-mips32-isa)
+section below, which is explicit about this difference in sourcing.
+
 Conventions pinned elsewhere and assumed here (see
-[`SPEC-NOTES.md`](SPEC-NOTES.md)): no branch delay slots (`DelayedBranching`
-default `false`); execution starts at `0x00400000`; big-endian memory;
-32 GPRs plus separate 64-bit `hi`/`lo` pair (internally registers 33/34);
-`$zero` write-ignored.
+[`SPEC-NOTES.md`](SPEC-NOTES.md)): one real-MIPS32 branch delay slot per
+branch/jump (not MARS's default `DelayedBranching=false` no-delay-slot
+config — see Global rule 3); execution starts at `0x00400000`; big-endian
+memory; 32 GPRs plus separate 64-bit `hi`/`lo` pair (internally registers
+33/34); `$zero` write-ignored.
 
 All line numbers below refer to
 `vendor/mars-src/mars/mips/instructions/InstructionSet.java` unless otherwise
@@ -68,6 +81,13 @@ execution logic (method `populate()`, lines 77–3236).
 | syscall 4 | — | print null-terminated byte string starting at address `$a0` |
 | syscall 10 | — | terminate program normally |
 | syscall 11 | — | print low byte of `$a0` as a character |
+| `teq` | R | `if ($rs == $rt) trap` |
+| `tne` | R | `if ($rs != $rt) trap` |
+| `tlt` | R | `if ($rs < $rt) trap`, signed |
+| `tge` | R | `if ($rs >= $rt) trap`, signed |
+| `tltu` | R | `if ($rs < $rt) trap`, unsigned |
+| `tgeu` | R | `if ($rs >= $rt) trap`, unsigned |
+| `break` | R | unconditional trap |
 
 `PC_next` denotes the program counter value *after* the fetched instruction
 has been accounted for, i.e. `PC_at_fetch + 4` — see Global rule 1.
@@ -94,26 +114,29 @@ Source: `vendor/mars-src/mars/simulator/Simulator.java`, lines 325–327
   (`PC_next` in this document).
 - **Non-control-flow instructions** (arith/logic/mem): PC is left at
   `PC_next`; execution continues there.
-- **Branches** (`beq`,`bne`,`blez`,`bgtz`): on taken condition,
-  `processBranch(displacement)` sets
+- **Branches** (`beq`,`bne`,`blez`,`bgtz`): the *target address formula* is
   `PC = PC_next + (displacement << 2)` (`InstructionSet.java` line ~3272,
-  the delayed-branching-off path; the comment literally reads "Decrement
-  needed because PC has already been incremented" and that decrement is
-  commented out). `displacement` is the instruction's signed 16-bit offset
-  field, i.e. the branch target is PC-relative to the instruction *after*
-  the branch, scaled by 4 — standard MIPS branch-target arithmetic, but
-  **with no delay slot executed** (see rule 3).
-- **Jumps** (`j`,`jal`): `processJump(targetAddress)` sets
-  `PC = targetAddress` directly, where
+  `processBranch`; `displacement` is the instruction's signed 16-bit offset
+  field) — standard MIPS branch-target arithmetic, PC-relative to the
+  instruction *after* the branch, scaled by 4. **Our semantics overrides
+  MARS's *timing* of when this target is applied**: real MIPS32 always
+  executes one delay-slot instruction first (see rule 3), so a taken branch
+  *schedules* this target rather than jumping to it immediately (MARS's
+  default `DelayedBranching=false` path jumps immediately instead; we do
+  not follow that part of MARS).
+- **Jumps** (`j`,`jal`): the *target address formula* is
   `targetAddress = (PC_next & 0xF0000000) | (target_field << 2)`
-  (`InstructionSet.java` lines ~1207–1211, 1238–1240). Note the top 4 bits
-  come from `PC_next` (the already-incremented PC), not from the jump
-  instruction's own address.
-- **Link instructions** (`jal`): `processReturnAddress(31)` sets
-  `$ra = PC_next` (plus `INSTRUCTION_LENGTH` only if delayed branching is
-  enabled, which is off by default) — `InstructionSet.java` lines
-  3309–3315. With delayed branching off (our v1 scope), `$ra` is exactly the
-  address of the instruction following `jal`.
+  (`InstructionSet.java` lines ~1207–1211, 1238–1240) — the top 4 bits come
+  from `PC_next`, not from the jump instruction's own address. As with
+  branches, our semantics *schedules* this target via the delay slot (rule
+  3) rather than applying it immediately.
+- **Link instructions** (`jal`): the address-*formula* source
+  (`processReturnAddress(31)`, `InstructionSet.java` lines 3309–3315) sets
+  `$ra = PC_next` only when delayed branching is disabled (MARS's default).
+  **Our semantics does not follow that**: since we always execute one
+  delay-slot instruction, `$ra` must be `PC_next + 4` (`pc + 8` relative to
+  `jal`'s own address) — the address *after* the delay slot — matching real
+  MIPS32, not MARS's no-delay-slot default (see rule 3).
 
 ### 2. `$zero` is write-ignored
 
@@ -124,18 +147,48 @@ array. Reads of register 0 always return `0` (it is initialized to 0 and
 never written). Every instruction below that writes `$rd`/`$rt` is silently
 a no-op if that operand is `$zero`.
 
-### 3. No branch delay slot (default configuration)
+### 3. Branch/jump delay slots (real MIPS32 semantics)
 
-Source: `vendor/mars-src/mars/mips/instructions/InstructionSet.java`,
-`processBranch`/`processJump` (lines 3265–3306), gated on
-`Globals.getSettings().getDelayedBranchingEnabled()`, and
-`vendor/mars-src/mars/Settings.java` (`DelayedBranching` defaults to
-`false`, per `SPEC-NOTES.md` §3). With the default setting, a taken
-branch/jump updates `PC` immediately to the target; the next instruction
-fetched is the one at the target, **not** the instruction physically
-following the branch/jump in memory. **This differs from real MIPS
-hardware**, which always executes one delay-slot instruction after every
-branch/jump. Flagged per-instruction below.
+Ground truth: the real MIPS32 architecture (not MARS). Every branch
+(`beq`,`bne`,`blez`,`bgtz`) and jump (`j`,`jal`) has exactly **one**
+architecturally-mandated delay slot: the single instruction immediately
+following it in program order always executes — whether or not the branch
+is taken — *before* control transfers to the target.
+
+- **Taken branch/jump**: the delay-slot instruction (at `pc + 4`) executes
+  normally; *after* it retires, `pc` becomes the branch/jump target (not
+  `pc + 4 + 4`). Modeled in `Semantics/Step.lean` as: the branch/jump
+  itself falls through to `pc + 4` and records the real target in
+  `State.pendingBranch : Option W32`; the delay-slot instruction's own step
+  (any ordinary, non-branch-like instruction) commits the scheduled target
+  to `pc` via `advance`/`mkNext`.
+- **Not-taken branch**: behaves exactly like an ordinary instruction (falls
+  through to `pc + 4`, `pendingBranch` stays `none`) — no observable
+  difference from a world without delay slots.
+- **`jal`'s `$ra`** is `pc + 8` (past the delay slot), not `pc + 4` — see
+  rule 1.
+- **A branch/jump occurring itself in another's delay slot** (i.e.
+  immediately after a *taken* branch/jump) is architecturally
+  discouraged/implementation-defined on real MIPS32. Rather than guess,
+  `step` halts with `HaltReason.branchInDelaySlot` whenever the instruction
+  about to execute is itself one of the six branch/jump instructions and
+  `State.pendingBranch` is still `some _` from the previous step — this
+  keeps `step` total and the condition diagnosable instead of silently
+  picking an arbitrary (and likely wrong) behavior.
+
+This **overrides MARS's own default configuration**
+(`vendor/mars-src/mars/mips/instructions/InstructionSet.java`,
+`processBranch`/`processJump`, lines 3265–3306, gated on
+`Globals.getSettings().getDelayedBranchingEnabled()`;
+`vendor/mars-src/mars/Settings.java`'s `DelayedBranching` defaults to
+`false`), under which a taken branch/jump updates `PC` to the target
+*immediately*, with no delay-slot instruction executed at all. MARS is only
+ever used by this project as a differential-testing oracle, not as the spec
+source (`SPEC-NOTES.md` §9 item 1); on this point we deliberately diverge
+from MARS's default to match the real architecture instead. (MARS *can*
+model delay slots if `DelayedBranching` is enabled, which would then agree
+with this rule — but that MARS setting is not why we implement it this
+way.)
 
 ### 4. Big-endian load/store byte order
 
@@ -598,31 +651,40 @@ Source: `vendor/mars-src/mars/mips/hardware/Memory.java`:
   `000010 ffffffffffffffffffffffffff` → `target=ffff...`(26-bit field,
   operand index 0; assembled from an absolute word address shifted right 2,
   per `ProgramStatement.java` line ~357).
-- **Semantics**: `PC = (PC_next & 0xF0000000) | (target << 2)`. `PC_next`
-  is the PC *after* this instruction's fetch-increment (rule 1), so the top
-  4 bits of the jump target come from the region containing the
-  instruction *after* `j`, not `j` itself (normal MIPS pseudo-direct
-  jump semantics).
+- **Semantics**: schedules `PC = (PC_next & 0xF0000000) | (target << 2)`
+  as the delay-slot transfer (Global rule 3) rather than applying it
+  immediately; `j` itself falls through to `PC_next` so the delay-slot
+  instruction executes first. `PC_next` is the PC *after* this
+  instruction's fetch-increment (rule 1), so the top 4 bits of the jump
+  target come from the region containing the instruction *after* `j`, not
+  `j` itself (normal MIPS pseudo-direct jump semantics).
 - **Errors/halts**: none directly; a bad target can later cause an
-  instruction-fetch `AddressErrorException` on the next fetch.
-- **MARS note**: **DEVIATION** — no delay slot executed (Global rule 3);
-  `PC` becomes the target immediately rather than after one more
-  sequential instruction, differing from real MIPS hardware's defined
-  delay-slot semantics.
+  instruction-fetch `AddressErrorException` on the next fetch; a branch/jump
+  occupying `j`'s own delay slot halts with `HaltReason.branchInDelaySlot`
+  (Global rule 3).
+- **MARS note**: our semantics **overrides MARS's default**
+  (`DelayedBranching=false`) and executes one delay-slot instruction before
+  `PC` becomes the target, matching real MIPS hardware's architecturally
+  mandated delay-slot semantics (Global rule 3) rather than MARS's
+  immediate-jump default.
 - **Source**: `InstructionSet.java`, lines 1200–1216;
   `processJump` at lines 3288–3298.
 
 ### jal (J)
 - **Encoding**: `opcode=000011` (0x03). Same field layout as `j`.
-- **Semantics**: `$ra ($31) = PC_next` (via `processReturnAddress(31)`,
-  with delayed branching off this adds no extra offset); then
-  `PC = (PC_next & 0xF0000000) | (target << 2)`, identical target
-  computation to `j`.
-- **Errors/halts**: none directly.
-- **MARS note**: **DEVIATION** — same no-delay-slot behavior as `j` (Global
-  rule 3). Link-address value itself (`PC_next`, i.e. address of the
-  instruction textually following `jal`) matches textbook MIPS; only the
-  absence of delay-slot execution differs.
+- **Semantics**: `$ra ($31) = PC_next + 4` (i.e. `pc + 8`, the address
+  *after* the delay slot — see Global rule 1/3, since the delay-slot
+  instruction still executes before `jal` can return); then schedules
+  `PC = (PC_next & 0xF0000000) | (target << 2)` as the delay-slot transfer,
+  identical target computation to `j`. `jal` itself falls through to
+  `PC_next` so the delay-slot instruction executes first.
+- **Errors/halts**: none directly; a branch/jump occupying `jal`'s own
+  delay slot halts with `HaltReason.branchInDelaySlot` (Global rule 3).
+- **MARS note**: our semantics **overrides MARS's default**
+  (`DelayedBranching=false`, under which `$ra = PC_next` with no delay slot
+  executed) to match real MIPS32: one delay-slot instruction always
+  executes, so `$ra` must be `PC_next + 4` rather than `PC_next` (Global
+  rule 1/3).
 - **Source**: `InstructionSet.java`, lines 1228–1244;
   `processReturnAddress` at lines 3309–3316.
 
@@ -631,21 +693,29 @@ Source: `vendor/mars-src/mars/mips/hardware/Memory.java`:
   `000100 fffff sssss tttttttttttttttt` → `rs=fffff`($t1, operand 0),
   `rt=sssss`($t2, operand 1), `offset=tttt...`(operand 2, 16-bit signed
   word displacement).
-- **Semantics**: if `$rs == $rt` (32-bit equality), `PC = PC_next +
-  (offset << 2)` via `processBranch`; otherwise PC stays at `PC_next`.
+- **Semantics**: if `$rs == $rt` (32-bit equality), schedules
+  `PC = PC_next + (offset << 2)` as the delay-slot transfer (Global rule 3)
+  — `beq` itself still falls through to `PC_next` so the delay-slot
+  instruction executes first; otherwise PC stays at `PC_next` with no
+  scheduled transfer (ordinary fallthrough).
 - **Errors/halts**: none directly from the comparison; a bad target can
-  cause a later fetch error.
-- **MARS note**: **DEVIATION** — no delay slot (Global rule 3): the branch,
-  if taken, redirects fetch to the target on the very next cycle instead of
-  executing one more sequential instruction first.
+  cause a later fetch error; a branch/jump occupying `beq`'s own delay slot
+  (only possible when `beq` is taken) halts with
+  `HaltReason.branchInDelaySlot` (Global rule 3).
+- **MARS note**: our semantics **overrides MARS's default**
+  (`DelayedBranching=false`) and executes one delay-slot instruction before
+  the target takes effect, matching real MIPS hardware (Global rule 3)
+  rather than MARS's immediate-branch default.
 - **Source**: `InstructionSet.java`, lines 858–875;
   `processBranch` at lines 3265–3281.
 
 ### bne (I-branch)
 - **Encoding**: `opcode=000101` (0x05). Same layout as `beq`.
-- **Semantics**: if `$rs != $rt`, `PC = PC_next + (offset << 2)`.
-- **Errors/halts**: none directly.
-- **MARS note**: **DEVIATION** — no delay slot, same as `beq`.
+- **Semantics**: if `$rs != $rt`, schedules `PC = PC_next + (offset << 2)`
+  as the delay-slot transfer, same as `beq` (Global rule 3).
+- **Errors/halts**: none directly; same delay-slot halt condition as `beq`.
+- **MARS note**: same real-MIPS32 delay-slot override as `beq` (Global
+  rule 3).
 - **Source**: `InstructionSet.java`, lines 876–891.
 
 ### blez (I-branch)
@@ -653,18 +723,115 @@ Source: `vendor/mars-src/mars/mips/hardware/Memory.java`:
   `000110 fffff 00000 ssssssssssssssss` → `rs=fffff`($t1, operand 0),
   `rt=00000`(fixed/unused), `offset=ssss...`(operand 1).
 - **Semantics**: if `$rs <= 0` (signed comparison, includes zero),
-  `PC = PC_next + (offset << 2)`.
-- **Errors/halts**: none directly.
-- **MARS note**: **DEVIATION** — no delay slot, same as `beq`.
+  schedules `PC = PC_next + (offset << 2)` as the delay-slot transfer, same
+  as `beq` (Global rule 3).
+- **Errors/halts**: none directly; same delay-slot halt condition as `beq`.
+- **MARS note**: same real-MIPS32 delay-slot override as `beq` (Global
+  rule 3).
 - **Source**: `InstructionSet.java`, lines 942–958.
 
 ### bgtz (I-branch)
 - **Encoding**: `opcode=000111` (0x07). Same layout as `blez`.
-- **Semantics**: if `$rs > 0` (signed, strictly positive), `PC = PC_next +
-  (offset << 2)`.
-- **Errors/halts**: none directly.
-- **MARS note**: **DEVIATION** — no delay slot, same as `beq`.
+- **Semantics**: if `$rs > 0` (signed, strictly positive), schedules
+  `PC = PC_next + (offset << 2)` as the delay-slot transfer, same as `beq`
+  (Global rule 3).
+- **Errors/halts**: none directly; same delay-slot halt condition as `beq`.
+- **MARS note**: same real-MIPS32 delay-slot override as `beq` (Global
+  rule 3).
 - **Source**: `InstructionSet.java`, lines 926–941.
+
+---
+
+## MIPS32 / MIPS32r2 additions (beyond the MARS-matched v1 baseline)
+
+The six instructions in this section (`movn`, `movz`, `clo`, `clz`, `seb`,
+`seh`) are real MIPS32/MIPS32r2 instructions that were out of the original
+v1 subset. Per this addition's house rule, their semantics are grounded
+directly in the **standard MIPS32 architecture** (as specified in the MIPS32
+Architecture Reference Manual, Volume II-A, the "CLO"/"CLZ"/"MOVN"/"MOVZ"/
+"SEB"/"SEH" instruction pages), not against the vendored MARS source —
+MARS is this project's differential-testing oracle, not the spec source,
+and (unlike every v1 instruction above) these encodings/semantics are
+pinned from the ISA directly rather than derived from `InstructionSet.java`
+line citations.
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `movn` | R | `if ($rt != 0) $rd = $rs` (else `$rd` unchanged) |
+| `movz` | R | `if ($rt == 0) $rd = $rs` (else `$rd` unchanged) |
+| `clo` | R (SPECIAL2) | `$rd = count of leading one bits in $rs` (32 if all-ones) |
+| `clz` | R (SPECIAL2) | `$rd = count of leading zero bits in $rs` (32 if all-zero) |
+| `seb` | R (SPECIAL3/BSHFL) | `$rd = sext8($rt[7:0])` |
+| `seh` | R (SPECIAL3/BSHFL) | `$rd = sext16($rt[15:0])` |
+
+### movn (R)
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=001011` (0x0b). Same
+  `rs, rt, rd` field layout as `add`/`slt`/etc.
+- **Semantics**: Move Conditional on Not Zero. If `$rt != 0`, `$rd = $rs`.
+  **If `$rt == 0`, `$rd` is left completely unchanged** — this is a true
+  conditional no-op on the destination register, not "write zero"; a
+  common implementation mistake this spec deliberately avoids (see
+  `Step.lean`'s `movn`/`movz` test cases, which pre-seed `$rd` with a
+  sentinel value to catch exactly this bug).
+- **Errors/halts**: none; no overflow concept.
+- **ISA note**: standard MIPS32r2 instruction, present from MIPS32 Release 1
+  onward alongside `movz`; commonly used to implement branch-free
+  conditional-move idioms (e.g. `a = cond ? b : a`).
+
+### movz (R)
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=001010` (0x0a). Same
+  layout as `movn`.
+- **Semantics**: Move Conditional on Zero. If `$rt == 0`, `$rd = $rs`;
+  otherwise `$rd` is left unchanged (same "true no-op", not "write zero",
+  caveat as `movn`).
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32r2 instruction.
+
+### clo (R, SPECIAL2)
+- **Encoding**: `opcode=011100` (0x1c, SPECIAL2), `funct=100001` (0x21).
+  Fields: `011100 sssss ddddd ddddd 00000 100001` → `rs=sssss` (source),
+  `rd=ddddd` (destination). **Encoding quirk**: the raw `rt` field
+  (bits 20..16) is required by the ISA to carry the *same* register number
+  as `rd` (both field positions are written with the destination register
+  when assembling); hardware does not read `rt` for `clo`. This `Instruction`
+  constructor therefore stores only `(rs, rd)` — see `Instruction.lean`'s
+  `.clo` docstring — and `decode` ignores the raw `rt` field rather than
+  validating or surfacing it, matching real hardware behavior.
+- **Semantics**: Count Leading Ones. `$rd` = the number of consecutive `1`
+  bits starting from the most-significant bit (bit 31) of `$rs`, stopping at
+  the first `0` bit. If `$rs` is all-ones (`0xFFFFFFFF`), the result is `32`.
+- **Errors/halts**: none; no overflow concept.
+- **ISA note**: standard MIPS32 instruction (present since MIPS32 Release 1).
+
+### clz (R, SPECIAL2)
+- **Encoding**: `opcode=011100` (0x1c, SPECIAL2), `funct=100000` (0x20).
+  Same field layout and `rt`-duplicates-`rd` quirk as `clo`.
+- **Semantics**: Count Leading Zeros. `$rd` = the number of consecutive `0`
+  bits starting from bit 31 of `$rs`, stopping at the first `1` bit. If
+  `$rs` is all-zero, the result is `32`.
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32 instruction.
+
+### seb (R, SPECIAL3/BSHFL)
+- **Encoding**: `opcode=011111` (0x1f, SPECIAL3), `funct=100000` (0x20,
+  the shared BSHFL sub-opcode family). Fields: `011111 00000 ttttt ddddd
+  10000 100000` → `rs=00000` (unused/fixed 0), `rt=ttttt` (source),
+  `rd=ddddd` (destination), and the 5-bit shamt-position sub-field fixed to
+  `10000` (0x10) to select SEB specifically out of the BSHFL family (which
+  also includes `wsbh`, `seh`, and others not in this scope — any other
+  sub-field value under funct 0x20 decodes to `none` here).
+- **Semantics**: Sign-Extend Byte. `$rd` = the low byte of `$rt`
+  (`$rt[7:0]`), sign-extended to 32 bits.
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32r2 instruction.
+
+### seh (R, SPECIAL3/BSHFL)
+- **Encoding**: `opcode=011111` (0x1f, SPECIAL3), `funct=100000` (0x20).
+  Same layout as `seb`, but the sub-field is `11000` (0x18).
+- **Semantics**: Sign-Extend Halfword. `$rd` = the low halfword of `$rt`
+  (`$rt[15:0]`), sign-extended to 32 bits.
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32r2 instruction.
 
 ---
 
@@ -754,15 +921,148 @@ convention: `$v0` = service number, `$a0` = register 4 (first argument).
 
 ---
 
+## Coprocessor 0 / traps and exceptions (real MIPS32 ISA)
+
+Everything above this section is grounded in the vendored MARS 4.5 source
+(`vendor/mars-src/`), per the module header. This section is different: it
+documents a small, deliberately minimal **addition** on top of the v1 set —
+`teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu` (trap-on-condition) and `break`
+(unconditional trap), plus the coprocessor-0 state and exception-vector
+mechanism they use. Per this track's process requirements, these are
+ground-truthed against the **real MIPS32 architecture** (the actual ISA, as
+commonly documented in "MIPS32 Architecture For Programmers, Volume II-A:
+The MIPS32 Instruction Set" and "Volume III: The MIPS32 Privileged Resource
+Architecture" / System Control Coprocessor), not against MARS, which was
+only ever meant as a differential-testing oracle for this project and does
+not model exceptions realistically (MARS's own exception handling is a
+Java-exception-based simulation shortcut, not a model of real CP0 register
+state). No internet access was available while writing this section; every
+encoding/field value below is the standard, commonly documented MIPS32
+value, called out explicitly rather than silently guessed. If any value
+here is later found to disagree with the written ISA spec, this paragraph
+is the place to correct it.
+
+### Coprocessor 0 state modeled (and what is deliberately out of scope)
+
+This is a **minimal** CP0 model: three registers, not the full coprocessor.
+
+| Field (on `State`) | Real MIPS32 register | Modeled behavior |
+|---|---|---|
+| `cp0Status` | `Status` (CP0 register 12) | Only bit 1 (`EXL`, exception level) is ever set, on any exception; no other bit (`IE`, `ERL`, `KSU`, `UM`, `BEV`, `IM7..IM0`, ...) is modeled. Initialized to `0`. |
+| `cp0Cause` | `Cause` (CP0 register 13) | Only the `ExcCode` field (bits 6..2) is ever written, as `excCode <<< 2`; no other field (`BD`, `CE`, `IV`, `WP`, the `IP` pending-interrupt bits, ...) is modeled. Initialized to `0`. |
+| `cp0Epc` | `EPC` (CP0 register 14) | Set to the trapping instruction's own address (`pc` at the time of the trap/`break`, *not* `pc + 4`) on every exception. Initialized to `0`. |
+
+**Explicitly out of scope** (documented here rather than silently omitted,
+per this track's process requirements): every other CP0 register (`Index`,
+`Random`, `EntryLo0/1`, `Context`, `PageMask`, `Wired`, `BadVAddr`, `Count`,
+`EntryHi`, `Compare`, `Config0-7`, `PRId`, `EBase`, ...), the full `Status`/
+`Cause` bitfields beyond `EXL`/`ExcCode`, interrupts (hardware or software),
+TLB/MMU behavior, `eret` (there is no way to leave exception level once
+entered — `EXL` is set and never cleared), and any notion of kernel/user
+mode. This model answers exactly one question: "did a trap/`break` fire,
+and where did control transfer to" — nothing more.
+
+### Exception mechanism (shared by all seven new instructions)
+
+On any trap condition being met, or on executing `break` (always): this is
+a **real state transition**, not a `HaltReason` — `step` returns
+`StepResult.next`, matching real MIPS32 hardware's exception-taken behavior
+(control transfers to the handler; the machine keeps running). Concretely,
+from the trapping/`break` instruction's state `s`:
+
+1. `cp0Epc := s.pc` — the address of the trapping instruction *itself*.
+   Real MIPS32 hardware would instead write `PC - 4` if the faulting
+   instruction were in a branch delay slot (and set `Cause.BD`); this v1
+   dialect has no delay slots at all (`SPEC-NOTES.md` §3/§9.1), so that
+   case cannot arise and `EPC = s.pc` unconditionally is exactly correct.
+2. `cp0Cause := excCode <<< 2` — `excCode` packed into the `ExcCode` field
+   position (bits 6..2 of the real `Cause` register). Two `excCode` values
+   are used, one per exception type as required: `excCodeBp = 9` ("Bp" —
+   Breakpoint, for `break`) and `excCodeTr = 13` ("Tr" — Trap, for all six
+   `t*` instructions). Both are the standard MIPS32 `Cause.ExcCode` encoding
+   values for these exception classes. Note real MIPS32 hardware does
+   *not* distinguish *which* of the six trap conditions fired in `Cause` —
+   a handler would have to re-decode the instruction word at `EPC` for
+   that, which this model does not need since it has no handler.
+3. `cp0Status := s.cp0Status ||| statusExlMask` — bit 1 (`EXL`) set,
+   preserving (OR-ing into) whatever was already there, matching real
+   hardware's behavior of never clearing unrelated `Status` bits on
+   exception entry.
+4. `pc := exceptionVectorAddr`, defined as `0x80000180` — the MIPS32
+   **general exception vector** (used whenever `Status.BEV = 0`, i.e. the
+   normal non-bootstrap case, for every exception other than TLB-refill/
+   XTLB-refill/cache-error, none of which this model has any notion of).
+   This same address is already referenced informally in Global rule 5
+   above ("no exception handler installed at `0x80000180`"); this track
+   promotes it to a named, documented constant (`Types.lean`) shared by
+   every exception site instead of a repeated literal.
+
+Deliberately **not** added: a synthetic "unhandled exception"/"no handler
+installed" `HaltReason`. Since this v1 dialect never installs anything at
+`exceptionVectorAddr`, the very next `step` call after a trap/`break`
+naturally re-enters the existing fetch path at that address and hits one of
+`step`'s pre-existing, already-documented halts: `addressError` (no
+instruction recorded there — the expected case for every test program that
+doesn't deliberately install a handler) or `illegalInstruction` (if some
+word happens to be recorded there but doesn't decode). This gives real
+exception-vector semantics for free, without inventing a new halt variant —
+and conversely, if a test program *does* install a real handler at
+`exceptionVectorAddr`, that handler executes completely normally, since it
+is just ordinary code at an ordinary (if high) address.
+
+### teq / tne / tlt / tge / tltu / tgeu (R, trap-on-condition)
+
+- **Encoding**: `opcode=000000`. Fields: `000000 sssss ttttt ----- ----- ffffff`
+  → `rs=sssss`, `rt=ttttt`; `rd`/`shamt` unused (always 0), same shape as
+  `mult`/`div`. `funct` per mnemonic, the standard MIPS32 SPECIAL-opcode trap
+  family: `teq` = `0x34`, `tne` = `0x36`, `tlt` = `0x32`, `tge` = `0x30`,
+  `tltu` = `0x33`, `tgeu` = `0x31`. (Funct `0x35`, between `teq` and `tne`,
+  is reserved/unused in the real ISA — no mnemonic maps to it.) These are
+  the standard MIPS32 values as commonly documented; cited here per this
+  track's requirement to state the source plainly rather than guess
+  silently.
+- **Semantics**: evaluate the named condition on `$rs`/`$rt` — `teq`:
+  `$rs == $rt`; `tne`: `$rs != $rt`; `tlt`: `$rs <s $rt` (signed); `tge`:
+  `$rs >=s $rt` (signed); `tltu`: `$rs <u $rt` (unsigned); `tgeu`:
+  `$rs >=u $rt` (unsigned). If the condition holds, take the exception
+  described above with `excCode = excCodeTr`. If the condition does not
+  hold, the instruction is a complete no-op other than the ordinary
+  fall-through to `pc + 4` — no CP0 state is touched at all.
+- **Errors/halts**: none beyond the exception transition itself (which is
+  `StepResult.next`, not a halt).
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  MARS does implement this family in its own `InstructionSet.java`, but per
+  this track's process requirements the ground truth cited here is the real
+  MIPS32 ISA, not MARS's implementation of it.
+
+### break (R, unconditional trap)
+
+- **Encoding**: `opcode=000000`, `funct=001101` (0x0d) — the funct value
+  immediately after `syscall`'s `0x0c`. Fields: all zero in this model
+  (`000000 00000 00000 00000 00000 001101`). Real MIPS32 `break` has an
+  optional 20-bit "code" field packed into bits 25..6, purely a
+  software-visible hint (e.g. distinguishing different breakpoint call
+  sites) with no architecturally-defined effect on the exception itself —
+  deliberately out of scope here, so `break`'s only field-level difference
+  from `syscall` is its `funct` value.
+- **Semantics**: unconditionally takes the exception described above, with
+  `excCode = excCodeBp`.
+- **Errors/halts**: none beyond the exception transition itself.
+- **MARS note**: not applicable, as for the trap family above.
+
 ## Flagged MARS deviations (summary)
 
 1. **`div`/`divu` by zero**: no exception, `hi`/`lo` left unchanged
    (explicit source comment citing the MIPS32 spec over the COD3 textbook
    framing). `Exceptions.DIVIDE_BY_ZERO_EXCEPTION` exists but is dead code.
-2. **No branch delay slot by default** (`j`, `jal`, `beq`, `bne`, `blez`,
-   `bgtz`): `DelayedBranching` setting defaults to `false`; PC jumps to the
-   target immediately with no delay-slot instruction executed, unlike real
-   MIPS hardware's architecturally-mandated delay slot.
+2. **Branch delay slots** (`j`, `jal`, `beq`, `bne`, `blez`, `bgtz`):
+   MARS's `DelayedBranching` setting defaults to `false`, so by default PC
+   jumps to the target immediately with no delay-slot instruction executed.
+   Our semantics does **not** follow that default: it implements real
+   MIPS32's architecturally-mandated one-instruction delay slot instead
+   (Global rule 3; SPEC-NOTES \u00a79 item 1) \u2014 the one case in this reference
+   where we deliberately diverge from MARS's default configuration rather
+   than documenting it as a quirk to match.
 3. **`lw`/`sw` offset sign-extension asymmetry** (flagged as a source
    ambiguity requiring a Lean-spec decision, not a confirmed intentional
    deviation): unlike `lb`/`lh`/`lhu`/`lbu`/`sh`/`addi`/`addiu`/`slti`/
@@ -781,3 +1081,125 @@ Everything else checked (`add`/`addi`/`sub` overflow trapping, `addu`/
 `subu`/`mult`/`multu` never trapping, `andi`/`ori`/`xori` zero-extending,
 `sltiu` sign-extending its immediate, `$zero` write-ignore, big-endian
 memory) matches textbook/ISA-spec MIPS behavior and is marked "none" above.
+
+---
+
+## Floating point (coprocessor 1, single precision) — v1.x addition
+
+This section documents a v1.x addition: a minimal real-MIPS32 coprocessor-1
+(FPU) instruction subset, added on top of the v1 scope documented above.
+**Grounding note**: unlike every section above (grounded in the vendored
+MARS 4.5 source), this section's semantics are grounded directly in the
+**real MIPS32 architecture** — specifically the standard MIPS32 ISA's
+"COP1"/FPU encoding (opcode `0x11`, the `fmt`/`ft`/`fs`/`fd`/`funct` field
+layout, and the standard `funct` assignments for `ADD.fmt`/`SUB.fmt`/
+`MUL.fmt`/`DIV.fmt`/`MOV.fmt`/`CVT.S.fmt`/`CVT.W.fmt`/`C.cond.fmt`/`BC1`), not
+MARS-specific behavior, per this track's explicit brief. MARS is not
+consulted as ground truth for this section.
+
+### Scope
+
+- **Single precision only.** All 32 FP registers `$f0`..`$f31` are modeled as
+  independent 32-bit registers holding a raw IEEE-754 binary32 bit pattern
+  (`State.fpRegs`). **Double precision (`.d`) is out of scope for this pass**
+  — real MIPS32 pairs adjacent `$f` registers for 64-bit doubles, which this
+  v1.x addition does not model at all. This is flagged as a documented
+  follow-up, not a silent gap.
+- **One FP condition flag, not eight.** Real MIPS32 has 8 FP condition-code
+  registers (the 3-bit `cc` field in compare/branch encodings). This addition
+  models only `cc = 0`, as a single `State.fpCondFlag : Bool`. Any encoding
+  with a nonzero `cc` (or nonzero `nd`/"likely" bit on `BC1`) is treated as
+  undecodable (`decode` returns `none`), not silently misinterpreted.
+- **No FP traps/exceptions.** Divide-by-zero and invalid operations (e.g.
+  `0.0 / 0.0`) are never trapped; IEEE-754 ±Infinity/NaN propagate naturally
+  through register writes, matching this project's existing precedent for
+  integer `div`/`divu` by zero (see "Flagged MARS deviations" item 1 above).
+- **No delay slot for `bc1t`/`bc1f`.** Real MIPS32 hardware has an
+  architecturally-mandated branch delay slot for every branch, including
+  `bc1t`/`bc1f`. This v1.x addition does **not** model one: `bc1t`/`bc1f`
+  jump immediately, matching this codebase's existing no-delay-slot
+  convention for `beq`/`bne`/`blez`/`bgtz`/`j`/`jal` (see "Flagged MARS
+  deviations" item 2 above — that deviation was MARS's `DelayedBranching`
+  default, but the resulting *simulator* behavior is the same shape this
+  addition reuses for consistency). Flagged for integration: a parallel
+  track is adding real delay-slot semantics (`State.pendingBranch`) for the
+  existing branches; `bc1t`/`bc1f` were deliberately left out of that scheme
+  to avoid touching the shared `step` dispatch loop, and should be
+  reconciled with that track by the orchestrator if delay slots are adopted
+  project-wide.
+- **Only `CVT.S.W`/`CVT.W.S`** of the `CVT.*` family are implemented (the
+  other source/destination format combinations — `.L`, `.D` — are out of
+  scope, since they all involve either double precision or 64-bit integers).
+  `cvt.w.s` always truncates toward zero; real MIPS32 instead rounds
+  according to the current FCSR rounding mode (default: round-to-nearest,
+  ties-to-even), since there is no `FCSR` in this project's scope. This is a
+  deliberate, documented simplification, not an oversight.
+- **Only `ADD.S`/`SUB.S`/`MUL.S`/`DIV.S`/`MOV.S`** of the arithmetic-format
+  instructions are implemented; `SQRT.S`, `ABS.S`, `NEG.S`, and the
+  `ROUND`/`TRUNC`/`CEIL`/`FLOOR` family are out of scope for this pass.
+- **Only `C.EQ.S`/`C.LT.S`/`C.LE.S`** of the sixteen `C.cond.S` compares are
+  implemented (the three most common; the rest — `C.UN.S`, `C.OLE.S`, etc. —
+  are out of scope).
+
+### Register/state model
+
+- `State.fpRegs : Array W32`, size 32 — `$f0`..`$f31`, each a raw 32-bit
+  IEEE-754 binary32 bit pattern (same raw-bit-pattern storage convention as
+  the integer `regs` array; conversion to/from Lean's `Float32` happens only
+  at the point of doing arithmetic, in `Step.lean`, via `Float32.ofBits`/
+  `Float32.toBits`, Lean core's exact IEEE-754 bit-pattern round-trip).
+  Initialized to all-zero (`initialState`). Unlike the integer registers,
+  **no FP register is hardwired to zero** — `$f0` is an ordinary read/write
+  register in real MIPS32, and `writeFpReg` never ignores a write.
+- `State.fpCondFlag : Bool` — the single modeled FP condition flag (`cc = 0`
+  only; see Scope above). Initialized to `false`.
+
+### Encoding summary
+
+| Mnemonic | Encoding | One-line semantics |
+|---|---|---|
+| `mtc1 $rt, $fs` | opcode 0x11, fmt=`MT`=0x04 | `$fs = rawbits($rt)`, no conversion |
+| `mfc1 $rt, $fs` | opcode 0x11, fmt=`MF`=0x00 | `$rt = rawbits($fs)`, no conversion |
+| `lwc1 $ft, off($rs)` | opcode 0x31 | `$ft = MEM32[$rs + off]`, raw bits |
+| `swc1 $ft, off($rs)` | opcode 0x39 | `MEM32[$rs + off] = rawbits($ft)` |
+| `add.s $fd, $fs, $ft` | opcode 0x11, fmt=`S`=0x10, funct=0x00 | `$fd = $fs + $ft` (IEEE-754) |
+| `sub.s $fd, $fs, $ft` | fmt=S, funct=0x01 | `$fd = $fs - $ft` |
+| `mul.s $fd, $fs, $ft` | fmt=S, funct=0x02 | `$fd = $fs * $ft` |
+| `div.s $fd, $fs, $ft` | fmt=S, funct=0x03 | `$fd = $fs / $ft`; `$ft=0` → ±Inf/NaN, no trap |
+| `mov.s $fd, $fs` | fmt=S, funct=0x06 | `$fd = $fs`, raw copy |
+| `cvt.s.w $fd, $fs` | fmt=`W`=0x14, funct=0x20 | `$fd = float32(int32bits($fs))` |
+| `cvt.w.s $fd, $fs` | fmt=S, funct=0x24 | `$fd = int32bits(trunc($fs))` |
+| `c.eq.s $fs, $ft` | fmt=S, funct=0x32, cc=0 | `fpCondFlag := ($fs == $ft)` |
+| `c.lt.s $fs, $ft` | fmt=S, funct=0x3c, cc=0 | `fpCondFlag := ($fs < $ft)` |
+| `c.le.s $fs, $ft` | fmt=S, funct=0x3e, cc=0 | `fpCondFlag := ($fs <= $ft)` |
+| `bc1t target` | opcode 0x11, fmt=`BC1`=0x08, tf=1 | `if fpCondFlag: PC = PC_next + (offset<<2)` |
+| `bc1f target` | fmt=BC1, tf=0 | `if !fpCondFlag: PC = PC_next + (offset<<2)` |
+
+Field layout for the arithmetic/compare format (`add.s` etc.): opcode(31-26)
+= 0x11, `fmt`(25-21), `ft`(20-16), `fs`(15-11), `fd`(10-6), `funct`(5-0) — the
+same positions as a plain R-type word's `rs`/`rt`/`rd`/`shamt`/`funct`, which
+is why `Instruction.lean`'s `mkRT` helper is reused (with opcode 0x11 OR'd in
+explicitly, since `mkRT` itself always leaves the opcode field 0). `mtc1`/
+`mfc1` use the same R-type-shaped layout with `fmt` in the `rs` position and
+all of `fd`/`funct` (bits 10-0) fixed to 0. `lwc1`/`swc1` are ordinary I-type
+words (opcode/`rs`=base/`rt`-position=`ft`/16-bit offset), identical in shape
+to `lw`/`sw`. `bc1t`/`bc1f` are also I-type-shaped: opcode 0x11, `rs`-position
+field = `BC1` sub-opcode `0x08`, `rt`-position field holds `cc`(bits 4-2,
+forced 0)/`nd`(bit 1, forced 0)/`tf`(bit 0) — so the whole `rt`-position field
+is exactly `0` (`bc1f`) or `1` (`bc1t`) in this subset — and a 16-bit
+sign-extended branch offset, exactly like `beq`/`bne`.
+
+### Citation
+
+Standard MIPS32 instruction-set architecture (the public "MIPS32 Architecture
+For Programmers" reference manual family, Volume II-A, "The MIPS32
+Instruction Set" — the COP1/FPU chapter). All opcode/fmt/funct values above
+(COP1 = 0x11, `LWC1`/`SWC1` = 0x31/0x39, `fmt` codes `MF`=0, `MT`=4, `BC1`=8,
+`S`=0x10, `W`=0x14, and `funct` codes 0x00/0x01/0x02/0x03/0x06/0x20/0x24 and
+the `C.cond.fmt` family `0x30 | cond` with `cond(EQ)=2`, `cond(LT)=12`,
+`cond(LE)=14`) are the standard, invariant MIPS32 COP1 encodings, not
+MARS-specific or implementation-chosen values. No internet access was used to
+write this section; these are well-established, memorized ISA constants, and
+any single value a future reader doubts should be cross-checked against a
+primary MIPS32 ISA reference before relying on it for anything beyond this
+simulator.

@@ -119,6 +119,7 @@ def runOurs (src : String) (fuel : Nat) : OurOutcome :=
       else .error s.out s!"illegalInstruction {w}"
     | .halted (.addressError a) s _ => .error s.out s!"addressError {a}"
     | .halted .arithmeticOverflow s _ => .error s.out "arithmeticOverflow"
+    | .halted .branchInDelaySlot s _ => .error s.out "branchInDelaySlot"
     | .limitReached s _ => .limitReached s.out
 
 /-- Strip the version banner, **and any assembler-diagnostic blocks that
@@ -534,22 +535,26 @@ private def branchTakenSrc : String :=
 "    li   $t1, 5\n" ++
 "    li   $t2, 1\n" ++
 "    beq  $t0, $t1, Lbeq\n" ++
+"    sll  $zero, $zero, 0\n" ++
 "    li   $t2, 0\n" ++
 "Lbeq:\n" ++
 "    li   $t3, 3\n" ++
 "    li   $t4, 4\n" ++
 "    li   $t5, 1\n" ++
 "    bne  $t3, $t4, Lbne\n" ++
+"    sll  $zero, $zero, 0\n" ++
 "    li   $t5, 0\n" ++
 "Lbne:\n" ++
 "    li   $t6, -1\n" ++
 "    li   $t7, 1\n" ++
 "    blez $t6, Lblez\n" ++
+"    sll  $zero, $zero, 0\n" ++
 "    li   $t7, 0\n" ++
 "Lblez:\n" ++
 "    li   $t8, 5\n" ++
 "    li   $t9, 1\n" ++
 "    bgtz $t8, Lbgtz\n" ++
+"    sll  $zero, $zero, 0\n" ++
 "    li   $t9, 0\n" ++
 "Lbgtz:\n" ++
 "    move $a0, $t2\n" ++
@@ -617,18 +622,17 @@ private def branchNotTakenSrc : String :=
 private def jumpJalSrc : String :=
 "main:\n" ++
 "    jal  Lsub\n" ++
+"    sll  $zero, $zero, 0\n" ++
 "AfterCall:\n" ++
 "    move $a0, $t0\n" ++
-"    li   $v0, 11\n" ++
-"    syscall\n" ++
-"    andi $a0, $ra, 0xff\n" ++
 "    li   $v0, 11\n" ++
 "    syscall\n" ++
 "    li   $v0, 10\n" ++
 "    syscall\n" ++
 "Lsub:\n" ++
 "    li   $t0, 65\n" ++
-"    j    AfterCall\n"
+"    j    AfterCall\n" ++
+"    sll  $zero, $zero, 0\n"
 
 #guard isHaltedExit (runOurs jumpJalSrc 100000)
 

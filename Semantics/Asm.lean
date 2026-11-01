@@ -20,11 +20,24 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
 - All v1 real instructions (`docs/spec/INSTRUCTION-REF.md`): R-type arith/
   logic/shift/mult-div/mfhi/mflo, I-type immediate/logic/memory, J-type,
   branches, and `syscall` (zero operands, all fields zero except
-  funct = 0x0c, i.e. word `0x0000000C`).
+  funct = 0x0c, i.e. word `0x0000000C`). Plus the MIPS32/MIPS32r2 additions
+  `movn`/`movz` (fit the `rd, rs, rt` R-type shape exactly, table-driven like
+  `add`), and `clo`/`clz`/`seb`/`seh` (SPECIAL2/SPECIAL3 opcodes, hand-encoded
+  below since they don't fit any existing `RForm`).
+- The coprocessor-0 trap/exception family (real MIPS32 ISA, added on top of
+  the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): `teq`/`tne`/
+  `tlt`/`tge`/`tltu`/`tgeu` (`rs, rt` operands, same shape as `mult`/`div`),
+  and `break` (zero operands, like `syscall`; funct = 0x0d, word
+  `0x0000000D`).
+- Coprocessor-1 (FPU) single-precision subset (docs/spec/INSTRUCTION-REF.md's
+  floating-point section): `mtc1`/`mfc1`, `lwc1`/`swc1`, `add.s`/`sub.s`/
+  `mul.s`/`div.s`, `mov.s`, `cvt.s.w`/`cvt.w.s`, `c.eq.s`/`c.lt.s`/`c.le.s`,
+  `bc1t`/`bc1f`.
 - Pseudo-ops: `li`, `la` (label only — see deviation note below), `move`,
   `nop`, expanded per `vendor/mars-src/PseudoOps.txt`.
 - Register names `$zero,$at,$v0,$v1,$a0..$a3,$t0..$t7,$s0..$s7,$t8,$t9,
-  $k0,$k1,$gp,$sp,$fp,$ra` plus raw numeric `$0`..`$31`.
+  $k0,$k1,$gp,$sp,$fp,$ra` plus raw numeric `$0`..`$31`, and FP register names
+  `$f0`..`$f31` for the coprocessor-1 instructions.
 
 ## Layout
 `.text` code words are placed sequentially starting at `textBase` (0x00400000);
@@ -219,6 +232,21 @@ private def parseRegister (tok : String) (line : Nat) : Except AsmError Nat := d
     | some n => if n < 32 then pure n else throw (.badRegister s!"register number out of range (0-31): '{tok}'" line)
     | none => throw (.badRegister s!"unknown register: '{tok}'" line)
 
+/-- `$f0`..`$f31`, the coprocessor-1 (FPU) single-precision register names. -/
+private def fpRegTable : List (String × Nat) :=
+  (List.range 32).map (fun i => (s!"f{i}", i))
+
+/-- Parse an FP register operand. Unlike `parseRegister`, there is no raw
+numeric fallback (`$5` is never an FP register) \u2014 FPU operands always use
+the `$fN` spelling, matching real MIPS32 assembly syntax. -/
+private def parseFpRegister (tok : String) (line : Nat) : Except AsmError Nat := do
+  if !(tok.startsWith "$") then
+    throw (.badRegister s!"FP register name must start with '$': '{tok}'" line)
+  let body := dropS tok 1
+  match fpRegTable.find? (fun p => p.1 == body) with
+  | some (_, n) => pure n
+  | none => throw (.badRegister s!"unknown FP register (expected '$f0'..'$f31'): '{tok}'" line)
+
 private def hexDigit? (c : Char) : Option Nat :=
   if '0' ≤ c ∧ c ≤ '9' then some (c.toNat - '0'.toNat)
   else if 'a' ≤ c ∧ c ≤ 'f' then some (c.toNat - 'a'.toNat + 10)
@@ -290,9 +318,15 @@ private def rTable : List (String × Nat × RForm) :=
   [("add", 0x20, .arith3), ("addu", 0x21, .arith3), ("sub", 0x22, .arith3), ("subu", 0x23, .arith3),
    ("and", 0x24, .arith3), ("or", 0x25, .arith3), ("xor", 0x26, .arith3), ("nor", 0x27, .arith3),
    ("slt", 0x2a, .arith3), ("sltu", 0x2b, .arith3),
+   ("movn", 0x0b, .arith3), ("movz", 0x0a, .arith3),  -- MIPS32r2; same opcode-0 `rd, rs, rt` shape as `add`
    ("sll", 0x00, .shift), ("srl", 0x02, .shift), ("sra", 0x03, .shift),
    ("mult", 0x18, .multdiv), ("multu", 0x19, .multdiv), ("div", 0x1a, .multdiv), ("divu", 0x1b, .multdiv),
-   ("mfhi", 0x10, .hilo), ("mflo", 0x12, .hilo)]
+   ("mfhi", 0x10, .hilo), ("mflo", 0x12, .hilo),
+   -- Trap-on-condition family (same `rs, rt` shape as `mult`/`div`): real
+   -- MIPS32 SPECIAL-opcode funct values (see `Instruction.lean`/
+   -- `docs/spec/INSTRUCTION-REF.md`), not MARS-derived.
+   ("teq", 0x34, .multdiv), ("tne", 0x36, .multdiv), ("tlt", 0x32, .multdiv),
+   ("tge", 0x30, .multdiv), ("tltu", 0x33, .multdiv), ("tgeu", 0x31, .multdiv)]
 
 /-- Static table of I-type mnemonics: (name, opcode, form). -/
 private def iTable : List (String × Nat × IForm) :=
@@ -309,12 +343,47 @@ private def jTable : List (String × Nat) := [("j", 0x02), ("jal", 0x03)]
 private def bTable : List (String × Nat × BForm) :=
   [("beq", 0x04, .two), ("bne", 0x05, .two), ("blez", 0x06, .one), ("bgtz", 0x07, .one)]
 
-private def pseudoSet : List String := ["li", "la", "move", "nop", "syscall"]
+/-- Coprocessor-1 (FPU) mnemonic operand shapes. The static parameters
+(`fmt`/`opcode`/`funct`/`tf`) needed to build each instruction's word are
+carried directly in the constructor — see `cop1Table` and
+`docs/spec/INSTRUCTION-REF.md`'s floating-point section for the exact
+encodings (same values as `Instruction.lean`'s `encode`). -/
+private inductive Cop1Form
+  | moveGpFp (fmt : Nat)        -- mtc1 ($rt,$fs; fmt=4) / mfc1 ($rt,$fs; fmt=0)
+  | mem (opcode : Nat)          -- lwc1 ($ft, offset($rs); 0x31) / swc1 (0x39)
+  | arith3 (fmt funct : Nat)    -- add.s/sub.s/mul.s/div.s: $fd, $fs, $ft
+  | unary (fmt funct : Nat)     -- mov.s/cvt.s.w/cvt.w.s: $fd, $fs
+  | compare (funct : Nat)       -- c.eq.s/c.lt.s/c.le.s: $fs, $ft (fmt always S)
+  | branch (tf : Nat)           -- bc1t (tf=1) / bc1f (tf=0): target
+
+/-- Static table of coprocessor-1 (FPU) mnemonics: (name, form). -/
+private def cop1Table : List (String × Cop1Form) :=
+  [("mtc1", .moveGpFp 4), ("mfc1", .moveGpFp 0),
+   ("lwc1", .mem 0x31), ("swc1", .mem 0x39),
+   ("add.s", .arith3 0x10 0x00), ("sub.s", .arith3 0x10 0x01),
+   ("mul.s", .arith3 0x10 0x02), ("div.s", .arith3 0x10 0x03),
+   ("mov.s", .unary 0x10 0x06),
+   ("cvt.s.w", .unary 0x14 0x20), ("cvt.w.s", .unary 0x10 0x24),
+   ("c.eq.s", .compare 0x32), ("c.lt.s", .compare 0x3c), ("c.le.s", .compare 0x3e),
+   ("bc1t", .branch 1), ("bc1f", .branch 0)]
+
+-- `break` is a real instruction, not a pseudo-op, but it is zero-operand
+-- (like `syscall`) rather than fitting any `RForm` with register operands,
+-- so it is special-cased alongside `syscall` the same way throughout this
+-- file (`isKnownMnemonic`, `wordsForMnemonic`, `encodeInstruction`).
+private def pseudoSet : List String := ["li", "la", "move", "nop", "syscall", "break"]
 private def directiveSet : List String := [".text", ".data", ".word", ".half", ".byte", ".asciiz", ".space"]
+
+/-- SPECIAL2/SPECIAL3 mnemonics with an opcode-bearing R-type-like shape that
+doesn't fit any existing `RForm` (nonzero opcode and/or an operand count
+that doesn't match `arith3`/`shift`/`multdiv`/`hilo`); hand-encoded directly
+in `encodeInstruction` below instead of via `rTable`. -/
+private def bshflMnemonics : List String := ["clo", "clz", "seb", "seh"]
 
 private def isKnownMnemonic (m : String) : Bool :=
   rTable.any (·.1 == m) ∨ iTable.any (·.1 == m) ∨ jTable.any (·.1 == m) ∨
-    bTable.any (·.1 == m) ∨ pseudoSet.contains m ∨ directiveSet.contains m
+    bTable.any (·.1 == m) ∨ cop1Table.any (·.1 == m) ∨ pseudoSet.contains m ∨
+    directiveSet.contains m ∨ bshflMnemonics.contains m
 
 /-- Number of 32-bit words a `li $rt, v` expansion emits, per
 `PseudoOps.txt` lines 245-247: sign-extendable-16-bit values use a single
@@ -439,6 +508,10 @@ private def wordsForMnemonic (mnemonic : String) (operands : List String) (lineN
     match operands with
     | [] => pure 1
     | _ => throw (.badOperand s!"syscall takes no operands" lineNo)
+  | "break" =>
+    match operands with
+    | [] => pure 1
+    | _ => throw (.badOperand s!"break takes no operands" lineNo)
   | _ => pure 1
 
 private def layoutLine (s : LState) (pl : ParsedLine) : Except AsmError LState := do
@@ -492,6 +565,19 @@ private def itWord (opcode rs rt : Nat) (imm : W32) : W32 :=
 
 private def jWord (opcode : Nat) (targetWordAddr : Nat) : W32 :=
   (natToW32 opcode <<< 26) ||| mkJT (natToW32 targetWordAddr)
+
+/-- Build a nonzero-opcode R-type-like word (`clo`/`clz`/`seb`/`seh`:
+SPECIAL2/SPECIAL3), same as `rtWord` but with the real opcode OR'd into the
+top 6 bits (mirrors `jWord`'s `opcode <<< 26` composition, since `mkRT`
+always leaves the opcode field as 0). -/
+private def opRtWord (opcode rs rt rd shamt funct : Nat) : W32 :=
+  (natToW32 opcode <<< 26) ||| rtWord rs rt rd shamt funct
+
+/-- Build a coprocessor-1 (FPU) R-type-shaped word: `mkRT`'s opcode field is
+always 0 (correct for plain R-type), so this ORs in opcode 0x11 explicitly,
+the same way `jWord` ORs its opcode over `mkJT`'s target-only field. -/
+private def cop1RtWord (fmt rt rd shamt funct : Nat) : W32 :=
+  (natToW32 0x11 <<< 26) ||| rtWord fmt rt rd shamt funct
 
 /-- Encode an `li $rt, v` expansion per `PseudoOps.txt` (see `liWordCount`). -/
 private def encodeLi (rt : Nat) (v : Int) : List W32 :=
@@ -609,6 +695,54 @@ private def encodeBForm (labels : Std.HashMap String W32) (name : String) (opcod
         pure (itWord opcode rs 0 (ofInt32 off))
     | _ => throw (.badOperand s!"{name} expects 'rs, target'" lineNo)
 
+/-- Encode a coprocessor-1 (FPU) mnemonic's operand list into its word, per
+`Cop1Form`'s shape and the static parameters carried in `cop1Table`. -/
+private def encodeCop1Form (labels : Std.HashMap String W32) (name : String) (form : Cop1Form)
+    (operands : List String) (instrAddr : W32) (lineNo : Nat) : Except AsmError W32 :=
+  match form with
+  | .moveGpFp fmt =>
+    match operands with
+    | [rtT, fsT] => do
+        let rt ← parseRegister rtT lineNo
+        let fs ← parseFpRegister fsT lineNo
+        pure (cop1RtWord fmt rt fs 0 0)
+    | _ => throw (.badOperand s!"{name} expects '$rt, $fs'" lineNo)
+  | .mem opcode =>
+    match operands with
+    | [ftT, memT] => do
+        let ft ← parseFpRegister ftT lineNo
+        let (imm, rs) ← parseMemOperand memT lineNo
+        pure (itWord opcode rs ft (ofInt32 imm))
+    | _ => throw (.badOperand s!"{name} expects '$ft, offset($rs)'" lineNo)
+  | .arith3 fmt funct =>
+    match operands with
+    | [fdT, fsT, ftT] => do
+        let fd ← parseFpRegister fdT lineNo
+        let fs ← parseFpRegister fsT lineNo
+        let ft ← parseFpRegister ftT lineNo
+        pure (cop1RtWord fmt ft fs fd funct)
+    | _ => throw (.badOperand s!"{name} expects '$fd, $fs, $ft'" lineNo)
+  | .unary fmt funct =>
+    match operands with
+    | [fdT, fsT] => do
+        let fd ← parseFpRegister fdT lineNo
+        let fs ← parseFpRegister fsT lineNo
+        pure (cop1RtWord fmt 0 fs fd funct)
+    | _ => throw (.badOperand s!"{name} expects '$fd, $fs'" lineNo)
+  | .compare funct =>
+    match operands with
+    | [fsT, ftT] => do
+        let fs ← parseFpRegister fsT lineNo
+        let ft ← parseFpRegister ftT lineNo
+        pure (cop1RtWord 0x10 ft fs 0 funct)
+    | _ => throw (.badOperand s!"{name} expects '$fs, $ft'" lineNo)
+  | .branch tf =>
+    match operands with
+    | [tgt] => do
+        let off ← branchOffset labels tgt instrAddr lineNo
+        pure (itWord 0x11 0x08 tf (ofInt32 off))
+    | _ => throw (.badOperand s!"{name} expects a single target operand" lineNo)
+
 /-- Encode one real/pseudo instruction item into its emitted word(s). -/
 private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem) :
     Except AsmError (List W32) := do
@@ -624,6 +758,9 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
   | none =>
   match bTable.find? (·.1 == name) with
   | some (_, opcode, form) => return [← encodeBForm labels name opcode form item.operands item.addr item.lineNo]
+  | none =>
+  match cop1Table.find? (·.1 == name) with
+  | some (_, form) => return [← encodeCop1Form labels name form item.operands item.addr item.lineNo]
   | none =>
   match name with
   | "li" =>
@@ -652,6 +789,44 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
     match item.operands with
     | [] => pure [0x0000000C#32]              -- all fields zero except funct = 0x0c
     | _ => throw (.badOperand s!"syscall takes no operands" item.lineNo)
+  -- SPECIAL2 bit-count (MIPS32): `clo $rd, $rs` / `clz $rd, $rs`. The raw
+  -- encoding's rt-position field duplicates rd (real hardware quirk, see
+  -- `Instruction.lean`'s `.clo`/`.clz` docstrings).
+  | "clo" =>
+    match item.operands with
+    | [rdT, rsT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rs ← parseRegister rsT item.lineNo
+        pure [opRtWord 0x1c rs rd rd 0 0x21]
+    | _ => throw (.badOperand s!"clo expects 'rd, rs'" item.lineNo)
+  | "clz" =>
+    match item.operands with
+    | [rdT, rsT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rs ← parseRegister rsT item.lineNo
+        pure [opRtWord 0x1c rs rd rd 0 0x20]
+    | _ => throw (.badOperand s!"clz expects 'rd, rs'" item.lineNo)
+  -- SPECIAL3 BSHFL sign-extend (MIPS32r2): `seb $rd, $rt` / `seh $rd, $rt`.
+  -- `rs` is unused/fixed 0; the shamt-position field (0x10/0x18) selects
+  -- which BSHFL sub-op this is.
+  | "seb" =>
+    match item.operands with
+    | [rdT, rtT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rt ← parseRegister rtT item.lineNo
+        pure [opRtWord 0x1f 0 rt rd 0x10 0x20]
+    | _ => throw (.badOperand s!"seb expects 'rd, rt'" item.lineNo)
+  | "seh" =>
+    match item.operands with
+    | [rdT, rtT] => do
+        let rd ← parseRegister rdT item.lineNo
+        let rt ← parseRegister rtT item.lineNo
+        pure [opRtWord 0x1f 0 rt rd 0x18 0x20]
+    | _ => throw (.badOperand s!"seh expects 'rd, rt'" item.lineNo)
+  | "break" =>
+    match item.operands with
+    | [] => pure [0x0000000D#32]              -- all fields zero except funct = 0x0d
+    | _ => throw (.badOperand s!"break takes no operands" item.lineNo)
   | _ => throw (.unknownMnemonic s!"unknown mnemonic '{name}'" item.lineNo)
 
 private def applyItem (labels : Std.HashMap String W32) (prog : Program) (item : RawItem) :
@@ -824,6 +999,131 @@ def syscallProg : Program :=
 
 #guard syscallProg.getD (textBase + 4#32) 0 = 0x0000000C#32
 #guard decode (syscallProg.getD (textBase + 4#32) 0) = some .syscall
+
+-- `movn`/`movz`: table-driven like `add`, 'rd, rs, rt' operand order.
+def movSrc : String := "movn $t0, $t1, $t2\nmovz $t0, $t1, $t2\n"
+def movProg : Program :=
+  match assemble movSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard movProg.getD textBase 0 = mkRT (9#32) (10#32) (8#32) (0#32) (0x0b#32)
+#guard movProg.getD (textBase + 4#32) 0 = mkRT (9#32) (10#32) (8#32) (0#32) (0x0a#32)
+#guard decode (movProg.getD textBase 0) = some (.movn 9#32 10#32 8#32)
+#guard decode (movProg.getD (textBase + 4#32) 0) = some (.movz 9#32 10#32 8#32)
+
+-- `clo $rd, $rs` / `clz $rd, $rs`: SPECIAL2 opcode 0x1c, rt field duplicates rd.
+def cloClzSrc : String := "clo $t0, $t1\nclz $t0, $t1\n"
+def cloClzProg : Program :=
+  match assemble cloClzSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard cloClzProg.getD textBase 0 = (natToW32 0x1c <<< 26) ||| mkRT (9#32) (8#32) (8#32) (0#32) (0x21#32)
+#guard cloClzProg.getD (textBase + 4#32) 0 = (natToW32 0x1c <<< 26) ||| mkRT (9#32) (8#32) (8#32) (0#32) (0x20#32)
+#guard decode (cloClzProg.getD textBase 0) = some (.clo 9#32 8#32)
+#guard decode (cloClzProg.getD (textBase + 4#32) 0) = some (.clz 9#32 8#32)
+
+-- `seb $rd, $rt` / `seh $rd, $rt`: SPECIAL3 opcode 0x1f, funct 0x20, the
+-- shamt-position sub-field (0x10/0x18) selects seb vs seh.
+def sebSehSrc : String := "seb $t0, $t1\nseh $t0, $t1\n"
+def sebSehProg : Program :=
+  match assemble sebSehSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard sebSehProg.getD textBase 0 = (natToW32 0x1f <<< 26) ||| mkRT (0#32) (9#32) (8#32) (0x10#32) (0x20#32)
+#guard sebSehProg.getD (textBase + 4#32) 0 = (natToW32 0x1f <<< 26) ||| mkRT (0#32) (9#32) (8#32) (0x18#32) (0x20#32)
+#guard decode (sebSehProg.getD textBase 0) = some (.seb 8#32 9#32)
+#guard decode (sebSehProg.getD (textBase + 4#32) 0) = some (.seh 8#32 9#32)
+-- `break`: zero operands, all fields zero except funct = 0x0d (0x0000000D);
+-- real MIPS32 encoding (the funct value immediately after `syscall`'s
+-- 0x0c) -- see `Instruction.lean`'s `encode .break`.
+def breakSrc : String := "break\n"
+def breakProg : Program :=
+  match assemble breakSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard breakProg.getD textBase 0 = 0x0000000D#32
+#guard decode (breakProg.getD textBase 0) = some .break
+#guard (assemble "break $t0\n").isOk = false
+
+-- trap-on-condition family: `rs, rt` operands, same shape as `mult`/`div`.
+def trapSrc : String := "teq $t0, $t1\ntne $t0, $t1\ntlt $t0, $t1\ntge $t0, $t1\ntltu $t0, $t1\ntgeu $t0, $t1\n"
+def trapProg : Program :=
+  match assemble trapSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard trapProg.getD textBase 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x34#32)
+#guard decode (trapProg.getD textBase 0) = some (.teq 8#32 9#32)
+#guard trapProg.getD (textBase + 4#32) 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x36#32)
+#guard decode (trapProg.getD (textBase + 4#32) 0) = some (.tne 8#32 9#32)
+#guard trapProg.getD (textBase + 8#32) 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x32#32)
+#guard decode (trapProg.getD (textBase + 8#32) 0) = some (.tlt 8#32 9#32)
+#guard trapProg.getD (textBase + 12#32) 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x30#32)
+#guard decode (trapProg.getD (textBase + 12#32) 0) = some (.tge 8#32 9#32)
+#guard trapProg.getD (textBase + 16#32) 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x33#32)
+#guard decode (trapProg.getD (textBase + 16#32) 0) = some (.tltu 8#32 9#32)
+#guard trapProg.getD (textBase + 20#32) 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x31#32)
+#guard decode (trapProg.getD (textBase + 20#32) 0) = some (.tgeu 8#32 9#32)
+#guard (assemble "teq $t0\n").isOk = false
+-- Coprocessor-1 (FPU) mnemonics: cross-checked word-for-word against
+-- `Instruction.encode` (an independent encoding path from this assembler's
+-- `cop1RtWord`/`itWord`), covering registers/`$fN` parsing and every form.
+def cop1Src : String :=
+"mtc1 $t0, $f3\n" ++
+"mfc1 $t1, $f3\n" ++
+"lwc1 $f5, 4($sp)\n" ++
+"swc1 $f5, 4($sp)\n" ++
+"add.s $f8, $f7, $f6\n" ++
+"sub.s $f8, $f7, $f6\n" ++
+"mul.s $f8, $f7, $f6\n" ++
+"div.s $f8, $f7, $f6\n" ++
+"mov.s $f8, $f7\n" ++
+"cvt.s.w $f8, $f7\n" ++
+"cvt.w.s $f8, $f7\n" ++
+"c.eq.s $f7, $f6\n" ++
+"c.lt.s $f7, $f6\n" ++
+"c.le.s $f7, $f6\n" ++
+"loop: bc1t loop\n" ++
+"bc1f loop\n"
+
+def cop1Prog : Program :=
+  match assemble cop1Src with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard cop1Prog.getD textBase 0 = encode (.mtc1 8#32 3#32)
+#guard cop1Prog.getD (textBase + 4#32) 0 = encode (.mfc1 9#32 3#32)
+#guard cop1Prog.getD (textBase + 8#32) 0 = encode (.lwc1 29#32 5#32 4#32)
+#guard cop1Prog.getD (textBase + 12#32) 0 = encode (.swc1 29#32 5#32 4#32)
+#guard cop1Prog.getD (textBase + 16#32) 0 = encode (.addS 8#32 7#32 6#32)
+#guard cop1Prog.getD (textBase + 20#32) 0 = encode (.subS 8#32 7#32 6#32)
+#guard cop1Prog.getD (textBase + 24#32) 0 = encode (.mulS 8#32 7#32 6#32)
+#guard cop1Prog.getD (textBase + 28#32) 0 = encode (.divS 8#32 7#32 6#32)
+#guard cop1Prog.getD (textBase + 32#32) 0 = encode (.movS 8#32 7#32)
+#guard cop1Prog.getD (textBase + 36#32) 0 = encode (.cvtSW 8#32 7#32)
+#guard cop1Prog.getD (textBase + 40#32) 0 = encode (.cvtWS 8#32 7#32)
+#guard cop1Prog.getD (textBase + 44#32) 0 = encode (.cEqS 7#32 6#32)
+#guard cop1Prog.getD (textBase + 48#32) 0 = encode (.cLtS 7#32 6#32)
+#guard cop1Prog.getD (textBase + 52#32) 0 = encode (.cLeS 7#32 6#32)
+-- `loop: bc1t loop`: instrAddr = textBase+56 = target; nextPc = +4;
+-- offset = (target - nextPc)/4 = -1.
+#guard cop1Prog.getD (textBase + 56#32) 0 = encode (.bc1t (ofInt32 (-1)))
+-- `bc1f loop`: instrAddr = textBase+60, nextPc = textBase+64, target = loop
+-- (textBase+56); offset = (56 - 64)/4 = -2.
+#guard cop1Prog.getD (textBase + 60#32) 0 = encode (.bc1f (ofInt32 (-2)))
+-- every emitted COP1 word also round-trips through `decode`
+#guard decode (cop1Prog.getD textBase 0) = some (.mtc1 8#32 3#32)
+#guard decode (cop1Prog.getD (textBase + 16#32) 0) = some (.addS 8#32 7#32 6#32)
+-- `decode`'s `imm` is the raw 16-bit field (zero-extended), not the
+-- sign-extended offset value, per `Instruction.lean`'s "raw field" convention
+-- (same as `beq`/`bne`'s `imm`); -1 as that raw 16-bit field is 0xffff.
+#guard decode (cop1Prog.getD (textBase + 56#32) 0) = some (.bc1t 0xffff#32)
+-- an unknown `$f` register is a `badRegister` error
+#guard (assemble "mov.s $f8, $f32\n").isOk = false
 
 -- One error case per major `AsmError` kind.
 #guard (assemble "frobnicate $t0, $t1\n").isOk = false

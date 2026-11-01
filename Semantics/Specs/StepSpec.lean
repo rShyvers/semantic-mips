@@ -57,6 +57,15 @@ negative, but the difference negative, or the mirror-image case. -/
 def subOverflowsSpec (a b diff : Int) : Bool :=
   decide ((0 ≤ a ∧ b < 0 ∧ diff < 0) ∨ (a < 0 ∧ 0 ≤ b ∧ 0 ≤ diff))
 
+/-- Mirrors `Step.lean`'s private `isBranchLike`: true for exactly the six
+branch/jump instructions that schedule a delay-slot transfer
+(`beq`,`bne`,`blez`,`bgtz`,`j`,`jal`) — used to state
+`branch_in_delay_slot_halts` below. -/
+def isBranchLikeSpec (instr : Instruction) : Bool :=
+  match instr with
+  | .beq _ _ _ | .bne _ _ _ | .blez _ _ | .bgtz _ _ | .j _ | .jal _ => true
+  | _ => false
+
 /-! ## Group 1 — global invariants preserved by one step -/
 
 /-- A `writeReg` call never moves the program counter: it only ever touches
@@ -138,7 +147,8 @@ formed, `addOverflowsSpec` is INSTRUCTION-REF's Java-derived overflow test
 `arithmeticOverflow` or writes the sum and advances the program counter by
 4. Every other `add`-related theorem is a corollary of this one. -/
 theorem add_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
-    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.add rs rt rd)) :
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.add rs rt rd))
+    (hpb : s.pendingBranch = none) :
     step p s =
       let av := readReg s (regIdxSpec rs)
       let bv := readReg s (regIdxSpec rt)
@@ -149,6 +159,9 @@ theorem add_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rd) sumBV) with
             pc := (writeReg s (regIdxSpec rd) sumBV).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
   unfold step
   rw [hfetch]
   dsimp only
@@ -162,8 +175,9 @@ has both a halting branch and a register-writing branch): whichever branch
 `step` takes, register `0` reads the same value before and after. -/
 theorem step_add_preserves_zero_register (p : Program) (s s' : State) (w rs rt rd : W32)
     (hfw : fetchWord p s.pc = some w) (hdw : decode w = some (.add rs rt rd))
+    (hpb : s.pendingBranch = none)
     (hstep : step p s = StepResult.next s') : readReg s' 0 = readReg s 0 := by
-  rw [add_spec_raw p s w rs rt rd hfw hdw] at hstep
+  rw [add_spec_raw p s w rs rt rd hfw hdw hpb] at hstep
   dsimp only at hstep
   split at hstep
   · cases hstep
@@ -175,7 +189,8 @@ theorem step_add_preserves_zero_register (p : Program) (s s' : State) (w rs rt r
 overflow.** Mirrors `add_spec_raw`; `subOverflowsSpec` is INSTRUCTION-REF's
 "sub" overflow test. -/
 theorem sub_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
-    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.sub rs rt rd)) :
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.sub rs rt rd))
+    (hpb : s.pendingBranch = none) :
     step p s =
       let av := readReg s (regIdxSpec rs)
       let bv := readReg s (regIdxSpec rt)
@@ -186,6 +201,9 @@ theorem sub_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rd) diffBV) with
             pc := (writeReg s (regIdxSpec rd) diffBV).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
   unfold step
   rw [hfetch]
   dsimp only
@@ -197,7 +215,8 @@ theorem sub_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
 signed overflow.** The immediate is sign-extended first (INSTRUCTION-REF
 "addi" section), then the same overflow test as `add` applies. -/
 theorem addi_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
-    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.addi rs rt imm)) :
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.addi rs rt imm))
+    (hpb : s.pendingBranch = none) :
     step p s =
       let av := readReg s (regIdxSpec rs)
       let bv := signExt16 imm
@@ -208,6 +227,9 @@ theorem addi_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) sumBV) with
             pc := (writeReg s (regIdxSpec rt) sumBV).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
   unfold step
   rw [hfetch]
   dsimp only
@@ -222,7 +244,8 @@ and `lo` untouched and does not halt** (SPEC-NOTES §9.2 / INSTRUCTION-REF
 "div" MARS-note: this is a deliberate MIPS32-spec reading, not a MARS bug).
 Both cases always advance the program counter by 4. -/
 theorem div_spec_raw (p : Program) (s : State) (w rs rt : W32)
-    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.div rs rt)) :
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.div rs rt))
+    (hpb : s.pendingBranch = none) :
     step p s =
       let a := asSigned (readReg s (regIdxSpec rs))
       let b := asSigned (readReg s (regIdxSpec rt))
@@ -230,6 +253,9 @@ theorem div_spec_raw (p : Program) (s : State) (w rs rt : W32)
         StepResult.next { s with pc := s.pc + 4#32 }
       else
         StepResult.next { s with lo := ofInt32 (a.tdiv b), hi := ofInt32 (a.tmod b), pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
   unfold step
   rw [hfetch]
   dsimp only
@@ -242,9 +268,10 @@ they were and does not halt — INSTRUCTION-REF "div" MARS-note, SPEC-NOTES
 §9.2. -/
 theorem div_by_zero_spec (p : Program) (s : State) (w rs rt : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.div rs rt))
+    (hpb : s.pendingBranch = none)
     (hzero : readReg s (regIdxSpec rt) = 0#32) :
     step p s = StepResult.next { s with pc := s.pc + 4#32 } := by
-  rw [div_spec_raw p s w rs rt hfetch hdecode, hzero]
+  rw [div_spec_raw p s w rs rt hfetch hdecode hpb, hzero]
   rfl
 
 /-- Corollary of `div_spec_raw`: with a negative dividend and a nonzero
@@ -253,6 +280,7 @@ truncates toward zero (same as Java's `%`, which Java-derived MARS uses —
 INSTRUCTION-REF "div" section, "remainder takes the sign of the dividend"). -/
 theorem div_negative_dividend_spec (p : Program) (s : State) (w rs rt : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.div rs rt))
+    (hpb : s.pendingBranch = none)
     (hnz : asSigned (readReg s (regIdxSpec rt)) ≠ 0)
     (hneg : asSigned (readReg s (regIdxSpec rs)) < 0) :
     step p s =
@@ -261,24 +289,37 @@ theorem div_negative_dividend_spec (p : Program) (s : State) (w rs rt : W32)
           lo := ofInt32 ((asSigned (readReg s (regIdxSpec rs))).tdiv (asSigned (readReg s (regIdxSpec rt))))
           hi := ofInt32 ((asSigned (readReg s (regIdxSpec rs))).tmod (asSigned (readReg s (regIdxSpec rt))))
           pc := s.pc + 4#32 } := by
-  rw [div_spec_raw p s w rs rt hfetch hdecode]
+  rw [div_spec_raw p s w rs rt hfetch hdecode hpb]
   have : ¬ (asSigned (readReg s (regIdxSpec rt)) == 0) := by
     simp [hnz]
   rw [if_neg (by simpa using this)]
 
-/-- **`beq`/`bne` branch target and condition, in one equation.** Mirrors
-`step`'s own code: the comparison `$rs == $rt` picks between falling through
-to `PC_next` and jumping to `PC_next + (sext16(offset) << 2)`, with `beq`
-and `bne` using the comparison the opposite way around (INSTRUCTION-REF
-"beq"/"bne" sections, Global rule 1 — no delay slot, so the taken branch's
-target is the very next fetch). -/
+/-- **`beq`/`bne` branch target and condition, in one equation — real
+MIPS32 one-delay-slot semantics.** Mirrors `step`'s own code: the
+comparison `$rs == $rt` picks between an ordinary fallthrough to `PC_next`
+and *scheduling* (not jumping to) `PC_next + (sext16(offset) << 2)` via
+`pendingBranch`, with `beq` and `bne` using the comparison the opposite way
+around. A taken branch never updates `pc` past `PC_next` in this same step
+— the delay-slot instruction at `PC_next` always executes first; the
+schedule is committed by the *next* step's `advance` (`Step.lean`), see
+`beq_taken_delay_slot_lands_on_target` below for the two-step composition
+(SPEC-NOTES §9 item 1; INSTRUCTION-REF Global rule 3 — this supersedes the
+old no-delay-slot MARS-default behavior). The hypothesis `hpb` restricts
+this equation to the ordinary case where `s` is not itself sitting in
+another pending delay slot; see `branch_in_delay_slot_halts` for that other
+case. -/
 theorem beq_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
-    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.beq rs rt imm)) :
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.beq rs rt imm))
+    (hpb : s.pendingBranch = none) :
     step p s =
       if readReg s (regIdxSpec rs) == readReg s (regIdxSpec rt) then
-        StepResult.next { s with pc := (s.pc + 4#32) + (signExt16 imm <<< 2) }
+        StepResult.next
+          { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
   unfold step
   rw [hfetch]
   dsimp only
@@ -287,12 +328,17 @@ theorem beq_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
   rfl
 
 theorem bne_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
-    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.bne rs rt imm)) :
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.bne rs rt imm))
+    (hpb : s.pendingBranch = none) :
     step p s =
       if readReg s (regIdxSpec rs) == readReg s (regIdxSpec rt) then
         StepResult.next { s with pc := s.pc + 4#32 }
       else
-        StepResult.next { s with pc := (s.pc + 4#32) + (signExt16 imm <<< 2) } := by
+        StepResult.next
+          { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
   unfold step
   rw [hfetch]
   dsimp only
@@ -300,50 +346,95 @@ theorem bne_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
   dsimp only
   rfl
 
-/-- **`beq`, taken**: when `$rs = $rt`, the next program counter is the
-address *after* `beq` plus the sign-extended offset scaled by 4
-(INSTRUCTION-REF "beq" / Global rule 1: `PC = PC_next + (offset << 2)`, no
-delay slot). -/
+/-- **`beq`, taken**: when `$rs = $rt`, `beq` schedules
+`PC_next + (offset << 2)` as the pending delay-slot transfer and itself
+falls through to `PC_next` — it does **not** jump immediately
+(INSTRUCTION-REF Global rule 3: real MIPS32 always executes one delay-slot
+instruction first). -/
 theorem beq_taken_spec (p : Program) (s : State) (w rs rt imm : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.beq rs rt imm))
+    (hpb : s.pendingBranch = none)
     (htaken : readReg s (regIdxSpec rs) = readReg s (regIdxSpec rt)) :
-    step p s = StepResult.next { s with pc := (s.pc + 4#32) + (signExt16 imm <<< 2) } := by
-  rw [beq_spec_raw p s w rs rt imm hfetch hdecode, if_pos (by simpa using htaken)]
+    step p s = StepResult.next
+      { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) } := by
+  rw [beq_spec_raw p s w rs rt imm hfetch hdecode hpb, if_pos (by simpa using htaken)]
 
 /-- **`beq`, not taken**: when `$rs ≠ $rt`, control simply falls through to
-`PC_next` (INSTRUCTION-REF "beq" section). -/
+`PC_next`, exactly as an ordinary instruction — no `pendingBranch` is ever
+set (INSTRUCTION-REF "beq" section). -/
 theorem beq_not_taken_spec (p : Program) (s : State) (w rs rt imm : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.beq rs rt imm))
+    (hpb : s.pendingBranch = none)
     (hnot : readReg s (regIdxSpec rs) ≠ readReg s (regIdxSpec rt)) :
     step p s = StepResult.next { s with pc := s.pc + 4#32 } := by
-  rw [beq_spec_raw p s w rs rt imm hfetch hdecode, if_neg (by simpa using hnot)]
+  rw [beq_spec_raw p s w rs rt imm hfetch hdecode hpb, if_neg (by simpa using hnot)]
 
-/-- **`bne`, taken**: when `$rs ≠ $rt`, branches to `PC_next + (offset <<
-2)` — the mirror image of `beq` (INSTRUCTION-REF "bne" section). -/
+/-- **`bne`, taken**: when `$rs ≠ $rt`, schedules `PC_next + (offset << 2)`
+— the mirror image of `beq`, same one-delay-slot discipline. -/
 theorem bne_taken_spec (p : Program) (s : State) (w rs rt imm : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.bne rs rt imm))
+    (hpb : s.pendingBranch = none)
     (htaken : readReg s (regIdxSpec rs) ≠ readReg s (regIdxSpec rt)) :
-    step p s = StepResult.next { s with pc := (s.pc + 4#32) + (signExt16 imm <<< 2) } := by
-  rw [bne_spec_raw p s w rs rt imm hfetch hdecode, if_neg (by simpa using htaken)]
+    step p s = StepResult.next
+      { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) } := by
+  rw [bne_spec_raw p s w rs rt imm hfetch hdecode hpb, if_neg (by simpa using htaken)]
 
 /-- **`bne`, not taken**: when `$rs = $rt`, falls through to `PC_next`. -/
 theorem bne_not_taken_spec (p : Program) (s : State) (w rs rt imm : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.bne rs rt imm))
+    (hpb : s.pendingBranch = none)
     (hnot : readReg s (regIdxSpec rs) = readReg s (regIdxSpec rt)) :
     step p s = StepResult.next { s with pc := s.pc + 4#32 } := by
-  rw [bne_spec_raw p s w rs rt imm hfetch hdecode, if_pos (by simpa using hnot)]
+  rw [bne_spec_raw p s w rs rt imm hfetch hdecode hpb, if_pos (by simpa using hnot)]
 
-/-- **`jal` links `$ra` to the address right after itself, and jumps to a
-target whose top 4 bits come from `PC_next`, not from `jal`'s own
-address** (INSTRUCTION-REF "jal" / Global rule 1 — `$ra = PC_next`,
-`PC = (PC_next & 0xF0000000) | (target << 2)`). -/
+/-- **Two-step delay-slot composition for a taken `beq`**: the branch's own
+step only schedules the target (`beq_taken_spec`); it is the *following*
+step — executing the delay-slot instruction — that actually lands `pc` on
+it (`advance` in `Step.lean`, triggered by any ordinary, non-branch-like
+instruction; demonstrated concretely here with `sll $zero,$zero,0` i.e.
+`nop` as the delay-slot filler). This is the theorem that directly
+witnesses "real MIPS32 branch delay slot" as a two-instruction behavior,
+matching the task's exact semantics rather than only the one-step schedule
+captured by `beq_taken_spec`. -/
+theorem beq_taken_delay_slot_lands_on_target (p : Program) (s : State) (w w2 rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.beq rs rt imm))
+    (hpb : s.pendingBranch = none)
+    (htaken : readReg s (regIdxSpec rs) = readReg s (regIdxSpec rt))
+    (hfetch2 : fetchWord p (s.pc + 4#32) = some w2)
+    (hdecode2 : decode w2 = some (.sll 0#32 0#32 0#32)) :
+    ∃ s1 s2,
+      step p s = StepResult.next s1 ∧
+      step p s1 = StepResult.next s2 ∧
+      s2.pc = (s.pc + 4#32) + (signExt16 imm <<< 2) := by
+  have h1 := beq_taken_spec p s w rs rt imm hfetch hdecode hpb htaken
+  have h2 : step p { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) } = StepResult.next { s with pc := (s.pc + 4#32) + (signExt16 imm <<< 2), pendingBranch := none } := by
+    unfold step
+    rw [show fetchWord p ({ s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) } : State).pc = some w2 from hfetch2]
+    dsimp only
+    rw [hdecode2]
+    dsimp only
+    rfl
+  exact ⟨_, _, h1, h2, rfl⟩
+
+/-- **`jal` links `$ra` to `pc + 8` — past the delay slot, not `PC_next`
+(`pc + 4`) — and schedules a jump to a target whose top 4 bits come from
+`PC_next`, not from `jal`'s own address** (INSTRUCTION-REF Global rule 3:
+real MIPS32's `jal` link value is the address of the instruction *after*
+the delay slot, since the delay-slot instruction itself still executes
+before control can return to `$ra`). Like `beq`/`bne`, `jal` schedules the
+jump via `pendingBranch` and itself falls through to `PC_next`; it never
+jumps in the same step. -/
 theorem jal_spec_raw (p : Program) (s : State) (w target : W32)
-    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.jal target)) :
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.jal target))
+    (hpb : s.pendingBranch = none) :
     step p s =
       let pcNext := s.pc + 4#32
       StepResult.next
-        { (writeReg s 31 pcNext) with
-          pc := (pcNext &&& 0xf0000000#32) ||| (target <<< 2) } := by
+        { (writeReg s 31 (pcNext + 4#32)) with
+          pc := pcNext, pendingBranch := some ((pcNext &&& 0xf0000000#32) ||| (target <<< 2)) } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
   unfold step
   rw [hfetch]
   dsimp only
@@ -352,16 +443,42 @@ theorem jal_spec_raw (p : Program) (s : State) (w target : W32)
   rfl
 
 /-- Corollary of `jal_spec_raw`: `$ra` (register 31) reads back exactly
-`PC_next`, i.e. the address of the instruction right after `jal`. -/
+`pc + 8`, i.e. the address of the instruction *after* the delay slot
+(`jal`'s own address plus 8), not `pc + 4`. -/
 theorem jal_sets_ra (p : Program) (s : State) (w target : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.jal target))
+    (hpb : s.pendingBranch = none)
     (hsize32 : s.regs.size = 32) :
-    ∃ s', step p s = StepResult.next s' ∧ readReg s' (regIdxSpec 31#32) = s.pc + 4#32 := by
-  refine ⟨_, jal_spec_raw p s w target hfetch hdecode, ?_⟩
-  show readReg (writeReg s 31 (s.pc + 4#32)) (regIdxSpec 31#32) = s.pc + 4#32
+    ∃ s', step p s = StepResult.next s' ∧ readReg s' (regIdxSpec 31#32) = s.pc + 8#32 := by
+  refine ⟨_, jal_spec_raw p s w target hfetch hdecode hpb, ?_⟩
+  show readReg (writeReg s 31 ((s.pc + 4#32) + 4#32)) (regIdxSpec 31#32) = s.pc + 8#32
   have h31 : regIdxSpec 31#32 = (31 : Fin 32) := by decide
-  rw [h31]
-  exact writeReg_reads_back s 31 (s.pc + 4#32) (by decide) hsize32
+  rw [h31, writeReg_reads_back s 31 ((s.pc + 4#32) + 4#32) (by decide) hsize32,
+    BitVec.add_assoc]
+  congr 1
+
+/-- **A branch/jump occurring in another's delay slot halts.** Real MIPS32
+leaves this architecturally discouraged/implementation-defined; rather than
+pick an arbitrary behavior, `step` reports `HaltReason.branchInDelaySlot`
+whenever the incoming state already has a scheduled transfer
+(`s.pendingBranch = some _`) and the instruction about to execute is itself
+one of the six branch/jump instructions (`isBranchLikeSpec`)
+(SPEC-NOTES §9 item 1; INSTRUCTION-REF Global rule 3). -/
+theorem branch_in_delay_slot_halts (p : Program) (s : State) (w : W32) (instr : Instruction)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some instr)
+    (hpb : s.pendingBranch.isSome = true) (hbr : isBranchLikeSpec instr = true) :
+    step p s = StepResult.halt .branchInDelaySlot := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  cases pb with
+  | none => simp at hpb
+  | some t =>
+    unfold step
+    rw [hfetch]
+    dsimp only
+    rw [hdecode]
+    dsimp only
+    cases instr <;> simp_all [isBranchLikeSpec] <;> rfl
 
 /-- **`lw` composes a big-endian word from memory at `$rs + sext16(offset)`,
 or halts with `addressError` on a misaligned effective address**
@@ -369,7 +486,8 @@ or halts with `addressError` on a misaligned effective address**
 sign-extended, unlike MARS's own latent zero-extension bug for raw-decoded
 binaries). -/
 theorem lw_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
-    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.lw rs rt imm)) :
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.lw rs rt imm))
+    (hpb : s.pendingBranch = none) :
     step p s =
       let addr := readReg s (regIdxSpec rs) + signExt16 imm
       match readMemWord s addr with
@@ -378,6 +496,9 @@ theorem lw_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) v) with
             pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
   unfold step
   rw [hfetch]
   dsimp only
@@ -389,9 +510,10 @@ theorem lw_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
 `addressError`, naming that exact address. -/
 theorem lw_misaligned_spec (p : Program) (s : State) (w rs rt imm : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.lw rs rt imm))
+    (hpb : s.pendingBranch = none)
     (hmisaligned : (readReg s (regIdxSpec rs) + signExt16 imm).toNat % 4 ≠ 0) :
     step p s = StepResult.halt (.addressError (readReg s (regIdxSpec rs) + signExt16 imm)) := by
-  rw [lw_spec_raw p s w rs rt imm hfetch hdecode]
+  rw [lw_spec_raw p s w rs rt imm hfetch hdecode hpb]
   dsimp only
   rw [show readMemWord s (readReg s (regIdxSpec rs) + signExt16 imm) = none by
     unfold readMemWord
@@ -403,7 +525,8 @@ effective address, same byte, different widening (INSTRUCTION-REF "lb" /
 side by side is the whole point of the spec. -/
 theorem lb_lbu_spec_raw (p : Program) (s : State) (wb wbu rs rt imm : W32)
     (hfetchB : fetchWord p s.pc = some wb) (hdecodeB : decode wb = some (.lb rs rt imm))
-    (hfetchBU : fetchWord p s.pc = some wbu) (hdecodeBU : decode wbu = some (.lbu rs rt imm)) :
+    (hfetchBU : fetchWord p s.pc = some wbu) (hdecodeBU : decode wbu = some (.lbu rs rt imm))
+    (hpb : s.pendingBranch = none) :
     (step p s =
       let addr := readReg s (regIdxSpec rs) + signExt16 imm
       match readMemByte s addr with
@@ -421,6 +544,9 @@ theorem lb_lbu_spec_raw (p : Program) (s : State) (wb wbu rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)) with
             pc := (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)).pc + 4#32 }) := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
   constructor
   · unfold step
     rw [hfetchB]
@@ -480,6 +606,12 @@ def prog1Spec (instr : Instruction) : Program := (∅ : Program).insert textBase
 examples below. -/
 def setRegsSpec (s : State) (kvs : List (Fin 32 × W32)) : State :=
   kvs.foldl (fun acc kv => writeReg acc kv.1 kv.2) s
+
+/-- A sequential program starting at `base`, for building concrete
+delay-slot examples below (mirrors `Step.lean`'s test-only `buildProg`). -/
+def buildProgSpec (base : W32) (instrs : List Instruction) : Program :=
+  instrs.zipIdx.foldl (fun acc (instr, i) => acc.insert (base + BitVec.ofNat 32 (4 * i)) (encode instr))
+    (∅ : Program)
 
 -- Closed weaker version of `syscall1_spec`: a concrete syscall-1 call
 -- appends the decimal rendering of `$a0`, with no trailing newline.
@@ -544,27 +676,42 @@ example : decode (encode (Instruction.add 8#32 9#32 10#32)) = some (.add 8#32 9#
         | .next s => s.lo == 0xfffffffd#32 && s.hi == 0xfffffffe#32
         | .halt _ => false) = true
 
--- `beq_taken_spec`/`beq_not_taken_spec`: equal registers branch, unequal
--- registers fall through.
+-- `beq_taken_spec`/`beq_not_taken_spec`: equal registers schedule the
+-- target via `pendingBranch` and fall through to the delay slot first
+-- (real MIPS32 one-delay-slot semantics); unequal registers fall through
+-- exactly as an ordinary instruction.
 #guard (match step (prog1Spec (.beq 8#32 9#32 3#32))
           (setRegsSpec (initialState textBase) [(8, 5#32), (9, 5#32)]) with
-        | .next s => s.pc == textBase + 4#32 + 12#32
+        | .next s => s.pc == textBase + 4#32 && s.pendingBranch == some (textBase + 4#32 + 12#32)
         | .halt _ => false) = true
 #guard (match step (prog1Spec (.beq 8#32 9#32 3#32))
           (setRegsSpec (initialState textBase) [(8, 5#32), (9, 6#32)]) with
-        | .next s => s.pc == textBase + 4#32
+        | .next s => s.pc == textBase + 4#32 && s.pendingBranch == none
         | .halt _ => false) = true
 
 -- `bne_taken_spec`/`bne_not_taken_spec`: the mirror image of `beq`.
 #guard (match step (prog1Spec (.bne 8#32 9#32 3#32))
           (setRegsSpec (initialState textBase) [(8, 5#32), (9, 6#32)]) with
-        | .next s => s.pc == textBase + 4#32 + 12#32
+        | .next s => s.pc == textBase + 4#32 && s.pendingBranch == some (textBase + 4#32 + 12#32)
         | .halt _ => false) = true
 
--- `jal_sets_ra`: `$ra` ends up exactly `pc + 4`, and the jump target's top
--- 4 bits come from `pc + 4`, not from `jal`'s own address.
+-- `beq_taken_delay_slot_lands_on_target`: the delay-slot instruction's own
+-- step is what actually lands `pc` on the scheduled target.
+#guard (match step (buildProgSpec textBase [.beq 8#32 9#32 3#32, .sll 0#32 0#32 0#32])
+          (setRegsSpec (initialState textBase) [(8, 5#32), (9, 5#32)]) with
+        | .next s1 =>
+          (match step (buildProgSpec textBase [.beq 8#32 9#32 3#32, .sll 0#32 0#32 0#32]) s1 with
+            | .next s2 => s2.pc == textBase + 4#32 + 12#32
+            | .halt _ => false)
+        | .halt _ => false) = true
+
+-- `jal_sets_ra`: `$ra` ends up exactly `pc + 8` (past the delay slot), and
+-- the jump is scheduled (not immediate) with its target's top 4 bits
+-- coming from `pc + 4`, not from `jal`'s own address.
 #guard (match step (prog1Spec (.jal 0x1000#32)) (initialState textBase) with
-        | .next s => readReg s 31 == textBase + 4#32 && s.pc == 0x4000#32
+        | .next s =>
+          readReg s 31 == textBase + 8#32 && s.pc == textBase + 4#32 &&
+            s.pendingBranch == some 0x4000#32
         | .halt _ => false) = true
 
 -- `lw_spec_raw`: a big-endian word loaded back out.
@@ -608,11 +755,12 @@ not. -/
 these operands. -/
 theorem add_overflow_not_wrapped (p : Program) (s : State) (w : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.add 8#32 9#32 10#32))
+    (hpb : s.pendingBranch = none)
     (ha : readReg s (regIdxSpec 8#32) = 0x7fffffff#32)
     (hb : readReg s (regIdxSpec 9#32) = 1#32) :
     ¬ ∃ s', step p s = StepResult.next s' := by
   rintro ⟨s', hs'⟩
-  rw [add_spec_raw p s w 8#32 9#32 10#32 hfetch hdecode] at hs'
+  rw [add_spec_raw p s w 8#32 9#32 10#32 hfetch hdecode hpb] at hs'
   dsimp only at hs'
   rw [ha, hb] at hs'
   rw [if_pos (by decide)] at hs'
@@ -642,10 +790,11 @@ real `lw` always halts on a misaligned effective address, so there is no
 state `s'` it could step to. -/
 theorem lw_misaligned_no_next (p : Program) (s : State) (w rs rt imm : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.lw rs rt imm))
+    (hpb : s.pendingBranch = none)
     (hmisaligned : (readReg s (regIdxSpec rs) + signExt16 imm).toNat % 4 ≠ 0) :
     ¬ ∃ s', step p s = StepResult.next s' := by
   rintro ⟨s', hs'⟩
-  rw [lw_misaligned_spec p s w rs rt imm hfetch hdecode hmisaligned] at hs'
+  rw [lw_misaligned_spec p s w rs rt imm hfetch hdecode hpb hmisaligned] at hs'
   cases hs'
 
 -- Concrete witness: `lw` from a `+1`-misaligned address halts, it never

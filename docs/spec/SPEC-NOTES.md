@@ -48,11 +48,17 @@ Source: `vendor/mars-src/mars/mips/hardware/RegisterFile.java`.
 Source: `vendor/mars-src/mars/simulator/Simulator.java`,
 `vendor/mars-src/mars/Settings.java`.
 
-- **No branch delay slots by default.** `DelayedBranching` setting defaults to
-  `false` (`Settings.java`, index 8 of `defaultBooleanSettingsValues`). A taken
-  branch/jump updates PC to the target immediately; the "next" instruction is
-  the one at the target. (MARS can model delay slots if the user enables the
-  setting — out of scope for our spec.)
+- **Branch delay slots: our semantics implements real MIPS32, not MARS's
+  default.** `DelayedBranching` setting defaults to `false` in MARS
+  (`Settings.java`, index 8 of `defaultBooleanSettingsValues`): with that
+  default, MARS updates PC to a taken branch/jump's target immediately, with
+  no delay-slot instruction executed. Real MIPS32 hardware always executes
+  exactly one delay-slot instruction (the one physically following the
+  branch/jump) before the transfer takes effect; our semantics models that
+  real-architecture behavior (see §9 item 1), not MARS's no-delay-slot
+  configuration. (MARS *can* model delay slots if the user enables the
+  setting, which would then match our spec — but that is a MARS
+  configuration detail, not why we implement it this way.)
 - **Execution starts at the `.text` base** (`0x400000`), not at `main`:
   `StartAtMain` defaults to `false`.
 - PC fetches must be word-aligned; instruction fetch reads a 32-bit big-endian
@@ -122,17 +128,42 @@ per-instruction details are pinned in Lean spec S against `Instruction.java`.
   Agreement on the faithful region (§9) validates our implementation; it does
   not define the spec.
 - **Not in v1 scope:** macros, exception handler loading, kernel space,
-  coprocessors, floating point, delay slots (see §9).
+  coprocessors, floating point (see §9). Branch delay slots **are** in
+  scope — see §9 item 1 (this is deliberately real-MIPS32 behavior, not a
+  MARS-default dialect choice).
 
 ## 9. Divergence list (language vs MARS)
 
 Places where MARS's behavior differs from the plain MIPS architecture, and
 the decision for our semantics:
 
-1. **Branch delay slots: OUT OF SCOPE (dialect choice).** Real MIPS executes
-   the instruction after a branch in a delay slot; MARS's default configuration
-   does not (`DelayedBranching=false`). Our semantics models the no-delay-slot
-   educational dialect (same as SPIM). Documented, not hidden.
+1. **Branch delay slots: we implement real MIPS32, overriding MARS's
+   default.** Real MIPS32 hardware (the actual architecture, not a MARS
+   peculiarity) mandates exactly one delay slot for every branch
+   (`beq`/`bne`/`blez`/`bgtz`) and jump (`j`/`jal`): the single instruction
+   immediately following the branch/jump in program order **always**
+   executes — whether or not the branch is taken — *before* control
+   transfers to the target. MARS's default configuration
+   (`DelayedBranching=false`, same as SPIM) instead jumps to the target
+   immediately with no delay-slot instruction executed; MARS was only ever
+   meant to serve this project as a differential-testing oracle, not as the
+   spec source, and on this point we deliberately diverge from MARS's
+   default to match the real architecture. Concretely (see
+   `Semantics/Step.lean`, `Semantics/Types.lean`):
+   - A taken branch/jump does not update `pc` to the target in the same
+     step. It falls through to `pc + 4` (the delay-slot instruction, which
+     always executes next, taken or not) and *schedules* the real target in
+     a new `State.pendingBranch : Option W32` field; the delay-slot
+     instruction's own step is what actually applies the scheduled target
+     to `pc` (`Step.lean`'s `advance`/`mkNext`).
+   - `jal`'s `$ra` link value is `pc + 8` (the address *after* the delay
+     slot), not `pc + 4` — because the delay-slot instruction still executes
+     before control can return to `$ra`.
+   - A branch/jump occurring itself in another branch/jump's delay slot is
+     architecturally discouraged/implementation-defined in real MIPS32; our
+     semantics halts with `HaltReason.branchInDelaySlot` in that case
+     instead of guessing, keeping `step` total and the condition
+     diagnosable (INSTRUCTION-REF Global rule 3).
 2. **`div`/`divu` by zero: hi/lo unchanged, no trap.** The MIPS32 spec is
    read (by MARS itself, with an explicit source comment) as "no arithmetic
    exception under any circumstances"; COD3 textbooks say "divide with
@@ -161,3 +192,25 @@ the decision for our semantics:
    the same-width access), and sequential `.byte`/`.asciiz` data accessed
    byte-by-byte — which produce identical observable results under either
    byte order.
+5. **`jal`'s `$ra` value: diverges from MARS whenever the delay slot is
+   non-empty, as a direct consequence of item 1 — language wins.** Per item
+   1, real MIPS32 sets `jal`'s `$ra` to `pc + 8` (the address *after* the
+   delay slot), since the delay-slot instruction always executes before
+   control returns to `$ra`. MARS's default `DelayedBranching=false` has no
+   delay slot at all, so it always sets `$ra = pc + 4` — the address of
+   whatever instruction textually follows `jal`, regardless of whether that
+   instruction is ever executed. Before real delay slots were implemented,
+   `jal` was typically followed immediately by its logical continuation (no
+   gap), so `pc + 4 == pc + 8` and the two engines agreed by coincidence.
+   Once a real delay-slot instruction (even a pure no-op, inserted solely to
+   give `jal` a harmless instruction to execute as required by item 1) sits
+   between `jal` and its continuation, `pc + 4` and `pc + 8` are two
+   different addresses, and the two engines' `$ra` values necessarily
+   disagree — this is not fixable by any choice of delay-slot filler
+   instruction, since it follows purely from the fixed 4-byte gap between
+   the two conventions. Affects `tests/corpus/jump_jal.asm`: its former
+   `andi $a0, $ra, 0xff` / syscall probe of `$ra`'s raw low byte was removed
+   for this reason (that file's own header already notes `jr` is out of v1
+   scope, so the program never actually uses `$ra` to return — it hardcodes
+   `j AfterCall` instead — so the probe was a demonstration that `$ra` held
+   *something*, not a load-bearing control-flow check).

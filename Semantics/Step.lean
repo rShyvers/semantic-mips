@@ -14,9 +14,23 @@ without modifying any of them.
 
 Ground truth for every instruction: `docs/spec/INSTRUCTION-REF.md`. Where the
 MARS source diverges from the plain MIPS architecture, `docs/spec/SPEC-NOTES.md`
-§9 overrides (no delay slots; `div`/`divu` by zero leave `hi`/`lo` unchanged
+§9 overrides (real MIPS32 one-delay-slot branch/jump semantics, not MARS's
+default no-delay-slot config; `div`/`divu` by zero leave `hi`/`lo` unchanged
 and do **not** halt; `lw`/`sw` offsets are sign-extended per the ISA, unlike
-MARS's latent zero-extension bug for raw-decoded binary).
+MARS's latent zero-extension bug for raw-decoded binary). The coprocessor-0
+trap/exception model (`teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu`/`break` and
+`takeException` below) is grounded in the real MIPS32 ISA instead, per
+INSTRUCTION-REF's dedicated "Coprocessor 0 / traps and exceptions" section.
+
+The coprocessor-1 (FPU) instructions (v1.x addition; single-precision only,
+double-precision out of scope — see `docs/spec/INSTRUCTION-REF.md`'s
+floating-point section) are grounded directly in the real MIPS32 ISA, not
+MARS; their arithmetic uses Lean core's native `Float32` (`Init.Data.Float.
+Float32`), which implements IEEE-754 binary32 exactly, including
+`Float32.ofBits`/`Float32.toBits` for the lossless bit-pattern round-trip
+`fpRegs` storage needs. No FP traps are modeled: divide-by-zero and invalid
+operations propagate IEEE-754 Infinity/NaN naturally, the same precedent as
+integer `div`/`divu` by zero (SPEC-NOTES §9 item 2).
 
 ## Design notes
 
@@ -39,20 +53,46 @@ always `< 32`) into a `Fin 32` index for `readReg`/`writeReg`. -/
 private def regIdx (w : W32) : Fin 32 :=
   Fin.ofNat 32 w.toNat
 
-/-- Advance `s`'s program counter by one instruction word (`W32` wraparound
-on overflow, matching hardware). Used for every non-control-flow instruction
-and for untaken/fallthrough control flow. -/
-private def advance (s : State) : State :=
-  { s with pc := s.pc + 4#32 }
+/-- Advance `s`'s program counter: if a branch/jump delay-slot transfer is
+pending (`s.pendingBranch = some target`), resolve it now — `pc` becomes
+`target` and `pendingBranch` is cleared — otherwise this is an ordinary
+fallthrough, so `pc` advances by one instruction word (`W32` wraparound on
+overflow, matching hardware). This is the one place the delay-slot exit is
+implemented (SPEC-NOTES §9 item 1; INSTRUCTION-REF Global rule 3): every
+non-control-flow `execInstr` case routes through `mkNext`/`advance`, so it
+automatically commits a pending branch/jump when it is the delay-slot
+instruction, without any of those ~18 cases mentioning `pendingBranch`
+themselves. -/
+private def advance (orig result : State) : State :=
+  match orig.pendingBranch with
+  | some target => { result with pc := target, pendingBranch := none }
+  | none => { result with pc := result.pc + 4#32 }
 
-/-- Package `s` as a successful step that just falls through to `pc + 4`. -/
-private def mkNext (s : State) : StepResult :=
-  StepResult.next (advance s)
+/-- Package `result` (the ordinary, non-control-flow effect of the current
+instruction) as a successful step, resolving any delay-slot transfer
+pending on `orig` -- the state `execInstr` was called with, i.e. *before*
+this instruction's own effect -- via `advance`. Taking `orig` and `result`
+as two separate arguments (rather than just the already-updated state)
+keeps `orig.pendingBranch` syntactically visible at the call site instead of
+buried behind an arbitrary `writeReg`/`writeMem*` call's own internal
+register-index/alignment check, which matters for `StepSpec.lean`'s
+`rfl`-based proofs (a symbolic register index makes `(writeReg s i v)`
+itself irreducible, which would otherwise make its `.pendingBranch` field
+irreducible too, even though `writeReg`/`writeMem*` never actually change
+it). -/
+private def mkNext (orig result : State) : StepResult :=
+  StepResult.next (advance orig result)
 
-/-- Set `s`'s program counter to an explicitly-computed value (used by
-branches/jumps, which bypass `advance`). -/
-private def setPc (s : State) (pc : W32) : State :=
-  { s with pc := pc }
+/-- Whether `instr` is one of the six branch/jump instructions that
+schedule a delay-slot transfer (`beq`,`bne`,`blez`,`bgtz`,`j`,`jal`). Used
+to detect a branch/jump occurring itself inside another's delay slot (real
+MIPS32 leaves this architecturally discouraged/implementation-defined), so
+`execInstr` can halt with `HaltReason.branchInDelaySlot` instead of
+guessing. -/
+private def isBranchLike (instr : Instruction) : Bool :=
+  match instr with
+  | .beq _ _ _ | .bne _ _ _ | .blez _ _ | .bgtz _ _ | .j _ | .jal _ => true
+  | _ => false
 
 /-- Signed-overflow predicate for `add`/`addi`, following INSTRUCTION-REF's
 exact Java-derived test: overflow iff both operands are non-negative and the
@@ -76,6 +116,49 @@ private def signExtByte (b : UInt8) : W32 :=
 private def zeroExtByte (b : UInt8) : W32 :=
   BitVec.ofNat 32 b.toNat
 
+/-- Sign-extend the low byte of a register value to 32 bits (for `seb`).
+Same technique as `signExtByte`, but operating directly on a `W32` register
+value rather than a `UInt8` loaded from memory. -/
+private def signExtLowByte (w : W32) : W32 :=
+  (w.extractLsb 7 0).signExtend 32
+
+/-- Count leading zero bits in `w` from the MSB (bit 31), stopping at the
+first set bit; `32` if `w` is all-zero. `fuel` bounds the scan to the
+remaining unscanned bit positions (`pos .. 31`) so this terminates by
+structural recursion on `fuel`, with no `partial`/`sorry` needed. Used by
+`clz`/`clo` (`docs/spec/INSTRUCTION-REF.md`): per the MIPS32 ISA, both
+instructions report `32` when there is no bit of the relevant kind. -/
+private def countLeadingZerosFrom (w : W32) : Nat → Nat → Nat
+  | 0, pos => pos
+  | fuel + 1, pos => if w.getMsbD pos then pos else countLeadingZerosFrom w fuel (pos + 1)
+
+/-- Count leading zero bits in `w`, from the MSB. -/
+private def countLeadingZeros (w : W32) : Nat :=
+  countLeadingZerosFrom w 32 0
+
+/-- Count leading one bits in `w`, from the MSB: a run of `1`s in `w` is
+exactly a run of `0`s in `~~~w`, so this reduces to `countLeadingZeros`. -/
+private def countLeadingOnes (w : W32) : Nat :=
+  countLeadingZeros (~~~w)
+/-- Take a real MIPS32 exception from `s` with the given `Cause.ExcCode`
+(`excCodeBp` or `excCodeTr`; see `Types.lean`). This is the minimal
+coprocessor-0 trap model (see the module's new "## Traps / exceptions
+(coprocessor 0)" docs below and `docs/spec/INSTRUCTION-REF.md`): record the
+trapping instruction's own address in `EPC`, pack `excCode` into `Cause`'s
+`ExcCode` field (bits 6..2, i.e. `excCode <<< 2`), set `Status.EXL`, and jump
+`PC` directly to `exceptionVectorAddr`. This is a real state transition
+(`StepResult.next`), not a `HaltReason`; with no handler installed at the
+vector address in v1, the *next* `step` call will naturally hit the existing
+fetch-failure halt (`addressError`) there, giving real exception-vector
+semantics without inventing a synthetic "unhandled exception" halt reason. -/
+private def takeException (s : State) (excCode : W32) : StepResult :=
+  StepResult.next
+    { s with
+        cp0Epc := s.pc
+        cp0Cause := excCode <<< 2
+        cp0Status := s.cp0Status ||| statusExlMask
+        pc := exceptionVectorAddr }
+
 /-- Maximum number of bytes scanned by syscall 4 (`PrintString`) before
 giving up. This is a v1 simulator limitation (needed for `step` to remain a
 total function without assuming anything about how "long" a null-terminated
@@ -96,10 +179,47 @@ private def readCString (s : State) (addr : W32) : Nat → String
     if b == 0 then ""
     else String.singleton (Char.ofNat b.toNat) ++ readCString s (addr + 1#32) fuel
 
+/-- Reinterpret `w`'s raw bit pattern as an IEEE-754 single-precision float
+(no numeric conversion \u2014 matches `fpRegs`' raw-bit-pattern storage
+convention, `Types.lean`). `Float32.ofBits` is Lean core's exact IEEE-754
+bit-pattern decode (`Init.Data.Float.Float32`). -/
+private def floatOfBits (w : W32) : Float32 :=
+  Float32.ofBits w.toNat.toUInt32
+
+/-- Inverse of `floatOfBits`: the raw bit pattern of `f`, as a `W32`. -/
+private def bitsOfFloat (f : Float32) : W32 :=
+  BitVec.ofNat 32 f.toBits.toNat
+
+/-- `cvt.s.w`'s numeric conversion: read `w`'s bit pattern as a 32-bit
+two's-complement int (`Int32.ofBitVec`), then convert that integer *value*
+to the nearest `Float32` (`Int32.toFloat32`, exact for every `Int32`). -/
+private def floatOfIntBits (w : W32) : Float32 :=
+  (Int32.ofBitVec w).toFloat32
+
+/-- `cvt.w.s`'s numeric conversion: truncate `f` toward zero to a 32-bit
+two's-complement int (`Float32.toInt32`, which clamps on overflow and maps
+`NaN` to `0`), returned as a raw bit pattern. See `Instruction.cvtWS`'s
+docstring for the truncating-vs-FCSR-rounding-mode simplification this
+pins. -/
+private def intBitsOfFloatTrunc (f : Float32) : W32 :=
+  f.toInt32.toBitVec
+
 /-- Execute a single already-fetched-and-decoded instruction. `w` is the raw
 instruction word (needed only to report `illegalInstruction` for an unknown
-`syscall` service number, per the pinned syscall decision). -/
+`syscall` service number, per the pinned syscall decision).
+
+Before dispatching, checks whether `s` already has a branch/jump delay-slot
+transfer pending (`s.pendingBranch = some _`) *and* `instr` is itself one of
+the six branch/jump instructions (`isBranchLike`) — i.e. a branch/jump
+occurring in another's delay slot. Real MIPS32 leaves that
+architecturally discouraged/implementation-defined, so rather than pick an
+arbitrary behavior this halts with `HaltReason.branchInDelaySlot`, keeping
+`step` total and the condition diagnosable (SPEC-NOTES §9 item 1;
+INSTRUCTION-REF Global rule 3). -/
 private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :=
+  if s.pendingBranch.isSome && isBranchLike instr then
+    StepResult.halt .branchInDelaySlot
+  else
   match instr with
   -- R-type reg/reg/reg arithmetic
   | .add rs rt rd =>
@@ -109,9 +229,9 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     if addOverflows (asSigned av) (asSigned bv) (asSigned sumBV) then
       StepResult.halt .arithmeticOverflow
     else
-      mkNext (writeReg s (regIdx rd) sumBV)
+      mkNext s (writeReg s (regIdx rd) sumBV)
   | .addu rs rt rd =>
-    mkNext (writeReg s (regIdx rd) (readReg s (regIdx rs) + readReg s (regIdx rt)))
+    mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rs) + readReg s (regIdx rt)))
   | .sub rs rt rd =>
     let av := readReg s (regIdx rs)
     let bv := readReg s (regIdx rt)
@@ -119,60 +239,82 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     if subOverflows (asSigned av) (asSigned bv) (asSigned diffBV) then
       StepResult.halt .arithmeticOverflow
     else
-      mkNext (writeReg s (regIdx rd) diffBV)
+      mkNext s (writeReg s (regIdx rd) diffBV)
   | .subu rs rt rd =>
-    mkNext (writeReg s (regIdx rd) (readReg s (regIdx rs) - readReg s (regIdx rt)))
+    mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rs) - readReg s (regIdx rt)))
   | .and rs rt rd =>
-    mkNext (writeReg s (regIdx rd) (readReg s (regIdx rs) &&& readReg s (regIdx rt)))
+    mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rs) &&& readReg s (regIdx rt)))
   | .or rs rt rd =>
-    mkNext (writeReg s (regIdx rd) (readReg s (regIdx rs) ||| readReg s (regIdx rt)))
+    mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rs) ||| readReg s (regIdx rt)))
   | .xor rs rt rd =>
-    mkNext (writeReg s (regIdx rd) (readReg s (regIdx rs) ^^^ readReg s (regIdx rt)))
+    mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rs) ^^^ readReg s (regIdx rt)))
   | .nor rs rt rd =>
-    mkNext (writeReg s (regIdx rd) (~~~(readReg s (regIdx rs) ||| readReg s (regIdx rt))))
+    mkNext s (writeReg s (regIdx rd) (~~~(readReg s (regIdx rs) ||| readReg s (regIdx rt))))
   | .slt rs rt rd =>
     let v := if asSigned (readReg s (regIdx rs)) < asSigned (readReg s (regIdx rt))
              then 1#32 else 0#32
-    mkNext (writeReg s (regIdx rd) v)
+    mkNext s (writeReg s (regIdx rd) v)
   | .sltu rs rt rd =>
     let v := if (readReg s (regIdx rs)).toNat < (readReg s (regIdx rt)).toNat
              then 1#32 else 0#32
-    mkNext (writeReg s (regIdx rd) v)
+    mkNext s (writeReg s (regIdx rd) v)
+  -- Conditional move: `$rd` is left *unchanged*, not zeroed, when the
+  -- condition fails (MIPS32r2 `movn`/`movz`; docs/spec/INSTRUCTION-REF.md).
+  | .movn rs rt rd =>
+    if readReg s (regIdx rt) != 0#32 then
+      mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rs)))
+    else
+      mkNext s s
+  | .movz rs rt rd =>
+    if readReg s (regIdx rt) == 0#32 then
+      mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rs)))
+    else
+      mkNext s s
   -- R-type shifts
   | .sll rd rt shamt =>
-    mkNext (writeReg s (regIdx rd) (readReg s (regIdx rt) <<< shamt.toNat))
+    mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rt) <<< shamt.toNat))
   | .srl rd rt shamt =>
-    mkNext (writeReg s (regIdx rd) (readReg s (regIdx rt) >>> shamt.toNat))
+    mkNext s (writeReg s (regIdx rd) (readReg s (regIdx rt) >>> shamt.toNat))
   | .sra rd rt shamt =>
-    mkNext (writeReg s (regIdx rd) ((readReg s (regIdx rt)).sshiftRight shamt.toNat))
+    mkNext s (writeReg s (regIdx rd) ((readReg s (regIdx rt)).sshiftRight shamt.toNat))
   -- R-type mult/div
   | .mult rs rt =>
     let a := asSigned (readReg s (regIdx rs))
     let b := asSigned (readReg s (regIdx rt))
     let prod64 : BitVec 64 := BitVec.ofInt 64 (a * b)
-    mkNext { s with lo := prod64.extractLsb 31 0, hi := prod64.extractLsb 63 32 }
+    mkNext s { s with lo := prod64.extractLsb 31 0, hi := prod64.extractLsb 63 32 }
   | .multu rs rt =>
     let a := (readReg s (regIdx rs)).toNat
     let b := (readReg s (regIdx rt)).toNat
     let prod64 : BitVec 64 := BitVec.ofNat 64 (a * b)
-    mkNext { s with lo := prod64.extractLsb 31 0, hi := prod64.extractLsb 63 32 }
+    mkNext s { s with lo := prod64.extractLsb 31 0, hi := prod64.extractLsb 63 32 }
   | .div rs rt =>
     let a := asSigned (readReg s (regIdx rs))
     let b := asSigned (readReg s (regIdx rt))
     if b == 0 then
       -- SPEC-NOTES §9.2: hi/lo unchanged, no halt.
-      mkNext s
+      mkNext s s
     else
-      mkNext { s with lo := ofInt32 (a.tdiv b), hi := ofInt32 (a.tmod b) }
+      mkNext s { s with lo := ofInt32 (a.tdiv b), hi := ofInt32 (a.tmod b) }
   | .divu rs rt =>
     let a := (readReg s (regIdx rs)).toNat
     let b := (readReg s (regIdx rt)).toNat
     if b == 0 then
-      mkNext s
+      mkNext s s
     else
-      mkNext { s with lo := BitVec.ofNat 32 (a / b), hi := BitVec.ofNat 32 (a % b) }
-  | .mflo rd => mkNext (writeReg s (regIdx rd) s.lo)
-  | .mfhi rd => mkNext (writeReg s (regIdx rd) s.hi)
+      mkNext s { s with lo := BitVec.ofNat 32 (a / b), hi := BitVec.ofNat 32 (a % b) }
+  | .mflo rd => mkNext s (writeReg s (regIdx rd) s.lo)
+  | .mfhi rd => mkNext s (writeReg s (regIdx rd) s.hi)
+  -- SPECIAL2 bit-count (MIPS32)
+  | .clo rs rd =>
+    mkNext s (writeReg s (regIdx rd) (BitVec.ofNat 32 (countLeadingOnes (readReg s (regIdx rs)))))
+  | .clz rs rd =>
+    mkNext s (writeReg s (regIdx rd) (BitVec.ofNat 32 (countLeadingZeros (readReg s (regIdx rs)))))
+  -- SPECIAL3 BSHFL sign-extend (MIPS32r2)
+  | .seb rd rt =>
+    mkNext s (writeReg s (regIdx rd) (signExtLowByte (readReg s (regIdx rt))))
+  | .seh rd rt =>
+    mkNext s (writeReg s (regIdx rd) (signExt16 (readReg s (regIdx rt))))
   -- I-type arith/logic
   | .addi rs rt imm =>
     let av := readReg s (regIdx rs)
@@ -181,114 +323,216 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     if addOverflows (asSigned av) (asSigned bv) (asSigned sumBV) then
       StepResult.halt .arithmeticOverflow
     else
-      mkNext (writeReg s (regIdx rt) sumBV)
+      mkNext s (writeReg s (regIdx rt) sumBV)
   | .addiu rs rt imm =>
-    mkNext (writeReg s (regIdx rt) (readReg s (regIdx rs) + signExt16 imm))
+    mkNext s (writeReg s (regIdx rt) (readReg s (regIdx rs) + signExt16 imm))
   | .slti rs rt imm =>
     let v := if asSigned (readReg s (regIdx rs)) < asSigned (signExt16 imm)
              then 1#32 else 0#32
-    mkNext (writeReg s (regIdx rt) v)
+    mkNext s (writeReg s (regIdx rt) v)
   | .sltiu rs rt imm =>
     let v := if (readReg s (regIdx rs)).toNat < (signExt16 imm).toNat
              then 1#32 else 0#32
-    mkNext (writeReg s (regIdx rt) v)
+    mkNext s (writeReg s (regIdx rt) v)
   | .andi rs rt imm =>
-    mkNext (writeReg s (regIdx rt) (readReg s (regIdx rs) &&& zeroExt16 imm))
+    mkNext s (writeReg s (regIdx rt) (readReg s (regIdx rs) &&& zeroExt16 imm))
   | .ori rs rt imm =>
-    mkNext (writeReg s (regIdx rt) (readReg s (regIdx rs) ||| zeroExt16 imm))
+    mkNext s (writeReg s (regIdx rt) (readReg s (regIdx rs) ||| zeroExt16 imm))
   | .xori rs rt imm =>
-    mkNext (writeReg s (regIdx rt) (readReg s (regIdx rs) ^^^ zeroExt16 imm))
+    mkNext s (writeReg s (regIdx rt) (readReg s (regIdx rs) ^^^ zeroExt16 imm))
   | .lui rt imm =>
-    mkNext (writeReg s (regIdx rt) (zeroExt16 imm <<< 16))
+    mkNext s (writeReg s (regIdx rt) (zeroExt16 imm <<< 16))
   -- Memory access: effective address = $rs + sign-extended offset
   -- (SPEC-NOTES §9.3 — we follow the ISA, not MARS's lw/sw zero-extension bug).
   | .lw rs rt imm =>
     let addr := readReg s (regIdx rs) + signExt16 imm
     match readMemWord s addr with
     | none => StepResult.halt (.addressError addr)
-    | some v => mkNext (writeReg s (regIdx rt) v)
+    | some v => mkNext s (writeReg s (regIdx rt) v)
   | .sw rs rt imm =>
     let addr := readReg s (regIdx rs) + signExt16 imm
     match writeMemWord s addr (readReg s (regIdx rt)) with
     | none => StepResult.halt (.addressError addr)
-    | some s' => mkNext s'
+    | some s' => mkNext s s'
   | .lb rs rt imm =>
     let addr := readReg s (regIdx rs) + signExt16 imm
     match readMemByte s addr with
     | none => StepResult.halt (.addressError addr)
-    | some b => mkNext (writeReg s (regIdx rt) (signExtByte b))
+    | some b => mkNext s (writeReg s (regIdx rt) (signExtByte b))
   | .lbu rs rt imm =>
     let addr := readReg s (regIdx rs) + signExt16 imm
     match readMemByte s addr with
     | none => StepResult.halt (.addressError addr)
-    | some b => mkNext (writeReg s (regIdx rt) (zeroExtByte b))
+    | some b => mkNext s (writeReg s (regIdx rt) (zeroExtByte b))
   | .lh rs rt imm =>
     let addr := readReg s (regIdx rs) + signExt16 imm
     match readMemHalf s addr with
     | none => StepResult.halt (.addressError addr)
-    | some h => mkNext (writeReg s (regIdx rt) (signExt16 h))
+    | some h => mkNext s (writeReg s (regIdx rt) (signExt16 h))
   | .lhu rs rt imm =>
     let addr := readReg s (regIdx rs) + signExt16 imm
     match readMemHalf s addr with
     | none => StepResult.halt (.addressError addr)
-    | some h => mkNext (writeReg s (regIdx rt) h)
+    | some h => mkNext s (writeReg s (regIdx rt) h)
   | .sh rs rt imm =>
     let addr := readReg s (regIdx rs) + signExt16 imm
     match writeMemHalf s addr (readReg s (regIdx rt)) with
     | none => StepResult.halt (.addressError addr)
-    | some s' => mkNext s'
-  -- Control flow: no delay slot (SPEC-NOTES §9.1). `pcNext` is `s.pc + 4`;
-  -- taken branches add `signExt16 imm <<< 2` to it, jumps replace its top
-  -- 4 bits with the shifted target.
+    | some s' => mkNext s s'
+  -- Control flow: one architectural delay slot per branch/jump, matching
+  -- real MIPS32 (SPEC-NOTES §9 item 1 — not MARS's default no-delay-slot
+  -- config; INSTRUCTION-REF Global rule 3). A taken branch/jump never jumps
+  -- immediately: it falls through to `pcNext` (the delay-slot instruction
+  -- executes next, normally) and *schedules* the real target in
+  -- `pendingBranch`; `advance`/`mkNext` commits it one step later, when the
+  -- delay-slot instruction retires. A not-taken branch sets no
+  -- `pendingBranch` and is indistinguishable from an ordinary instruction
+  -- (`mkNext`). `pcNext` is `s.pc + 4`; taken branches schedule
+  -- `pcNext + (signExt16 imm <<< 2)`, jumps schedule a target whose top 4
+  -- bits come from `pcNext`.
   | .beq rs rt imm =>
     let pcNext := s.pc + 4#32
     if readReg s (regIdx rs) == readReg s (regIdx rt) then
-      StepResult.next (setPc s (pcNext + (signExt16 imm <<< 2)))
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
     else
-      StepResult.next (setPc s pcNext)
+      mkNext s s
   | .bne rs rt imm =>
     let pcNext := s.pc + 4#32
     if readReg s (regIdx rs) == readReg s (regIdx rt) then
-      StepResult.next (setPc s pcNext)
+      mkNext s s
     else
-      StepResult.next (setPc s (pcNext + (signExt16 imm <<< 2)))
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
   | .blez rs imm =>
     let pcNext := s.pc + 4#32
     if asSigned (readReg s (regIdx rs)) ≤ 0 then
-      StepResult.next (setPc s (pcNext + (signExt16 imm <<< 2)))
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
     else
-      StepResult.next (setPc s pcNext)
+      mkNext s s
   | .bgtz rs imm =>
     let pcNext := s.pc + 4#32
     if 0 < asSigned (readReg s (regIdx rs)) then
-      StepResult.next (setPc s (pcNext + (signExt16 imm <<< 2)))
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
     else
-      StepResult.next (setPc s pcNext)
+      mkNext s s
   | .j target =>
     let pcNext := s.pc + 4#32
-    StepResult.next (setPc s ((pcNext &&& 0xf0000000#32) ||| (target <<< 2)))
+    StepResult.next
+      { s with pc := pcNext, pendingBranch := some ((pcNext &&& 0xf0000000#32) ||| (target <<< 2)) }
   | .jal target =>
+    -- `$ra` links to `pc + 8` — past the delay slot — not `pcNext` (`pc + 4`):
+    -- real MIPS32's `jal` link value is the address of the instruction
+    -- *after* the delay slot, since the delay-slot instruction itself still
+    -- executes before control reaches `$ra` on return.
     let pcNext := s.pc + 4#32
-    let s' := writeReg s 31 pcNext
-    StepResult.next (setPc s' ((pcNext &&& 0xf0000000#32) ||| (target <<< 2)))
+    let linkVal := pcNext + 4#32
+    let s' := writeReg s 31 linkVal
+    StepResult.next
+      { s' with pc := pcNext, pendingBranch := some ((pcNext &&& 0xf0000000#32) ||| (target <<< 2)) }
+  -- Coprocessor 1 (FPU), single-precision subset (docs/spec/INSTRUCTION-REF.md
+  -- floating-point section). `mtc1`/`mfc1`/`lwc1`/`swc1` move/transfer raw
+  -- bit patterns with no numeric conversion; arithmetic/compare/convert go
+  -- through `floatOfBits`/`bitsOfFloat` at the point of computation.
+  | .mfc1 rt fs =>
+    mkNext s (writeReg s (regIdx rt) (readFpReg s (regIdx fs)))
+  | .mtc1 rt fs =>
+    mkNext s (writeFpReg s (regIdx fs) (readReg s (regIdx rt)))
+  | .lwc1 rs ft imm =>
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    match readMemWord s addr with
+    | none => StepResult.halt (.addressError addr)
+    | some v => mkNext s (writeFpReg s (regIdx ft) v)
+  | .swc1 rs ft imm =>
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    match writeMemWord s addr (readFpReg s (regIdx ft)) with
+    | none => StepResult.halt (.addressError addr)
+    | some s' => mkNext s s'
+  | .addS fd fs ft =>
+    let v := (floatOfBits (readFpReg s (regIdx fs))).add (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat v))
+  | .subS fd fs ft =>
+    let v := (floatOfBits (readFpReg s (regIdx fs))).sub (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat v))
+  | .mulS fd fs ft =>
+    let v := (floatOfBits (readFpReg s (regIdx fs))).mul (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat v))
+  | .divS fd fs ft =>
+    -- IEEE-754 division; `$ft == 0` yields ±Infinity/NaN, never a trap
+    -- (module docstring; SPEC-NOTES §9 item 2 precedent).
+    let v := (floatOfBits (readFpReg s (regIdx fs))).div (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat v))
+  | .movS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (readFpReg s (regIdx fs)))
+  | .cvtSW fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat (floatOfIntBits (readFpReg s (regIdx fs)))))
+  | .cvtWS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (intBitsOfFloatTrunc (floatOfBits (readFpReg s (regIdx fs)))))
+  | .cEqS fs ft =>
+    let flag := (floatOfBits (readFpReg s (regIdx fs))).beq (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s { s with fpCondFlag := flag }
+  | .cLtS fs ft =>
+    let flag := (floatOfBits (readFpReg s (regIdx fs))).lt (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s { s with fpCondFlag := flag }
+  | .cLeS fs ft =>
+    let flag := (floatOfBits (readFpReg s (regIdx fs))).le (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s { s with fpCondFlag := flag }
+  -- `bc1t`/`bc1f`: upgraded during dev/v2 integration to use the same
+  -- `pendingBranch` delay-slot scheduling as `beq`/`bne`/etc. (real MIPS32
+  -- gives every branch, including FP ones, exactly one delay slot) instead
+  -- of the immediate-jump the fpu track shipped under time pressure --
+  -- closing that documented gap rather than leaving two different branch
+  -- disciplines coexisting in one semantics.
+  | .bc1t imm =>
+    let pcNext := s.pc + 4#32
+    if s.fpCondFlag then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      mkNext s s
+  | .bc1f imm =>
+    let pcNext := s.pc + 4#32
+    if s.fpCondFlag then
+      mkNext s s
+    else
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
   -- Syscalls (v1 scope: 1/4/10/11; see docs/spec/INSTRUCTION-REF.md syscall section).
   | .syscall =>
     match (readReg s 2).toNat with
     | 1 =>
       let n := asSigned (readReg s 4)
-      mkNext { s with out := s.out ++ toString n }
+      mkNext s { s with out := s.out ++ toString n }
     | 4 =>
       let str := readCString s (readReg s 4) printStringFuel
-      mkNext { s with out := s.out ++ str }
+      mkNext s { s with out := s.out ++ str }
     | 10 => StepResult.halt .exit
     | 11 =>
       let c := Char.ofNat ((readReg s 4 &&& 0xff#32).toNat)
-      mkNext { s with out := s.out ++ String.singleton c }
+      mkNext s { s with out := s.out ++ String.singleton c }
     | _ =>
       -- v1 approximation of MARS's unsupported-syscall-number error: we have
       -- no generic `ProcessingException`/`SYSCALL_EXCEPTION` halt reason, so
       -- we report it the same way as any other undecodable-in-context word.
       StepResult.halt (.illegalInstruction w)
+  -- Trap-on-condition (coprocessor-0 exception model, real MIPS32 ISA; see
+  -- `takeException` above and `docs/spec/INSTRUCTION-REF.md`). Trap-not-taken
+  -- behaves like an ordinary instruction: `mkNext s` falls through to
+  -- `pc + 4` with no CP0 state touched at all.
+  | .teq rs rt =>
+    if readReg s (regIdx rs) == readReg s (regIdx rt) then takeException s excCodeTr else mkNext s s
+  | .tne rs rt =>
+    if readReg s (regIdx rs) ≠ readReg s (regIdx rt) then takeException s excCodeTr else mkNext s s
+  | .tlt rs rt =>
+    if asSigned (readReg s (regIdx rs)) < asSigned (readReg s (regIdx rt))
+    then takeException s excCodeTr else mkNext s s
+  | .tge rs rt =>
+    if asSigned (readReg s (regIdx rs)) ≥ asSigned (readReg s (regIdx rt))
+    then takeException s excCodeTr else mkNext s s
+  | .tltu rs rt =>
+    if (readReg s (regIdx rs)).toNat < (readReg s (regIdx rt)).toNat
+    then takeException s excCodeTr else mkNext s s
+  | .tgeu rs rt =>
+    if (readReg s (regIdx rs)).toNat ≥ (readReg s (regIdx rt)).toNat
+    then takeException s excCodeTr else mkNext s s
+  -- break: unconditional trap (coprocessor-0 exception model).
+  | .break => takeException s excCodeBp
 
 /-- Execute a single instruction: fetch at `s.pc`, decode, and dispatch.
 Total: fetch/decode failure and syscall-dispatch failure all become defined
@@ -340,6 +584,9 @@ private def regs0 : State := initialState textBase
 private def setRegs (s : State) (kvs : List (Fin 32 × W32)) : State :=
   kvs.foldl (fun acc kv => writeReg acc kv.1 kv.2) s
 
+private def setFpRegs (s : State) (kvs : List (Fin 32 × W32)) : State :=
+  kvs.foldl (fun acc kv => writeFpReg acc kv.1 kv.2) s
+
 private def prog1 (instr : Instruction) : Program :=
   (∅ : Program).insert textBase (encode instr)
 
@@ -370,6 +617,16 @@ private def nextHiLoEq (r : StepResult) (hi lo : W32) : Bool :=
   | .next s => s.hi == hi && s.lo == lo
   | .halt _ => false
 
+private def nextFpRegEq (r : StepResult) (i : Fin 32) (v : W32) : Bool :=
+  match r with
+  | .next s => readFpReg s i == v
+  | .halt _ => false
+
+private def nextFpCondFlagEq (r : StepResult) (v : Bool) : Bool :=
+  match r with
+  | .next s => s.fpCondFlag == v
+  | .halt _ => false
+
 private def isNext (r : StepResult) : Bool :=
   match r with
   | .next _ => true
@@ -395,19 +652,57 @@ private def isHaltExit (r : StepResult) : Bool :=
   | .halt .exit => true
   | _ => false
 
+private def isHaltBranchInDelaySlot (r : StepResult) : Bool :=
+  match r with
+  | .halt .branchInDelaySlot => true
+  | _ => false
+
+private def nextPendingEq (r : StepResult) (pb : Option W32) : Bool :=
+  match r with
+  | .next s => s.pendingBranch == pb
+  | .halt _ => false
+
+-- `sll $zero, $zero, 0` — the canonical MIPS encoding of `nop` (word
+-- `0x00000000`) — used as an inert delay-slot filler instruction below.
+private def nopInstr : Instruction := .sll 0#32 0#32 0#32
+
+/-- Step once through `instr` placed at `base` (with `nopInstr` as its delay
+slot at `base + 4`) from `s`, then step once more through the delay slot:
+returns the landing `pc` after both steps, or `none` if either step halts.
+Used to exercise the full two-step delay-slot behavior of a taken
+branch/jump (SPEC-NOTES §9 item 1). -/
+private def stepThroughDelaySlot (base : W32) (instr : Instruction) (s : State) : Option W32 :=
+  let p := buildProg base [instr, nopInstr]
+  match stepState p s with
+  | some s1 => match step p s1 with
+    | .next s2 => some s2.pc
+    | .halt _ => none
+  | none => none
+
 end TestHelpers
 
 -- ### Pure-arithmetic helper sanity (`by decide`/`by rfl`, no `Program`/`mem`)
 
 example : regIdx (5#32) = (5 : Fin 32) := by decide
 example : regIdx (31#32) = (31 : Fin 32) := by decide
-example : (advance (initialState textBase)).pc = textBase + 4#32 := by decide
+example : (advance (initialState textBase) (initialState textBase)).pc = textBase + 4#32 := by decide
 example : addOverflows 0x7fffffff (1 : Int) (-0x80000000 : Int) = true := by decide
 example : addOverflows 5 7 12 = false := by decide
 example : subOverflows (-0x80000000 : Int) 1 0x7fffffff = true := by decide
 example : subOverflows 10 3 7 = false := by decide
 example : signExtByte 0x80 = 0xffffff80#32 := by decide
 example : zeroExtByte 0x80 = 0x00000080#32 := by decide
+example : signExtLowByte 0x00000080#32 = 0xffffff80#32 := by decide
+example : signExtLowByte 0x0000007f#32 = 0x0000007f#32 := by decide
+example : countLeadingZeros 0#32 = 32 := by decide
+example : countLeadingZeros 0xffffffff#32 = 0 := by decide
+example : countLeadingZeros 0x80000000#32 = 0 := by decide
+example : countLeadingZeros 1#32 = 31 := by decide
+example : countLeadingZeros 0x0000ffff#32 = 16 := by decide
+example : countLeadingOnes 0xffffffff#32 = 32 := by decide
+example : countLeadingOnes 0#32 = 0 := by decide
+example : countLeadingOnes 0xffff0000#32 = 16 := by decide
+example : countLeadingOnes 0x7fffffff#32 = 0 := by decide  -- MSB clear -> zero leading ones
 -- PC wraparound (W32 arithmetic): pc+4 wraps past 0xffffffff.
 example : (0xfffffffc#32 : W32) + 4#32 = 0#32 := by decide
 
@@ -443,6 +738,18 @@ example : isHaltAddr (step (∅ : Program) misalignedState) (textBase + 1#32) = 
 #guard (match step (prog1 (.add 8#32 9#32 0#32)) (setRegs regs0 [(8, 5#32), (9, 7#32)]) with
         | .next s' => readReg s' 0 == 0#32 && s'.pc == textBase + 4#32
         | .halt _ => false)
+
+-- ### movn/movz: conditional move -- the "condition fails" case must leave
+-- `$rd` at its *preset* value (99 below), not zero it (a real no-op, per
+-- docs/spec/INSTRUCTION-REF.md's movn/movz entries).
+#guard nextRegEq (step (prog1 (.movn 8#32 9#32 10#32)) (setRegs regs0 [(8, 5#32), (9, 1#32), (10, 99#32)]))
+  10 5#32   -- movn, $rt != 0: moves
+#guard nextRegEq (step (prog1 (.movn 8#32 9#32 10#32)) (setRegs regs0 [(8, 5#32), (9, 0#32), (10, 99#32)]))
+  10 99#32  -- movn, $rt == 0: $rd unchanged
+#guard nextRegEq (step (prog1 (.movz 8#32 9#32 10#32)) (setRegs regs0 [(8, 5#32), (9, 0#32), (10, 99#32)]))
+  10 5#32   -- movz, $rt == 0: moves
+#guard nextRegEq (step (prog1 (.movz 8#32 9#32 10#32)) (setRegs regs0 [(8, 5#32), (9, 1#32), (10, 99#32)]))
+  10 99#32  -- movz, $rt != 0: $rd unchanged
 
 -- ### add/sub overflow traps
 
@@ -502,6 +809,25 @@ private def seededHiLo : State := { regs0 with hi := 0xdeadbeef#32, lo := 0xcafe
 -- divu: zero divisor unchanged, no halt
 #guard isNext (step (prog1 (.divu 8#32 9#32)) (setRegs seededHiLo [(8, 10#32), (9, 0#32)]))
 
+-- ### clo/clz/movn/movz/seb/seh (MIPS32/MIPS32r2 additions; see
+-- docs/spec/INSTRUCTION-REF.md)
+
+-- clo: all-ones -> 32; a mixed pattern; all-zero -> 0 leading ones
+#guard nextRegEq (step (prog1 (.clo 8#32 10#32)) (setRegs regs0 [(8, 0xffffffff#32)])) 10 32#32
+#guard nextRegEq (step (prog1 (.clo 8#32 10#32)) (setRegs regs0 [(8, 0xfff0ffff#32)])) 10 12#32
+#guard nextRegEq (step (prog1 (.clo 8#32 10#32)) (setRegs regs0 [(8, 0x00000000#32)])) 10 0#32
+-- clz: all-zero -> 32; a mixed pattern; all-ones -> 0 leading zeros
+#guard nextRegEq (step (prog1 (.clz 8#32 10#32)) (setRegs regs0 [(8, 0x00000000#32)])) 10 32#32
+#guard nextRegEq (step (prog1 (.clz 8#32 10#32)) (setRegs regs0 [(8, 0x0000ffff#32)])) 10 16#32
+#guard nextRegEq (step (prog1 (.clz 8#32 10#32)) (setRegs regs0 [(8, 0xffffffff#32)])) 10 0#32
+
+-- seb: sign-extends only the low byte of $rt, ignoring higher bits
+#guard nextRegEq (step (prog1 (.seb 10#32 8#32)) (setRegs regs0 [(8, 0x12345680#32)])) 10 0xffffff80#32
+#guard nextRegEq (step (prog1 (.seb 10#32 8#32)) (setRegs regs0 [(8, 0x1234567f#32)])) 10 0x0000007f#32
+-- seh: sign-extends only the low halfword of $rt
+#guard nextRegEq (step (prog1 (.seh 10#32 8#32)) (setRegs regs0 [(8, 0x1234ffff#32)])) 10 0xffffffff#32
+#guard nextRegEq (step (prog1 (.seh 10#32 8#32)) (setRegs regs0 [(8, 0x12347fff#32)])) 10 0x00007fff#32
+
 -- ### addi overflow trap vs addiu wrap; andi/ori/xori high-imm-bits; lui
 
 #guard isHaltOverflow (step (prog1 (.addi 8#32 9#32 1#32)) (setRegs regs0 [(8, 0x7fffffff#32)]))
@@ -546,33 +872,79 @@ private def memTestState : State :=
 #guard (stepState (prog1 (.sw 8#32 9#32 0xfffc#32)) (setRegs regs0 [(8, 0x10010010#32), (9, 0x2a#32)])).bind
         (fun s' => readMemWord s' 0x1001000c#32) = some 0x2a#32
 
--- ### beq/bne/blez/bgtz: taken/not-taken with exact target words
+-- ### beq/bne/blez/bgtz: taken schedules a `pendingBranch` and falls
+-- through to the delay slot; not-taken behaves exactly as before (SPEC-NOTES
+-- §9 item 1). `stepThroughDelaySlot` executes the branch *and* an inert
+-- delay-slot instruction, landing on the real target.
 
-#guard nextPcEq (step (prog1 (.beq 8#32 9#32 3#32)) (setRegs regs0 [(8, 5#32), (9, 5#32)]))
-  (textBase + 4#32 + 12#32)
+-- `beq` taken: the branch's own step falls through to `pcNext` with the
+-- real target recorded in `pendingBranch`, not yet applied to `pc`.
+#guard (match step (prog1 (.beq 8#32 9#32 3#32)) (setRegs regs0 [(8, 5#32), (9, 5#32)]) with
+        | .next s => s.pc == textBase + 4#32 && s.pendingBranch == some (textBase + 4#32 + 12#32)
+        | .halt _ => false)
+-- ... and the delay-slot instruction's own step is what actually lands on
+-- the target.
+#guard stepThroughDelaySlot textBase (.beq 8#32 9#32 3#32) (setRegs regs0 [(8, 5#32), (9, 5#32)])
+  = some (textBase + 4#32 + 12#32)
 #guard nextPcEq (step (prog1 (.beq 8#32 9#32 3#32)) (setRegs regs0 [(8, 5#32), (9, 6#32)]))
   (textBase + 4#32)
-#guard nextPcEq (step (prog1 (.bne 8#32 9#32 3#32)) (setRegs regs0 [(8, 5#32), (9, 6#32)]))
-  (textBase + 4#32 + 12#32)
+#guard nextPendingEq (step (prog1 (.beq 8#32 9#32 3#32)) (setRegs regs0 [(8, 5#32), (9, 6#32)])) none
+
+#guard stepThroughDelaySlot textBase (.bne 8#32 9#32 3#32) (setRegs regs0 [(8, 5#32), (9, 6#32)])
+  = some (textBase + 4#32 + 12#32)
 #guard nextPcEq (step (prog1 (.bne 8#32 9#32 3#32)) (setRegs regs0 [(8, 5#32), (9, 5#32)]))
   (textBase + 4#32)
-#guard nextPcEq (step (prog1 (.blez 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)]))  -- -5 ≤ 0
-  (textBase + 4#32 + 8#32)
-#guard nextPcEq (step (prog1 (.blez 8#32 2#32)) (setRegs regs0 [(8, 0#32)]))  -- 0 ≤ 0
-  (textBase + 4#32 + 8#32)
+
+#guard stepThroughDelaySlot textBase (.blez 8#32 2#32) (setRegs regs0 [(8, 0xfffffffb#32)])  -- -5 ≤ 0
+  = some (textBase + 4#32 + 8#32)
+#guard stepThroughDelaySlot textBase (.blez 8#32 2#32) (setRegs regs0 [(8, 0#32)])  -- 0 ≤ 0
+  = some (textBase + 4#32 + 8#32)
 #guard nextPcEq (step (prog1 (.blez 8#32 2#32)) (setRegs regs0 [(8, 5#32)]))  -- 5 ≤ 0 is false
   (textBase + 4#32)
-#guard nextPcEq (step (prog1 (.bgtz 8#32 2#32)) (setRegs regs0 [(8, 5#32)]))  -- 5 > 0
-  (textBase + 4#32 + 8#32)
+#guard stepThroughDelaySlot textBase (.bgtz 8#32 2#32) (setRegs regs0 [(8, 5#32)])  -- 5 > 0
+  = some (textBase + 4#32 + 8#32)
 #guard nextPcEq (step (prog1 (.bgtz 8#32 2#32)) (setRegs regs0 [(8, 0#32)]))  -- 0 > 0 is false
   (textBase + 4#32)
 
--- ### j/jal: exact targets including top-4-bit preservation from `pc_next`; jal $ra
+-- ### j/jal: exact targets including top-4-bit preservation from `pc_next`;
+-- jal $ra links to `pc + 8` (past the delay slot), not `pc + 4`
 
 private def crossRegionState : State := { regs0 with pc := 0x90400000#32 }
-#guard nextPcEq (step (progAt 0x90400000#32 (.j 0x1000#32)) crossRegionState) 0x90004000#32
-#guard nextPcEq (step (progAt 0x90400000#32 (.jal 0x1000#32)) crossRegionState) 0x90004000#32
-#guard nextRegEq (step (progAt 0x90400000#32 (.jal 0x1000#32)) crossRegionState) 31 0x90400004#32
+-- `j`'s own step falls through to the delay slot, scheduling the target.
+#guard (match step (progAt 0x90400000#32 (.j 0x1000#32)) crossRegionState with
+        | .next s => s.pc == 0x90400004#32 && s.pendingBranch == some 0x90004000#32
+        | .halt _ => false)
+#guard stepThroughDelaySlot 0x90400000#32 (.j 0x1000#32) crossRegionState = some 0x90004000#32
+-- `jal`: `$ra` is `pc + 8`, and the target lands the same way as `j` after
+-- the delay slot.
+#guard nextRegEq (step (progAt 0x90400000#32 (.jal 0x1000#32)) crossRegionState) 31 0x90400008#32
+#guard stepThroughDelaySlot 0x90400000#32 (.jal 0x1000#32) crossRegionState = some 0x90004000#32
+
+-- ### branch/jump in a delay slot: diagnosable halt, not arbitrary behavior
+
+-- A branch immediately following a *taken* branch (i.e. itself occupying
+-- the delay slot) halts rather than silently scheduling/overwriting
+-- anything — real MIPS32 leaves this architecturally discouraged/
+-- implementation-defined (INSTRUCTION-REF Global rule 3).
+#guard (match stepState (buildProg textBase [.beq 8#32 9#32 1#32, .beq 0#32 0#32 0#32])
+          (setRegs regs0 [(8, 5#32), (9, 5#32)]) with
+        | some s1 =>
+          isHaltBranchInDelaySlot
+            (step (buildProg textBase [.beq 8#32 9#32 1#32, .beq 0#32 0#32 0#32]) s1)
+        | none => false)
+-- A branch following a *not-taken* branch is unaffected (no pending
+-- transfer was ever scheduled, so there is no delay slot to be inside).
+#guard (match stepState (buildProg textBase [.beq 8#32 9#32 1#32, .beq 0#32 0#32 0#32])
+          (setRegs regs0 [(8, 5#32), (9, 6#32)]) with
+        | some s1 =>
+          isNext (step (buildProg textBase [.beq 8#32 9#32 1#32, .beq 0#32 0#32 0#32]) s1)
+        | none => false)
+-- `j` right after a taken `beq` halts the same way.
+#guard (match stepState (buildProg textBase [.beq 8#32 9#32 1#32, .j 0x1000#32])
+          (setRegs regs0 [(8, 5#32), (9, 5#32)]) with
+        | some s1 =>
+          isHaltBranchInDelaySlot (step (buildProg textBase [.beq 8#32 9#32 1#32, .j 0x1000#32]) s1)
+        | none => false)
 
 -- ### syscalls
 
@@ -594,11 +966,170 @@ private def syscall4EmptyState : State :=
   = some "A"
 #guard isHaltIllegal (step (prog1 .syscall) (setRegs regs0 [(2, 999#32)])) (encode .syscall)
 
+-- ### Traps / exceptions (coprocessor 0): teq/tne/tlt/tge/tltu/tgeu/break
+
+private def cp0Eq (r : StepResult) (epc cause status pc : W32) : Bool :=
+  match r with
+  | .next s => s.cp0Epc == epc && s.cp0Cause == cause && s.cp0Status == status && s.pc == pc
+  | .halt _ => false
+
+private def cp0Untouched (r : StepResult) (before : State) : Bool :=
+  match r with
+  | .next s => s.cp0Epc == before.cp0Epc && s.cp0Cause == before.cp0Cause
+                 && s.cp0Status == before.cp0Status
+  | .halt _ => false
+
+-- teq: trap-taken from `textBase` sets `EPC = textBase` (the trapping
+-- instruction's own address, not `pc + 4`), `Cause.ExcCode = excCodeTr`
+-- packed into bits 6..2 (`excCodeTr <<< 2`), `Status.EXL` (bit 1) set, and
+-- `pc = exceptionVectorAddr`.
+#guard cp0Eq (step (prog1 (.teq 8#32 9#32)) (setRegs regs0 [(8, 5#32), (9, 5#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+-- teq: trap-not-taken behaves like an ordinary instruction (falls through
+-- to `pc + 4`) and leaves all CP0 state untouched.
+#guard nextPcEq (step (prog1 (.teq 8#32 9#32)) (setRegs regs0 [(8, 5#32), (9, 6#32)]))
+  (textBase + 4#32)
+#guard cp0Untouched (step (prog1 (.teq 8#32 9#32)) (setRegs regs0 [(8, 5#32), (9, 6#32)])) regs0
+
+-- tne: trap on not-equal (opposite condition from teq)
+#guard cp0Eq (step (prog1 (.tne 8#32 9#32)) (setRegs regs0 [(8, 5#32), (9, 6#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+#guard isNext (step (prog1 (.tne 8#32 9#32)) (setRegs regs0 [(8, 5#32), (9, 5#32)]))
+
+-- tlt/tge: signed comparison (negative `$rs` is less than positive `$rt`)
+#guard cp0Eq (step (prog1 (.tlt 8#32 9#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 1#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr  -- -1 < 1
+#guard isNext (step (prog1 (.tlt 8#32 9#32)) (setRegs regs0 [(8, 1#32), (9, 0xffffffff#32)]))  -- 1 < -1 false
+#guard cp0Eq (step (prog1 (.tge 8#32 9#32)) (setRegs regs0 [(8, 1#32), (9, 0xffffffff#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr  -- 1 >= -1
+#guard isNext (step (prog1 (.tge 8#32 9#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 1#32)]))  -- -1 >= 1 false
+
+-- tltu/tgeu: unsigned comparison (0xffffffff is the largest unsigned value,
+-- so it is never `<u` anything and always `>=u` everything)
+#guard isNext (step (prog1 (.tltu 8#32 9#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 1#32)]))
+#guard cp0Eq (step (prog1 (.tgeu 8#32 9#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 1#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+
+-- break: unconditional trap, distinct `ExcCode` (`excCodeBp` ≠ `excCodeTr`)
+-- from the same starting state/address as the teq case above.
+#guard excCodeBp ≠ excCodeTr
+#guard cp0Eq (step (prog1 .break) regs0)
+  textBase (excCodeBp <<< 2) statusExlMask exceptionVectorAddr
+
+-- a second trap from a nonzero `pc` records that instruction's own address
+-- in `EPC`, not `textBase`/`pc + 4`.
+private def trapAtState : State := { regs0 with pc := textBase + 0x100#32 }
+#guard cp0Eq (step (progAt (textBase + 0x100#32) .break) trapAtState)
+  (textBase + 0x100#32) (excCodeBp <<< 2) statusExlMask exceptionVectorAddr
+
+-- exception-vector mechanism "for free": with no handler installed at
+-- `exceptionVectorAddr`, the *next* `step` call from the post-trap state
+-- naturally hits the existing fetch-failure halt (no instruction recorded
+-- there) -- this is `step`'s ordinary `addressError`, not a synthetic
+-- "unhandled exception" halt reason.
+#guard (match stepState (prog1 .break) regs0 with
+        | some s' => isHaltAddr (step (∅ : Program) s') exceptionVectorAddr
+        | none => false)
+
+-- if a real handler word *is* present at the vector address, it executes
+-- normally after the trap (e.g. an `addi` landing there).
+private def vectorHandlerProg : Program :=
+  (prog1 .break).insert exceptionVectorAddr (encode (.addi 0#32 8#32 42#32))
+#guard (match stepState vectorHandlerProg regs0 with
+        | some s' => nextRegEq (step vectorHandlerProg s') 8 42#32
+        | none => false)
+
 -- ### Undecodable word → illegalInstruction
 
-private def badWord : W32 := 0x11#32 <<< 26  -- opcode 0x11, unimplemented
+-- opcode 0x11 (COP1) is implemented for the fmt/funct combinations decoded
+-- in `Instruction.lean`; fmt=0x1f is not one of them, so this word is still
+-- genuinely undecodable.
+private def badWord : W32 := (0x11#32 <<< 26) ||| (0x1f#32 <<< 21)
 private def badProg : Program := (∅ : Program).insert textBase badWord
 #guard isHaltIllegal (step badProg regs0) badWord
+
+-- ### Coprocessor 1 (FPU): mtc1/mfc1/lwc1/swc1 raw bit-pattern moves
+
+-- mtc1 then mfc1 round-trips an arbitrary bit pattern through $f3
+#guard nextFpRegEq (step (prog1 (.mtc1 8#32 3#32)) (setRegs regs0 [(8, 0x12345678#32)])) 3
+  0x12345678#32
+#guard (match stepState (prog1 (.mtc1 8#32 3#32)) (setRegs regs0 [(8, 0x12345678#32)]) with
+        | some s' => nextRegEq (step (prog1 (.mfc1 9#32 3#32)) { s' with pc := textBase }) 9
+            0x12345678#32
+        | none => false)
+
+private def fpMemTestState : State :=
+  { (setRegs regs0 [(8, 0x10010000#32)]) with
+      mem := (((∅ : Std.HashMap W32 UInt8).insert 0x10010004#32 0x3f).insert 0x10010005#32 0x80)
+               |>.insert 0x10010006#32 0x00 |>.insert 0x10010007#32 0x00 }  -- 1.0 at offset 4
+#guard nextFpRegEq (step (prog1 (.lwc1 8#32 9#32 4#32)) fpMemTestState) 9 0x3f800000#32
+#guard (stepState (prog1 (.swc1 8#32 9#32 4#32))
+          (setFpRegs (setRegs regs0 [(8, 0x10010000#32)]) [(9, 0x3f800000#32)])).bind
+        (fun s' => readMemWord s' 0x10010004#32) = some 0x3f800000#32
+-- lwc1/swc1 alignment rules match lw/sw exactly
+#guard isHaltAddr (step (prog1 (.lwc1 8#32 9#32 1#32)) (setRegs regs0 [(8, 0x10010000#32)]))
+  0x10010001#32
+
+-- ### Coprocessor 1 (FPU): add.s/sub.s/mul.s/div.s/mov.s (IEEE-754 single-precision)
+
+-- 1.0 = 0x3f800000, 2.0 = 0x40000000, 3.0 = 0x40400000, 5.0 = 0x40a00000,
+-- 6.0 = 0x40c00000 (standard IEEE-754 binary32 bit patterns).
+#guard nextFpRegEq (step (prog1 (.addS 10#32 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x40000000#32)])) 10 0x40400000#32  -- 1.0+2.0=3.0
+#guard nextFpRegEq (step (prog1 (.subS 10#32 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x40a00000#32), (9, 0x40000000#32)])) 10 0x40400000#32  -- 5.0-2.0=3.0
+#guard nextFpRegEq (step (prog1 (.mulS 10#32 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x40000000#32), (9, 0x40400000#32)])) 10 0x40c00000#32  -- 2.0*3.0=6.0
+#guard nextFpRegEq (step (prog1 (.divS 10#32 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x40c00000#32), (9, 0x40000000#32)])) 10 0x40400000#32  -- 6.0/2.0=3.0
+-- div.s by zero: IEEE-754 Infinity, no trap (SPEC-NOTES §9 item 2 precedent)
+#guard isNext (step (prog1 (.divS 10#32 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x00000000#32)]))
+#guard nextFpRegEq (step (prog1 (.divS 10#32 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x00000000#32)])) 10 0x7f800000#32  -- 1.0/0.0=+Inf
+#guard nextFpRegEq (step (prog1 (.movS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40400000#32)])) 10
+  0x40400000#32
+
+-- ### Coprocessor 1 (FPU): cvt.s.w / cvt.w.s numeric conversions
+
+-- cvt.s.w: int bit pattern -> float value; 5 -> 5.0, -5 (0xfffffffb) -> -5.0
+#guard nextFpRegEq (step (prog1 (.cvtSW 10#32 8#32)) (setFpRegs regs0 [(8, 5#32)])) 10
+  0x40a00000#32
+#guard nextFpRegEq (step (prog1 (.cvtSW 10#32 8#32)) (setFpRegs regs0 [(8, 0xfffffffb#32)])) 10
+  0xc0a00000#32
+-- cvt.w.s: float value -> int bit pattern, truncating toward zero (not
+-- rounding); 5.9 (0x40bccccd) -> 5, -5.9 (0xc0bccccd) -> -5
+#guard nextFpRegEq (step (prog1 (.cvtWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40a00000#32)])) 10
+  0x00000005#32
+#guard nextFpRegEq (step (prog1 (.cvtWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40bccccd#32)])) 10
+  0x00000005#32
+#guard nextFpRegEq (step (prog1 (.cvtWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0bccccd#32)])) 10
+  0xfffffffb#32
+
+-- ### Coprocessor 1 (FPU): c.eq.s/c.lt.s/c.le.s set `fpCondFlag`; bc1t/bc1f branch on it
+
+#guard nextFpCondFlagEq (step (prog1 (.cEqS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) true   -- 1.0 == 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cEqS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x40000000#32)])) false  -- 1.0 != 2.0
+#guard nextFpCondFlagEq (step (prog1 (.cLtS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x40000000#32)])) true   -- 1.0 < 2.0
+#guard nextFpCondFlagEq (step (prog1 (.cLtS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x40000000#32), (9, 0x3f800000#32)])) false  -- 2.0 < 1.0 is false
+#guard nextFpCondFlagEq (step (prog1 (.cLeS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) true   -- 1.0 <= 1.0
+
+-- `bc1t`/`bc1f` get the same delay slot as every other branch (dev/v2
+-- integration: upgraded from the fpu track's original immediate-jump
+-- implementation to match `beq`/`bne`/etc.'s `pendingBranch` scheduling --
+-- see `Step.lean`'s `.bc1t`/`.bc1f` cases). Taken: two steps via
+-- `stepThroughDelaySlot` land on the target. Not taken: one step is an
+-- ordinary fallthrough to `pc + 4`, same as before.
+private def fpFlagState (b : Bool) : State := { regs0 with fpCondFlag := b }
+#guard stepThroughDelaySlot textBase (.bc1t 3#32) (fpFlagState true) = some (textBase + 4#32 + 12#32)
+#guard nextPcEq (step (prog1 (.bc1t 3#32)) (fpFlagState false)) (textBase + 4#32)
+#guard stepThroughDelaySlot textBase (.bc1f 3#32) (fpFlagState false) = some (textBase + 4#32 + 12#32)
+#guard nextPcEq (step (prog1 (.bc1f 3#32)) (fpFlagState true)) (textBase + 4#32)
 
 -- ### `run`: a short program that computes something and exits
 
@@ -619,8 +1150,11 @@ private def sumProg : Program :=
         | .halted .exit s steps => s.out == "12" && steps == 8
         | _ => false)
 
--- `limitReached`: a one-instruction infinite self-loop (`beq $zero,$zero,-1`)
-private def loopProg : Program := (∅ : Program).insert textBase (encode (.beq 0#32 0#32 0xffff#32))
+-- `limitReached`: a two-instruction infinite self-loop
+-- (`beq $zero,$zero,-1` with a `nop` delay slot) — with delay slots the
+-- loop body is the branch *plus* its delay-slot instruction, so each
+-- iteration costs 2 steps, but it still never halts.
+private def loopProg : Program := buildProg textBase [.beq 0#32 0#32 0xffff#32, nopInstr]
 #guard (match run loopProg regs0 5 with
         | .limitReached _ steps => steps == 5
         | _ => false)
