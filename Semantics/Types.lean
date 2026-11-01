@@ -1,5 +1,5 @@
 import Std.Data.HashMap.Basic
-import MipsSim.Word
+import Semantics.Word
 
 /-!
 # Types — core simulator datatypes

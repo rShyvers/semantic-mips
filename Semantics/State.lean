@@ -1,6 +1,6 @@
 import Std.Data.HashMap.Basic
-import MipsSim.Word
-import MipsSim.Types
+import Semantics.Word
+import Semantics.Types
 
 /-!
 # State — hardware operations on `State`

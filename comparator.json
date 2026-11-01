@@ -1,6 +1,6 @@
 {
-  "challenge_module": "MipsSim.Specs.StepSpec",
-  "solution_module": "MipsSim.Specs.StepSpec",
+  "challenge_module": "Semantics.Specs.StepSpec",
+  "solution_module": "Semantics.Specs.StepSpec",
   "theorem_names": [
     "add_spec_raw",
     "sub_spec_raw",

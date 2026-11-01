@@ -1,5 +1,5 @@
-import MipsSim.Word
-import MipsSim.Types
+import Semantics.Word
+import Semantics.Types
 
 /-!
 # Instruction — the v1 MIPS instruction set, decode, and encode

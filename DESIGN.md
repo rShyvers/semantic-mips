@@ -1,4 +1,4 @@
-# MipsSim — design & module contracts
+# Semantics — design & module contracts
 
 Small-step semantics of MIPS (educational dialect, see `docs/spec/SPEC-NOTES.md` §9)
 plus a differential harness against MARS. This file pins module boundaries and
@@ -25,13 +25,13 @@ Word ─┬─ Types ─┬─ State      (Wave 1, parallel)
 
 | File | Owns | Depends on |
 |---|---|---|
-| `MipsSim/Word.lean` | W32 type + bit-level helpers + tests | mathlib BitVec only |
-| `MipsSim/Types.lean` | Program, State struct, HaltReason, StepResult, instruction-word constructors, environment constants + tests | Word |
-| `MipsSim/State.lean` | hardware operations on State (init, reg read/write, mem read/write) + tests | Word, Types |
-| `MipsSim/Instruction.lean` | `Instruction` enum, `decode`, `encode` + tests vs INSTRUCTION-REF encodings | Word, Types |
-| `MipsSim/Asm.lean` | assembler: v1 subset source text → Program + golden tests | Word, Types |
-| `MipsSim/Step.lean` | `step` (small-step semantics) + `Sim.run` loop + per-instruction unit tests | all of the above |
-| `MipsSim/DiffHarness.lean` | exe: run corpus through Sim, spawn MARS, compare outputs | Step, Asm, IO |
+| `Semantics/Word.lean` | W32 type + bit-level helpers + tests | mathlib BitVec only |
+| `Semantics/Types.lean` | Program, State struct, HaltReason, StepResult, instruction-word constructors, environment constants + tests | Word |
+| `Semantics/State.lean` | hardware operations on State (init, reg read/write, mem read/write) + tests | Word, Types |
+| `Semantics/Instruction.lean` | `Instruction` enum, `decode`, `encode` + tests vs INSTRUCTION-REF encodings | Word, Types |
+| `Semantics/Asm.lean` | assembler: v1 subset source text → Program + golden tests | Word, Types |
+| `Semantics/Step.lean` | `step` (small-step semantics) + `Sim.run` loop + per-instruction unit tests | all of the above |
+| `Semantics/DiffHarness.lean` | exe: run corpus through Sim, spawn MARS, compare outputs | Step, Asm, IO |
 
 Foundation = Word + Types (Wave 0: implemented by a worker against §3, reviewed
 and committed by the orchestrator; **read-only for all subsequent workers**).
@@ -115,7 +115,7 @@ in `State.out`; `step` has no I/O.
 
 - Unit tests live in the module file as `example ... := by decide` / `by rfl` plus
   `#guard cond` lines (CLAUDE.md §5). No separate test targets in v1.
-- Build one module per edit: `lake build MipsSim.<Module>`. Never run two lake
+- Build one module per edit: `lake build Semantics.<Module>`. Never run two lake
   processes in the same checkout — parallel workers use git worktrees, not shared builds.
 - `plausible` property tests arrive with the Step/Specs waves, not Wave 1.
 
@@ -135,6 +135,6 @@ in `State.out`; `step` has no I/O.
 
 - Foundation files (Word, Types) are READ-ONLY. If a foundation type is missing or
   wrong, report it in your final message; do not edit foundation or other modules.
-- Edit only your assigned file. No edits under vendor/, docs/, or outside MipsSim/.
+- Edit only your assigned file. No edits under vendor/, docs/, or outside Semantics/.
 - No `sorry`, no `axiom`, no `set_option` tricks (CLAUDE.md §7).
 - If stuck after real effort, report the exact goal state you're blocked on.

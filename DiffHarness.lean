@@ -1,15 +1,15 @@
 import Std.Data.HashMap.Basic
-import MipsSim.Word
-import MipsSim.Types
-import MipsSim.State
-import MipsSim.Instruction
-import MipsSim.Asm
-import MipsSim.Step
+import Semantics.Word
+import Semantics.Types
+import Semantics.State
+import Semantics.Instruction
+import Semantics.Asm
+import Semantics.Step
 
 /-!
 # DiffHarness — differential testing executable (Wave 3, DESIGN.md §2/§6)
 
-Runs every `.asm` program in `MipsSim/tests/corpus/` through both our `Step`
+Runs every `.asm` program in `Semantics/tests/corpus/` through both our `Step`
 simulator and a real MARS 4.5 process, and compares their observable output
 exactly (after stripping MARS's startup banner).
 

@@ -1,8 +1,8 @@
 import Std.Data.HashMap.Basic
-import MipsSim.Word
-import MipsSim.Types
-import MipsSim.State
-import MipsSim.Instruction
+import Semantics.Word
+import Semantics.Types
+import Semantics.State
+import Semantics.Instruction
 
 /-!
 # Step — small-step semantics of the v1 MIPS instruction set

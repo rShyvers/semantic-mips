@@ -1,8 +1,8 @@
-import MipsSim.Word
-import MipsSim.Types
-import MipsSim.State
-import MipsSim.Instruction
-import MipsSim.Step
+import Semantics.Word
+import Semantics.Types
+import Semantics.State
+import Semantics.Instruction
+import Semantics.Step
 
 /-!
 # StepSpec — a reviewable specification for `step`

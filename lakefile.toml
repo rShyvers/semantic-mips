@@ -1,11 +1,11 @@
-name = "MipsSim"
+name = "Semantics"
 version = "0.1.0"
 keywords = ["math"]
-# `Checked` (not `MipsSim`) is the default target on purpose: it is the
+# `Checked` (not `Semantics`) is the default target on purpose: it is the
 # sorry-free subset that `lake check` kernel-replays. See `Checked.lean`
-# and the "Verification gates" section of the root README. `MipsSim`
+# and the "Verification gates" section of the root README. `Semantics`
 # (the full library, including the 3 documented `sorry`s in
-# `MipsSim.Specs.StepSpec`) is still buildable with `lake build MipsSim`.
+# `Semantics.Specs.StepSpec`) is still buildable with `lake build Semantics`.
 defaultTargets = ["Checked", "DiffHarness"]
 
 [leanOptions]
@@ -17,7 +17,7 @@ scope = "leanprover-community"
 rev = "v4.35.0"
 
 [[lean_lib]]
-name = "MipsSim"
+name = "Semantics"
 
 [[lean_lib]]
 name = "Checked"

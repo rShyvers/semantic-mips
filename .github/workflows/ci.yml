@@ -19,8 +19,8 @@ jobs:
           key: lake-${{ hashFiles('lake-manifest.json') }}-${{ hashFiles('lean-toolchain') }}
       - name: Fetch mathlib build cache (no-op when restored from cache)
         run: ~/.elan/bin/lake exe cache get
-      - name: Build all targets (MipsSim incl. StepSpec, Checked, DiffHarness; includes unit tests / #guard)
-        run: ~/.elan/bin/lake build MipsSim Checked DiffHarness
+      - name: Build all targets (Semantics incl. StepSpec, Checked, DiffHarness; includes unit tests / #guard)
+        run: ~/.elan/bin/lake build Semantics Checked DiffHarness
       - name: Kernel replay gate (lake check on the zero-sorry target)
         run: ~/.elan/bin/lake check
       - name: Trusted-statement gate (lake comparator on the 8-theorem trusted surface)

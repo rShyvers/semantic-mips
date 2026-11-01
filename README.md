@@ -11,12 +11,12 @@ dependency on anything else in that project.
 
 ## What this is
 
-- `MipsSim/Step.lean`'s `step : Program → State → StepResult` is a **total,
+- `Semantics/Step.lean`'s `step : Program → State → StepResult` is a **total,
   one-instruction transition function**: fetch, decode, execute exactly one
   instruction, and either produce the next `State` or halt with a reason.
   That one-step relation *is* the semantics; `run` (same file) is nothing
   more than `step` iterated with a fuel bound, built strictly on top of it.
-- `MipsSim/Specs/StepSpec.lean` is a human-readable specification of `step`:
+- `Semantics/Specs/StepSpec.lean` is a human-readable specification of `step`:
   one theorem per semantically important behavior (arithmetic + overflow,
   branches, jumps, memory, the `$zero`-register rule), each citing the
   instruction-reference section it encodes, plus bad-output rejections
@@ -40,9 +40,9 @@ MARS 4.5 behavior).
 
 The MIPS language spec lives in `docs/spec/` (`INSTRUCTION-REF.md` and
 `SPEC-NOTES.md`), human-written and sourced to the real MARS 4.5 simulator's
-behavior. `step` (`MipsSim/Step.lean`) is the Lean implementation of that
+behavior. `step` (`Semantics/Step.lean`) is the Lean implementation of that
 spec. The spec's key claims are kernel-checked theorems
-(`MipsSim/Specs/StepSpec.lean`), judged by `lake comparator` against a
+(`Semantics/Specs/StepSpec.lean`), judged by `lake comparator` against a
 trusted statement file (`comparator.json`), and the whole semantics is
 differentially validated against real MARS 4.5 on a 12-program corpus
 (`DiffHarness`, `tests/corpus/`).
@@ -69,7 +69,7 @@ Two gates decide whether a proof counts as "done" (see the parent project's
 - **`lake comparator`** checks a named list of theorems
   (`comparator.json`) against an explicit per-theorem axiom allowlist. Unlike
   `lake check`, it works theorem-by-theorem, so it is the right tool for
-  `MipsSim/Specs/StepSpec.lean`, which mixes finished and (honestly
+  `Semantics/Specs/StepSpec.lean`, which mixes finished and (honestly
   documented) unfinished proofs.
 
 ### Current status
@@ -84,14 +84,14 @@ Two gates decide whether a proof counts as "done" (see the parent project's
   invariant, closed form).
 - **`lake check`: green**, over the `Checked` library (`Checked.lean`): the
   sorry-free subset of the project — `Word`, `Types`, `State`, `Instruction`,
-  `Asm`, `Step`, and their unit tests — plus `DiffHarness`. `MipsSim.Specs.StepSpec`
+  `Asm`, `Step`, and their unit tests — plus `DiffHarness`. `Semantics.Specs.StepSpec`
   (the spec file) is excluded from this target by design (see below) but is
-  still built by `lake build MipsSim` and still checked, theorem-by-theorem,
+  still built by `lake build Semantics` and still checked, theorem-by-theorem,
   by `lake comparator` above.
 
 ### Open items: 3 documented `sorry`s
 
-All three are in `MipsSim/Specs/StepSpec.lean`, each with a closed, weaker
+All three are in `Semantics/Specs/StepSpec.lean`, each with a closed, weaker
 version proved instead and a concrete `#guard`-checked example — see that
 file's "STALL NOTE" comments for the exact mechanism they stall on:
 
@@ -125,18 +125,18 @@ currently `leanprover/lean4:v4.35.0`) and a JRE on `PATH` for
 lakefile.toml, lean-toolchain, lake-manifest.json   — Lean project files
 Checked.lean           — sorry-free default-target root (see its header)
 comparator.json        — trusted-theorem config for `lake comparator`
-MipsSim/Word.lean       — W32 bit-level helpers
-MipsSim/Types.lean      — Program, State, HaltReason, StepResult
-MipsSim/State.lean      — register/memory operations on State
-MipsSim/Instruction.lean — Instruction enum, decode/encode
-MipsSim/Asm.lean        — assembler (v1 source text → Program)
-MipsSim/Step.lean       — step (the semantics) + run (fuel-bounded iteration)
-MipsSim/Specs/StepSpec.lean — the reviewable specification + proofs
-DiffHarness.lean        — differential-testing executable (Step vs MARS)
-tests/corpus/           — .asm programs used by DiffHarness
-docs/spec/              — human-written MIPS spec (ground truth for `step`)
-vendor/mars/            — real MARS 4.5 jar, used only by DiffHarness
-DESIGN.md               — module map, dependency graph, build waves
+Semantics/Word.lean            — W32 bit-level helpers
+Semantics/Types.lean           — Program, State, HaltReason, StepResult
+Semantics/State.lean           — register/memory operations on State
+Semantics/Instruction.lean     — Instruction enum, decode/encode
+Semantics/Asm.lean             — assembler (v1 source text → Program)
+Semantics/Step.lean            — step (the semantics) + run (fuel-bounded iteration)
+Semantics/Specs/StepSpec.lean  — the reviewable specification + proofs
+DiffHarness.lean               — differential-testing executable (Step vs MARS)
+tests/corpus/                  — .asm programs used by DiffHarness
+docs/spec/                     — human-written MIPS spec (ground truth for `step`)
+vendor/mars/                   — real MARS 4.5 jar, used only by DiffHarness
+DESIGN.md                      — module map, dependency graph, build waves
 ```
 
 ## License / provenance

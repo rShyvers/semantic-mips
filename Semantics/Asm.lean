@@ -1,7 +1,7 @@
 import Std.Data.HashMap.Basic
-import MipsSim.Word
-import MipsSim.Types
-import MipsSim.Instruction
+import Semantics.Word
+import Semantics.Types
+import Semantics.Instruction
 
 /-!
 # Asm — v1 MIPS assembler
