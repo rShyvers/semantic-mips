@@ -803,3 +803,366 @@ theorem lw_misaligned_no_next (p : Program) (s : State) (w rs rt imm : W32)
           (setRegsSpec (initialState textBase) [(8, 0x10010000#32)]) with
         | .next _ => false
         | .halt _ => true) = true
+
+/-! ## Group 5 — R-type logic/compare specs (`addu`,`subu`,`and`,`or`,`xor`,
+`nor`,`slt`,`sltu`,`movn`,`movz`)
+
+These ten R-type instructions round out Group 2's arithmetic/logic coverage.
+`addu`/`subu` are `add`/`sub` with the overflow trap removed entirely — plain
+two's-complement wraparound, never a halt (INSTRUCTION-REF "addu"/"subu"
+sections). `and`/`or`/`xor`/`nor` are the four bitwise ops, with no overflow
+concept whatsoever (INSTRUCTION-REF "and"/"or"/"xor"/"nor" sections).
+`slt`/`sltu` write a `0`/`1` comparison result, signed vs. unsigned
+(INSTRUCTION-REF "slt"/"sltu" sections). `movn`/`movz` are MIPS32r2
+conditional moves whose defining feature — `$rd` left genuinely untouched
+(not zeroed) when the condition fails — is exactly what the corollaries
+after their raw specs pin down, per this project's CLAUDE.md §4 ("the spec
+must reject bad behaviour"): a buggy always-overwrite implementation would
+fail `movn_not_taken_unchanged`/`movz_not_taken_unchanged` below. -/
+
+/-- **`addu` computes `$rs + $rt` with plain wraparound and never traps** —
+same formula as `add_spec_raw` minus the overflow check entirely
+(INSTRUCTION-REF "addu" section). -/
+theorem addu_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.addu rs rt rd))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let sumBV := readReg s (regIdxSpec rs) + readReg s (regIdxSpec rt)
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) sumBV) with
+          pc := (writeReg s (regIdxSpec rd) sumBV).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`subu` computes `$rs - $rt` with plain wraparound and never traps**
+(INSTRUCTION-REF "subu" section). -/
+theorem subu_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.subu rs rt rd))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let diffBV := readReg s (regIdxSpec rs) - readReg s (regIdxSpec rt)
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) diffBV) with
+          pc := (writeReg s (regIdxSpec rd) diffBV).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`and` computes the bitwise AND of `$rs`/`$rt`** — no overflow concept
+at all (INSTRUCTION-REF "and" section). -/
+theorem and_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.and rs rt rd))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let v := readReg s (regIdxSpec rs) &&& readReg s (regIdxSpec rt)
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`or` computes the bitwise OR of `$rs`/`$rt`** (INSTRUCTION-REF "or"
+section). -/
+theorem or_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.or rs rt rd))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let v := readReg s (regIdxSpec rs) ||| readReg s (regIdxSpec rt)
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`xor` computes the bitwise XOR of `$rs`/`$rt`** (INSTRUCTION-REF "xor"
+section). -/
+theorem xor_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.xor rs rt rd))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let v := readReg s (regIdxSpec rs) ^^^ readReg s (regIdxSpec rt)
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`nor` computes the bitwise NOR (`~($rs | $rt)`) of `$rs`/`$rt`**
+(INSTRUCTION-REF "nor" section). -/
+theorem nor_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.nor rs rt rd))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let v := ~~~(readReg s (regIdxSpec rs) ||| readReg s (regIdxSpec rt))
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`slt` writes `1` to `$rd` iff `$rs < $rt` as a signed comparison, else
+`0`** (INSTRUCTION-REF "slt" section). -/
+theorem slt_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.slt rs rt rd))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let v := if asSigned (readReg s (regIdxSpec rs)) < asSigned (readReg s (regIdxSpec rt))
+               then 1#32 else 0#32
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`sltu` writes `1` to `$rd` iff `$rs < $rt` as an unsigned comparison,
+else `0`** (INSTRUCTION-REF "sltu" section). -/
+theorem sltu_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.sltu rs rt rd))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let v := if (readReg s (regIdxSpec rs)).toNat < (readReg s (regIdxSpec rt)).toNat
+               then 1#32 else 0#32
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`movn` moves `$rs` into `$rd` iff `$rt ≠ 0`; otherwise `$rd` is left
+completely unchanged** — a true conditional no-op, not "write `0`"
+(INSTRUCTION-REF "movn" section). This is the full case split; see
+`movn_taken_spec`/`movn_not_taken_spec`/`movn_not_taken_unchanged` below for
+the two branches isolated. -/
+theorem movn_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.movn rs rt rd))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if readReg s (regIdxSpec rt) != 0#32 then
+        StepResult.next
+          { (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rs))) with
+            pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rs))).pc + 4#32 }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`movn`, condition true (`$rt ≠ 0`)**: `$rd` actually receives `$rs`'s
+value. -/
+theorem movn_taken_spec (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.movn rs rt rd))
+    (hpb : s.pendingBranch = none)
+    (htaken : readReg s (regIdxSpec rt) ≠ 0#32) :
+    step p s =
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rs))) with
+          pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rs))).pc + 4#32 } := by
+  rw [movn_spec_raw p s w rs rt rd hfetch hdecode hpb, if_pos (by simpa using htaken)]
+
+/-- **`movn`, condition false (`$rt = 0`)**: the state advances with no
+register write at all — `$rd` is not touched, not zeroed. -/
+theorem movn_not_taken_spec (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.movn rs rt rd))
+    (hpb : s.pendingBranch = none)
+    (hnot : readReg s (regIdxSpec rt) = 0#32) :
+    step p s = StepResult.next { s with pc := s.pc + 4#32 } := by
+  rw [movn_spec_raw p s w rs rt rd hfetch hdecode hpb, if_neg (by simp [hnot])]
+
+/-- **"Bad output rejection" for `movn`**: whenever the condition fails
+(`$rt = 0`), the resulting state's `$rd` reads back *exactly* its pre-step
+value — a buggy implementation that always overwrote `$rd` regardless of
+`$rt` could never satisfy this. -/
+theorem movn_not_taken_unchanged (p : Program) (s s' : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.movn rs rt rd))
+    (hpb : s.pendingBranch = none)
+    (hnot : readReg s (regIdxSpec rt) = 0#32)
+    (hstep : step p s = StepResult.next s') :
+    readReg s' (regIdxSpec rd) = readReg s (regIdxSpec rd) := by
+  rw [movn_not_taken_spec p s w rs rt rd hfetch hdecode hpb hnot] at hstep
+  injection hstep with hs
+  rw [← hs]
+  rfl
+
+/-- **`movz` moves `$rs` into `$rd` iff `$rt = 0`; otherwise `$rd` is left
+completely unchanged** — the mirror image of `movn` (INSTRUCTION-REF "movz"
+section). -/
+theorem movz_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.movz rs rt rd))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if readReg s (regIdxSpec rt) == 0#32 then
+        StepResult.next
+          { (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rs))) with
+            pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rs))).pc + 4#32 }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`movz`, condition true (`$rt = 0`)**: `$rd` actually receives `$rs`'s
+value. -/
+theorem movz_taken_spec (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.movz rs rt rd))
+    (hpb : s.pendingBranch = none)
+    (htaken : readReg s (regIdxSpec rt) = 0#32) :
+    step p s =
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rs))) with
+          pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rs))).pc + 4#32 } := by
+  rw [movz_spec_raw p s w rs rt rd hfetch hdecode hpb, if_pos (by simpa using htaken)]
+
+/-- **`movz`, condition false (`$rt ≠ 0`)**: the state advances with no
+register write at all. -/
+theorem movz_not_taken_spec (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.movz rs rt rd))
+    (hpb : s.pendingBranch = none)
+    (hnot : readReg s (regIdxSpec rt) ≠ 0#32) :
+    step p s = StepResult.next { s with pc := s.pc + 4#32 } := by
+  rw [movz_spec_raw p s w rs rt rd hfetch hdecode hpb, if_neg (by simpa using hnot)]
+
+/-- **"Bad output rejection" for `movz`**: whenever the condition fails
+(`$rt ≠ 0`), the resulting state's `$rd` reads back *exactly* its pre-step
+value — a buggy implementation that always overwrote `$rd` regardless of
+`$rt` could never satisfy this. -/
+theorem movz_not_taken_unchanged (p : Program) (s s' : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.movz rs rt rd))
+    (hpb : s.pendingBranch = none)
+    (hnot : readReg s (regIdxSpec rt) ≠ 0#32)
+    (hstep : step p s = StepResult.next s') :
+    readReg s' (regIdxSpec rd) = readReg s (regIdxSpec rd) := by
+  rw [movz_not_taken_spec p s w rs rt rd hfetch hdecode hpb hnot] at hstep
+  injection hstep with hs
+  rw [← hs]
+  rfl
+
+/-! ### Group 5 — satisfiable examples
+
+Same technique as Group 3: each theorem above is instantiated on a concrete
+program/state with every hypothesis discharged. -/
+
+-- `addu_spec_raw`: `0xffffffff + 2` wraps to `1`, with no trap (unlike
+-- `add`, which would halt on this operand pair's signed overflow reading).
+#guard (match step (prog1Spec (.addu 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32), (9, 2#32)]) with
+        | .next s => readReg s 10 == 1#32
+        | .halt _ => false) = true
+
+-- `subu_spec_raw`: `0 - 1` wraps to `0xffffffff`, with no trap.
+#guard (match step (prog1Spec (.subu 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0#32), (9, 1#32)]) with
+        | .next s => readReg s 10 == 0xffffffff#32
+        | .halt _ => false) = true
+
+-- `and_spec_raw`/`or_spec_raw`/`xor_spec_raw`/`nor_spec_raw`.
+#guard (match step (prog1Spec (.and 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0xff00ff00#32), (9, 0x0f0f0f0f#32)]) with
+        | .next s => readReg s 10 == 0x0f000f00#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.or 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0xff00ff00#32), (9, 0x0f0f0f0f#32)]) with
+        | .next s => readReg s 10 == 0xff0fff0f#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.xor 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0xff00ff00#32), (9, 0x0f0f0f0f#32)]) with
+        | .next s => readReg s 10 == 0xf00ff00f#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.nor 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0#32), (9, 0#32)]) with
+        | .next s => readReg s 10 == 0xffffffff#32
+        | .halt _ => false) = true
+
+-- `slt_spec_raw`/`sltu_spec_raw`: the same bit pattern (`0xffffffff`, i.e.
+-- `-1` signed) compares differently against `1` under signed vs. unsigned
+-- interpretation.
+#guard (match step (prog1Spec (.slt 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32), (9, 1#32)]) with
+        | .next s => readReg s 10 == 1#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.sltu 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32), (9, 1#32)]) with
+        | .next s => readReg s 10 == 0#32
+        | .halt _ => false) = true
+
+-- `movn_taken_spec`/`movn_not_taken_unchanged`: `$rd` pre-seeded with the
+-- sentinel `99` is overwritten when `$rt ≠ 0`, and left at `99` (not
+-- zeroed) when `$rt = 0`.
+#guard (match step (prog1Spec (.movn 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 5#32), (9, 1#32), (10, 99#32)]) with
+        | .next s => readReg s 10 == 5#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.movn 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 5#32), (9, 0#32), (10, 99#32)]) with
+        | .next s => readReg s 10 == 99#32
+        | .halt _ => false) = true
+
+-- `movz_taken_spec`/`movz_not_taken_unchanged`: the mirror image of `movn`.
+#guard (match step (prog1Spec (.movz 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 5#32), (9, 0#32), (10, 99#32)]) with
+        | .next s => readReg s 10 == 5#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.movz 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 5#32), (9, 1#32), (10, 99#32)]) with
+        | .next s => readReg s 10 == 99#32
+        | .halt _ => false) = true
