@@ -135,6 +135,14 @@ value rather than a `UInt8` loaded from memory. -/
 private def signExtLowByte (w : W32) : W32 :=
   (w.extractLsb 7 0).signExtend 32
 
+/-- A `W32` with the low `n` bits set and all higher bits clear (`n = 0..32`).
+Used by `ext`/`ins` to mask out a `size`-bit field. Built as `(1 <<< n) - 1`:
+for `n = 32`, `1 <<< 32` wraps to `0` in a 32-bit `BitVec` (hardware shift
+semantics, `BitVec.shiftLeft`), so `0 - 1` wraps to `0xffffffff` -- exactly
+the all-ones mask a full-word field needs, with no separate case split. -/
+private def lowBitsMask (n : Nat) : W32 :=
+  ((1#32) <<< n) - 1#32
+
 /-- Count leading zero bits in `w` from the MSB (bit 31), stopping at the
 first set bit; `32` if `w` is all-zero. `fuel` bounds the scan to the
 remaining unscanned bit positions (`pos .. 31`) so this terminates by
@@ -216,6 +224,23 @@ docstring for the truncating-vs-FCSR-rounding-mode simplification this
 pins. -/
 private def intBitsOfFloatTrunc (f : Float32) : W32 :=
   f.toInt32.toBitVec
+
+/-- `round.w.s`'s numeric conversion: round `f` to the nearest integer via
+Lean core's `Float32.round` (`roundf`, ties away from zero \u2014 see
+`Instruction.roundWS`'s docstring for why this isn't ties-to-even), then
+clamp/convert to `Int32` the same way `intBitsOfFloatTrunc` does. -/
+private def intBitsOfFloatRound (f : Float32) : W32 :=
+  f.round.toInt32.toBitVec
+
+/-- `ceil.w.s`'s numeric conversion: round `f` toward +Infinity
+(`Float32.ceil`, `ceilf`), then clamp/convert to `Int32`. -/
+private def intBitsOfFloatCeil (f : Float32) : W32 :=
+  f.ceil.toInt32.toBitVec
+
+/-- `floor.w.s`'s numeric conversion: round `f` toward -Infinity
+(`Float32.floor`, `floorf`), then clamp/convert to `Int32`. -/
+private def intBitsOfFloatFloor (f : Float32) : W32 :=
+  f.floor.toInt32.toBitVec
 
 /-- Execute a single already-fetched-and-decoded instruction. `w` is the raw
 instruction word (needed only to report `illegalInstruction` for an unknown
@@ -303,6 +328,16 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
   | .srav rd rt rs =>
     let amt := ((readReg s (regIdx rs)).extractLsb 4 0).toNat
     mkNext s (writeReg s (regIdx rd) ((readReg s (regIdx rt)).sshiftRight amt))
+  -- R-type rotate (MIPS32r2): bits shifted off the bottom wrap around to the
+  -- top, unlike `srl`/`srlv`'s zero-fill on the same input
+  -- (docs/spec/MIPS-COVERAGE-GAPS.md section 3.4). `BitVec.rotateRight` already
+  -- reduces its shift amount mod the bitvector width, matching the real
+  -- MIPS32 `sa`/`$rs & 0x1f` range (0-31) exactly.
+  | .rotr rd rt sa =>
+    mkNext s (writeReg s (regIdx rd) ((readReg s (regIdx rt)).rotateRight sa.toNat))
+  | .rotrv rd rt rs =>
+    let amt := ((readReg s (regIdx rs)).extractLsb 4 0).toNat
+    mkNext s (writeReg s (regIdx rd) ((readReg s (regIdx rt)).rotateRight amt))
   -- R-type mult/div
   | .mult rs rt =>
     let a := asSigned (readReg s (regIdx rs))
@@ -329,8 +364,47 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
       mkNext s s
     else
       mkNext s { s with lo := BitVec.ofNat 32 (a / b), hi := BitVec.ofNat 32 (a % b) }
+  -- SPECIAL2 multiply-accumulate (MIPS32): same signed/unsigned 64-bit
+  -- product formation as `mult`/`multu` above, but added to (or subtracted
+  -- from) the *existing* `{hi,lo}` pair instead of overwriting it. The
+  -- 64-bit add/subtract is plain `BitVec 64` arithmetic, which already
+  -- wraps on overflow -- no overflow trap, matching `mult`'s existing
+  -- non-trapping precedent (docs/spec/MIPS-COVERAGE-GAPS.md §3.5). `hi ++ lo`
+  -- reassembles the current 64-bit accumulator (`hi` is the high word).
+  | .madd rs rt =>
+    let a := asSigned (readReg s (regIdx rs))
+    let b := asSigned (readReg s (regIdx rt))
+    let prod64 : BitVec 64 := BitVec.ofInt 64 (a * b)
+    let acc64 : BitVec 64 := s.hi ++ s.lo
+    let sum64 := acc64 + prod64
+    mkNext s { s with lo := sum64.extractLsb 31 0, hi := sum64.extractLsb 63 32 }
+  | .maddu rs rt =>
+    let a := (readReg s (regIdx rs)).toNat
+    let b := (readReg s (regIdx rt)).toNat
+    let prod64 : BitVec 64 := BitVec.ofNat 64 (a * b)
+    let acc64 : BitVec 64 := s.hi ++ s.lo
+    let sum64 := acc64 + prod64
+    mkNext s { s with lo := sum64.extractLsb 31 0, hi := sum64.extractLsb 63 32 }
+  | .msub rs rt =>
+    let a := asSigned (readReg s (regIdx rs))
+    let b := asSigned (readReg s (regIdx rt))
+    let prod64 : BitVec 64 := BitVec.ofInt 64 (a * b)
+    let acc64 : BitVec 64 := s.hi ++ s.lo
+    let diff64 := acc64 - prod64
+    mkNext s { s with lo := diff64.extractLsb 31 0, hi := diff64.extractLsb 63 32 }
+  | .msubu rs rt =>
+    let a := (readReg s (regIdx rs)).toNat
+    let b := (readReg s (regIdx rt)).toNat
+    let prod64 : BitVec 64 := BitVec.ofNat 64 (a * b)
+    let acc64 : BitVec 64 := s.hi ++ s.lo
+    let diff64 := acc64 - prod64
+    mkNext s { s with lo := diff64.extractLsb 31 0, hi := diff64.extractLsb 63 32 }
   | .mflo rd => mkNext s (writeReg s (regIdx rd) s.lo)
   | .mfhi rd => mkNext s (writeReg s (regIdx rd) s.hi)
+  -- R-type move, write direction: the write-direction counterparts to
+  -- `mfhi`/`mflo` above (docs/spec/MIPS-COVERAGE-GAPS.md §3.5).
+  | .mthi rs => mkNext s { s with hi := readReg s (regIdx rs) }
+  | .mtlo rs => mkNext s { s with lo := readReg s (regIdx rs) }
   -- SPECIAL2 bit-count (MIPS32)
   | .clo rs rd =>
     mkNext s (writeReg s (regIdx rd) (BitVec.ofNat 32 (countLeadingOnes (readReg s (regIdx rs)))))
@@ -352,6 +426,32 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     mkNext s (writeReg s (regIdx rd) (signExtLowByte (readReg s (regIdx rt))))
   | .seh rd rt =>
     mkNext s (writeReg s (regIdx rd) (signExt16 (readReg s (regIdx rt))))
+  -- SPECIAL3 BSHFL word-swap-bytes-within-halfwords (MIPS32r2): swap the
+  -- two bytes of each 16-bit half of `$rt` independently; the halfwords
+  -- themselves stay in their original word positions (not a full 32-bit
+  -- byte-reverse -- that's `wsbh` + `rotr 16`, not modeled as a single op).
+  | .wsbh rd rt =>
+    let v := readReg s (regIdx rt)
+    let b0 := v &&& 0xff#32
+    let b1 := (v >>> 8) &&& 0xff#32
+    let b2 := (v >>> 16) &&& 0xff#32
+    let b3 := (v >>> 24) &&& 0xff#32
+    let result := (b2 <<< 24) ||| (b3 <<< 16) ||| (b0 <<< 8) ||| b1
+    mkNext s (writeReg s (regIdx rd) result)
+  -- SPECIAL3 bitfield extract/insert (MIPS32r2;
+  -- docs/spec/MIPS-COVERAGE-GAPS.md section 3.4). `pos`/`size` are already the
+  -- semantic values (`Instruction.decode` did the raw-field +-1 arithmetic),
+  -- so this is pure bit masking -- no special-casing for the real
+  -- `pos + size <= 32` hardware constraint, per this track's brief.
+  | .ext rt rs pos size =>
+    let field := (readReg s (regIdx rs) >>> pos.toNat) &&& lowBitsMask size.toNat
+    mkNext s (writeReg s (regIdx rt) field)
+  | .ins rt rs pos size =>
+    let mask := lowBitsMask size.toNat
+    let srcField := (readReg s (regIdx rs) &&& mask) <<< pos.toNat
+    let clearMask := ~~~(mask <<< pos.toNat)
+    let newVal := (readReg s (regIdx rt) &&& clearMask) ||| srcField
+    mkNext s (writeReg s (regIdx rt) newVal)
   -- I-type arith/logic
   | .addi rs rt imm =>
     let av := readReg s (regIdx rs)
@@ -550,6 +650,14 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     mkNext s (writeReg s (regIdx rt) (readFpReg s (regIdx fs)))
   | .mtc1 rt fs =>
     mkNext s (writeFpReg s (regIdx fs) (readReg s (regIdx rt)))
+  -- `cfc1`/`ctc1`: no FCSR/FIR control-register state is modeled, so these
+  -- reuse the same `fpRegs` array as an addressable 32-bit scratch slot
+  -- (`Instruction.cfc1`'s docstring) -- same move shape as `mfc1`/`mtc1`,
+  -- just a different `rs`-position sub-opcode.
+  | .cfc1 rt fs =>
+    mkNext s (writeReg s (regIdx rt) (readFpReg s (regIdx fs)))
+  | .ctc1 rt fs =>
+    mkNext s (writeFpReg s (regIdx fs) (readReg s (regIdx rt)))
   | .lwc1 rs ft imm =>
     let addr := readReg s (regIdx rs) + signExt16 imm
     match readMemWord s addr with
@@ -589,6 +697,56 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
   | .cLeS fs ft =>
     let flag := (floatOfBits (readFpReg s (regIdx fs))).le (floatOfBits (readFpReg s (regIdx ft)))
     mkNext s { s with fpCondFlag := flag }
+  | .sqrtS fd fs =>
+    let v := (floatOfBits (readFpReg s (regIdx fs))).sqrt
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat v))
+  -- `abs.s`/`neg.s`: raw sign-bit operations, no `Float32` arithmetic
+  -- involved (`Instruction.absS`/`negS`'s docstrings).
+  | .absS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (readFpReg s (regIdx fs) &&& 0x7fffffff#32))
+  | .negS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (readFpReg s (regIdx fs) ^^^ 0x80000000#32))
+  | .roundWS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (intBitsOfFloatRound (floatOfBits (readFpReg s (regIdx fs)))))
+  -- `trunc.w.s`: numerically identical to `cvtWS` under this model
+  -- (`Instruction.truncWS`'s docstring) -- both truncate toward zero.
+  | .truncWS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (intBitsOfFloatTrunc (floatOfBits (readFpReg s (regIdx fs)))))
+  | .ceilWS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (intBitsOfFloatCeil (floatOfBits (readFpReg s (regIdx fs)))))
+  | .floorWS fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (intBitsOfFloatFloor (floatOfBits (readFpReg s (regIdx fs)))))
+  | .cFS _ _ =>
+    mkNext s { s with fpCondFlag := false }
+  -- `c.un.s`/`c.ult.s`/`c.ule.s` are built from `Float32.isNaN` explicitly,
+  -- not derived from `<`/`<=` -- those operators already return `false` for
+  -- any NaN operand (IEEE-754-correct), so deriving "unordered" from them
+  -- would silently be wrong (`Instruction.cUnS`'s docstring).
+  | .cUnS fs ft =>
+    let a := floatOfBits (readFpReg s (regIdx fs))
+    let b := floatOfBits (readFpReg s (regIdx ft))
+    mkNext s { s with fpCondFlag := a.isNaN || b.isNaN }
+  | .cUeqS fs ft =>
+    let a := floatOfBits (readFpReg s (regIdx fs))
+    let b := floatOfBits (readFpReg s (regIdx ft))
+    mkNext s { s with fpCondFlag := a.beq b || a.isNaN || b.isNaN }
+  -- `c.olt.s`/`c.ole.s`: numerically identical to `cLtS`/`cLeS` under this
+  -- model (`Instruction.cOltS`/`cOleS`'s docstrings) -- kept as separate
+  -- constructors because they are distinct real-MIPS32 encodings.
+  | .cOltS fs ft =>
+    let flag := (floatOfBits (readFpReg s (regIdx fs))).lt (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s { s with fpCondFlag := flag }
+  | .cUltS fs ft =>
+    let a := floatOfBits (readFpReg s (regIdx fs))
+    let b := floatOfBits (readFpReg s (regIdx ft))
+    mkNext s { s with fpCondFlag := a.lt b || a.isNaN || b.isNaN }
+  | .cOleS fs ft =>
+    let flag := (floatOfBits (readFpReg s (regIdx fs))).le (floatOfBits (readFpReg s (regIdx ft)))
+    mkNext s { s with fpCondFlag := flag }
+  | .cUleS fs ft =>
+    let a := floatOfBits (readFpReg s (regIdx fs))
+    let b := floatOfBits (readFpReg s (regIdx ft))
+    mkNext s { s with fpCondFlag := a.le b || a.isNaN || b.isNaN }
   -- `bc1t`/`bc1f`: upgraded during dev/v2 integration to use the same
   -- `pendingBranch` delay-slot scheduling as `beq`/`bne`/etc. (real MIPS32
   -- gives every branch, including FP ones, exactly one delay slot) instead
@@ -645,8 +803,68 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
   | .tgeu rs rt =>
     if (readReg s (regIdx rs)).toNat ≥ (readReg s (regIdx rt)).toNat
     then takeException s excCodeTr else mkNext s s
+  -- Trap-immediate (REGIMM, real MIPS32 ISA; `docs/spec/MIPS-COVERAGE-GAPS.md`
+  -- §3.8): same coprocessor-0 trap model as `teq`/`tne`/etc. above, but
+  -- comparing `$rs` against a sign-extended 16-bit immediate instead of a
+  -- second register. `tgeiu`/`tltiu` sign-extend the immediate to 32 bits
+  -- first, then compare the resulting bit pattern as unsigned — same
+  -- convention `sltiu` already uses.
+  | .teqi rs imm =>
+    if readReg s (regIdx rs) == signExt16 imm then takeException s excCodeTr else mkNext s s
+  | .tnei rs imm =>
+    if readReg s (regIdx rs) ≠ signExt16 imm then takeException s excCodeTr else mkNext s s
+  | .tgei rs imm =>
+    if asSigned (readReg s (regIdx rs)) ≥ asSigned (signExt16 imm)
+    then takeException s excCodeTr else mkNext s s
+  | .tgeiu rs imm =>
+    if (readReg s (regIdx rs)).toNat ≥ (signExt16 imm).toNat
+    then takeException s excCodeTr else mkNext s s
+  | .tlti rs imm =>
+    if asSigned (readReg s (regIdx rs)) < asSigned (signExt16 imm)
+    then takeException s excCodeTr else mkNext s s
+  | .tltiu rs imm =>
+    if (readReg s (regIdx rs)).toNat < (signExt16 imm).toNat
+    then takeException s excCodeTr else mkNext s s
   -- break: unconditional trap (coprocessor-0 exception model).
   | .break => takeException s excCodeBp
+  -- Coprocessor 0 (CP0) register move and execution-control instructions
+  -- (v1.x addition; `docs/spec/MIPS-COVERAGE-GAPS.md` \u00a73.10A). Scoped to
+  -- exactly the three CP0 registers this project models: `rd = 12/13/14`
+  -- maps to `cp0Status`/`cp0Cause`/`cp0Epc` (the real MIPS32 register
+  -- numbers for `Status`/`Cause`/`EPC`). Any other `rd` has no backing
+  -- register in this minimal model; rather than silently fabricate a `0`
+  -- read or silently drop a write, this halts with
+  -- `HaltReason.illegalInstruction` \u2014 a documented, honest choice (real
+  -- hardware would read garbage or trap depending on the specific
+  -- register; since every other CP0 register is architecturally
+  -- out-of-scope here, a clean halt is more defensible than inventing
+  -- behavior for registers this model doesn't have).
+  | .mfc0 rt rd =>
+    match rd.toNat with
+    | 12 => mkNext s (writeReg s (regIdx rt) s.cp0Status)
+    | 13 => mkNext s (writeReg s (regIdx rt) s.cp0Cause)
+    | 14 => mkNext s (writeReg s (regIdx rt) s.cp0Epc)
+    | _ => StepResult.halt (.illegalInstruction w)
+  | .mtc0 rt rd =>
+    match rd.toNat with
+    | 12 => mkNext s { s with cp0Status := readReg s (regIdx rt) }
+    | 13 => mkNext s { s with cp0Cause := readReg s (regIdx rt) }
+    | 14 => mkNext s { s with cp0Epc := readReg s (regIdx rt) }
+    | _ => StepResult.halt (.illegalInstruction w)
+  -- `eret`: exception return (MD00086 Rev 2.50 \u00a73.2, Table 3-23). Sets
+  -- `PC := cp0Epc` and clears `Status.EXL` (the same bit `takeException`
+  -- sets, cleared here via `&&& ~~~statusExlMask`). Real MIPS32: `eret` is
+  -- NOT delay-slotted \u2014 it takes effect immediately, an explicit
+  -- architectural exception to the general branch/jump delay-slot rule, so
+  -- (unlike every control-flow instruction above) this bypasses
+  -- `mkNext`/`pendingBranch` entirely and sets `pc` directly.
+  | .eret =>
+    StepResult.next { s with pc := s.cp0Epc, cp0Status := s.cp0Status &&& ~~~statusExlMask }
+  -- `wait`: real hardware halts the pipeline until an interrupt arrives;
+  -- this simulator has no interrupt/timer model at all, so the only
+  -- sensible behavior is a documented no-op that falls through to `pc + 4`
+  -- via `mkNext`, the same as any other non-control-flow instruction.
+  | .wait => mkNext s s
 
 /-- Execute a single instruction: fetch at `s.pc`, decode, and dispatch.
 Total: fetch/decode failure and syscall-dispatch failure all become defined
@@ -940,6 +1158,49 @@ private def seededHiLo : State := { regs0 with hi := 0xdeadbeef#32, lo := 0xcafe
   0xdeadbeef#32 0xcafef00d#32  -- hi/lo unchanged by mul
 #guard nextRegEq (step (prog1 (.mul 8#32 9#32 10#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 2#32)])) 10 0xfffffffe#32  -- (-1) * 2 = -2, wraps
 
+-- ### madd/maddu/msub/msubu/mthi/mtlo (MIPS32 multiply-accumulate and HI/LO
+-- register moves; docs/spec/MIPS-COVERAGE-GAPS.md §3.5). The key property
+-- that distinguishes these from mult/multu/mul: starting from a nonzero
+-- `seededHiLo` accumulator, the result must be the *sum* (or difference) of
+-- the prior accumulator and the product, never just the product alone.
+
+-- madd: positive × positive (product 42, same pair as the plain mult test
+-- above) accumulated on top of seededHiLo instead of overwriting it
+#guard nextHiLoEq (step (prog1 (.madd 8#32 9#32)) (setRegs seededHiLo [(8, 6#32), (9, 7#32)]))
+  0xdeadbeef#32 0xcafef037#32
+-- madd: negative × negative (same pair as the mult test whose product is
+-- 0x3782dace_9d900000), accumulated onto seededHiLo with a 64-bit carry
+-- into the hi word
+#guard nextHiLoEq (step (prog1 (.madd 8#32 9#32)) (setRegs seededHiLo [(8, 0x88ca6c00#32), (9, 0x88ca6c00#32)]))
+  0x163099be#32 0x688ef00d#32
+-- maddu: unsigned operands > 2^31 (same pair as the multu test above)
+#guard nextHiLoEq (step (prog1 (.maddu 8#32 9#32)) (setRegs seededHiLo [(8, 0xb2d05e00#32), (9, 0xb2d05e00#32)]))
+  0x5b942b40#32 0xad82f00d#32
+-- msub: subtracts the product from the prior accumulator (inverse of the
+-- positive madd case above)
+#guard nextHiLoEq (step (prog1 (.msub 8#32 9#32)) (setRegs seededHiLo [(8, 6#32), (9, 7#32)]))
+  0xdeadbeef#32 0xcafeefe3#32
+-- msubu: unsigned subtract
+#guard nextHiLoEq (step (prog1 (.msubu 8#32 9#32)) (setRegs seededHiLo [(8, 0xb2d05e00#32), (9, 0xb2d05e00#32)]))
+  0x61c7529e#32 0xe87af00d#32
+
+-- mthi/mtlo: write-direction counterparts to mfhi/mflo. Each sets only its
+-- own half, leaving the other half (0 on regs0) untouched
+#guard nextHiLoEq (step (prog1 (.mthi 8#32)) (setRegs regs0 [(8, 0x12345678#32)])) 0x12345678#32 0#32
+#guard nextHiLoEq (step (prog1 (.mtlo 8#32)) (setRegs regs0 [(8, 0x87654321#32)])) 0#32 0x87654321#32
+-- round trip through the register file: mthi $8 then mfhi $9 reads back
+-- $8's original value (symmetric for mtlo/mflo)
+#guard (match stepState (prog1 (.mthi 8#32)) (setRegs regs0 [(8, 0x12345678#32)]) with
+        | some s' =>
+          let s'' := { s' with pc := textBase }
+          nextRegEq (step (prog1 (.mfhi 9#32)) s'') 9 0x12345678#32
+        | none => false)
+#guard (match stepState (prog1 (.mtlo 8#32)) (setRegs regs0 [(8, 0x87654321#32)]) with
+        | some s' =>
+          let s'' := { s' with pc := textBase }
+          nextRegEq (step (prog1 (.mflo 9#32)) s'') 9 0x87654321#32
+        | none => false)
+
 -- ### clo/clz/movn/movz/seb/seh (MIPS32/MIPS32r2 additions; see
 -- docs/spec/INSTRUCTION-REF.md)
 
@@ -985,6 +1246,70 @@ private def seededHiLo : State := { regs0 with hi := 0xdeadbeef#32, lo := 0xcafe
   10 0xc0000000#32
 #guard nextRegEq (step (prog1 (.srav 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 1#32)]))
   10 0xc0000000#32
+
+-- ### rotr/rotrv/ext/ins/wsbh (MIPS32r2 additions; docs/spec/MIPS-COVERAGE-GAPS.md
+-- §3.4)
+
+-- rotr: wrap-around is the whole point -- contrast directly with `srl` on
+-- the exact same input (0x80000000 >> 31 would be 1 either way, so use a
+-- shamt where zero-fill and wrap-around visibly differ).
+#guard nextRegEq (step (prog1 (.rotr 10#32 8#32 4#32)) (setRegs regs0 [(8, 0x12345678#32)]))
+  10 0x81234567#32  -- rotate right 4: low nibble (0x8) wraps to the top
+#guard nextRegEq (step (prog1 (.srl 10#32 8#32 4#32)) (setRegs regs0 [(8, 0x12345678#32)]))
+  10 0x01234567#32  -- srl on the same input: zero-fills instead of wrapping
+#guard nextRegEq (step (prog1 (.rotr 10#32 8#32 0#32)) (setRegs regs0 [(8, 0x12345678#32)]))
+  10 0x12345678#32  -- rotate by 0 is a no-op
+#guard nextRegEq (step (prog1 (.rotr 10#32 8#32 31#32)) (setRegs regs0 [(8, 0x80000000#32)]))
+  10 1#32  -- rotate right 31 == rotate left 1
+
+-- rotrv: same wrap-around behavior, but the amount comes from a register's
+-- low 5 bits (masking case included, mirroring sllv/srlv/srav above).
+#guard nextRegEq (step (prog1 (.rotrv 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x12345678#32), (9, 4#32)]))
+  10 0x81234567#32
+#guard nextRegEq (step (prog1 (.rotrv 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x12345678#32), (9, 36#32)]))
+  10 0x81234567#32  -- 36 & 0x1f = 4, masks identically to rotrv by 4
+
+-- ext: extract a 10-bit field starting at bit 6 out of a known pattern.
+-- 0x12345678 = 0001 0010 0011 0100 0101 0110 0111 1000; bits [15:6]
+-- (10 bits starting at pos 6, i.e. (0x12345678 >> 6) & 0x3ff) = 0x159.
+#guard nextRegEq (step (prog1 (.ext 10#32 8#32 6#32 10#32)) (setRegs regs0 [(8, 0x12345678#32)]))
+  10 0x159#32
+-- ext: pos=0, size=32 extracts the whole register unchanged
+#guard nextRegEq (step (prog1 (.ext 10#32 8#32 0#32 32#32)) (setRegs regs0 [(8, 0x89abcdef#32)]))
+  10 0x89abcdef#32
+-- ext: a single bit
+#guard nextRegEq (step (prog1 (.ext 10#32 8#32 31#32 1#32)) (setRegs regs0 [(8, 0x80000000#32)]))
+  10 1#32
+
+-- ins: insert the low 10 bits of $rs (0x159) at pos 6 into $rt, leaving the
+-- bits outside [15:6] unchanged -- round-trips with the `ext` example above.
+#guard nextRegEq (step (prog1 (.ins 10#32 8#32 6#32 10#32)) (setRegs regs0 [(8, 0x159#32), (10, 0x12345678#32)]))
+  10 0x12345678#32  -- re-inserting the field ext'd out above reproduces the original word
+-- ins leaves bits outside the target field unchanged, even when the source
+-- register has garbage in its higher bits (only the low `size` bits of $rs
+-- are used) and $rt's target field previously held something different.
+-- low 10 bits of $rs = 0xfffffc01 & 0x3ff = 0x001, shifted to pos 6 = 0x40;
+-- $rt starts at 0, so only that one bit (bit 6) ends up set.
+#guard nextRegEq (step (prog1 (.ins 10#32 8#32 6#32 10#32)) (setRegs regs0 [(8, 0xfffffc01#32), (10, 0x00000000#32)]))
+  10 0x40#32
+-- ext/ins round-trip: ins-ing a field then ext-racting it back gives the
+-- original (masked-to-size) value, for an arbitrary field/position.
+-- (`prog1` always places its single instruction at `textBase`, so a true
+-- two-instruction sequence needs `buildProg`, threading the same program
+-- across two `stepState` calls -- the first executes `ins` at `textBase`
+-- and advances `pc` to `textBase+4`, where the second call then finds
+-- `ext`.)
+private def extInsRoundTripProg : Program :=
+  buildProg textBase [.ins 10#32 8#32 3#32 7#32, .ext 11#32 10#32 3#32 7#32]
+#guard (stepState extInsRoundTripProg (setRegs regs0 [(8, 0x7f#32), (10, 0#32)])).bind
+        (fun s' => (stepState extInsRoundTripProg s').map (fun s'' => readReg s'' 11))
+  = some 0x7f#32
+
+-- wsbh: swap bytes within each halfword independently, halfwords stay put.
+-- 0x12345678 -> halfword0 (0x5678) swaps to 0x7856, halfword1 (0x1234)
+-- swaps to 0x3412 -> result 0x34127856.
+#guard nextRegEq (step (prog1 (.wsbh 10#32 8#32)) (setRegs regs0 [(8, 0x12345678#32)]))
+  10 0x34127856#32
 
 -- ### addi overflow trap vs addiu wrap; andi/ori/xori high-imm-bits; lui
 
@@ -1318,6 +1643,53 @@ private def cp0Untouched (r : StepResult) (before : State) : Bool :=
 #guard cp0Eq (step (prog1 (.tgeu 8#32 9#32)) (setRegs regs0 [(8, 0xffffffff#32), (9, 1#32)]))
   textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
 
+-- ### Trap-immediate family (REGIMM, real MIPS32 ISA;
+-- docs/spec/MIPS-COVERAGE-GAPS.md §3.8): teqi/tnei/tgei/tgeiu/tlti/tltiu,
+-- the sign-extended-16-bit-immediate counterpart of teq/tne/tlt/tge/tltu/tgeu.
+
+-- teqi: trap-taken when `$rs == sext16(imm)`; trap-not-taken behaves like
+-- an ordinary instruction and leaves all CP0 state untouched.
+#guard cp0Eq (step (prog1 (.teqi 8#32 5#32)) (setRegs regs0 [(8, 5#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+#guard isNext (step (prog1 (.teqi 8#32 5#32)) (setRegs regs0 [(8, 6#32)]))
+#guard cp0Untouched (step (prog1 (.teqi 8#32 5#32)) (setRegs regs0 [(8, 6#32)])) regs0
+
+-- tnei: trap on not-equal (opposite condition from teqi)
+#guard cp0Eq (step (prog1 (.tnei 8#32 5#32)) (setRegs regs0 [(8, 6#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+#guard isNext (step (prog1 (.tnei 8#32 5#32)) (setRegs regs0 [(8, 5#32)]))
+
+-- tgei/tlti: signed comparison against `sext16(imm)`; imm = 0xffff sign-
+-- extends to -1.
+#guard cp0Eq (step (prog1 (.tgei 8#32 0xffff#32)) (setRegs regs0 [(8, 0xffffffff#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr  -- -1 >= -1
+#guard isNext (step (prog1 (.tgei 8#32 0xffff#32)) (setRegs regs0 [(8, 0xfffffffe#32)]))  -- -2 >= -1 false
+#guard cp0Eq (step (prog1 (.tlti 8#32 1#32)) (setRegs regs0 [(8, 0xffffffff#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr  -- -1 < 1
+#guard isNext (step (prog1 (.tlti 8#32 1#32)) (setRegs regs0 [(8, 1#32)]))  -- 1 < 1 false
+
+-- tgeiu/tltiu: the immediate is sign-extended to 32 bits first, *then* the
+-- comparison is unsigned on the resulting bit pattern -- same convention
+-- `sltiu` already uses. Edge case where the signed and unsigned
+-- interpretations of the same `$rs` bit pattern disagree: $rs = 0xffffffff
+-- (signed -1, unsigned max) against imm = 1 (sext16(1) = 1); unsigned
+-- 0xffffffff >=u 1 is true (traps), even though a signed read of the same
+-- bits (-1 >= 1) would be false.
+#guard cp0Eq (step (prog1 (.tgeiu 8#32 1#32)) (setRegs regs0 [(8, 0xffffffff#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+#guard isNext (step (prog1 (.tltiu 8#32 1#32)) (setRegs regs0 [(8, 0xffffffff#32)]))  -- 0xffffffff <u 1 false
+#guard cp0Eq (step (prog1 (.tltiu 8#32 1#32)) (setRegs regs0 [(8, 0#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr  -- 0 <u 1 true
+
+-- a negative-immediate edge case: imm = 0xffff (sext16 = -1, i.e. bit
+-- pattern 0xffffffff) compared *unsigned* against $rs = 1 does NOT trap
+-- (1 >=u 0xffffffff is false) under tgeiu, unlike the signed tgei case
+-- with the exact same operands (1 >= -1 is true, traps) -- demonstrating
+-- tgeiu really does compare unsigned, not just sign-extend-and-reuse-tgei.
+#guard isNext (step (prog1 (.tgeiu 8#32 0xffff#32)) (setRegs regs0 [(8, 1#32)]))
+#guard cp0Eq (step (prog1 (.tgei 8#32 0xffff#32)) (setRegs regs0 [(8, 1#32)]))
+  textBase (excCodeTr <<< 2) statusExlMask exceptionVectorAddr
+
 -- break: unconditional trap, distinct `ExcCode` (`excCodeBp` ≠ `excCodeTr`)
 -- from the same starting state/address as the teq case above.
 #guard excCodeBp ≠ excCodeTr
@@ -1347,6 +1719,82 @@ private def vectorHandlerProg : Program :=
         | some s' => nextRegEq (step vectorHandlerProg s') 8 42#32
         | none => false)
 
+-- ### Coprocessor 0 (CP0): mfc0/mtc0/eret/wait (docs/spec/MIPS-COVERAGE-GAPS.md
+-- §3.10A)
+
+-- mfc0 reads back each of the three real CP0 registers, selected by `rd`
+-- (12/13/14 = Status/Cause/EPC).
+#guard nextRegEq (step (prog1 (.mfc0 8#32 12#32)) { regs0 with cp0Status := 0x2#32 }) 8 0x2#32
+#guard nextRegEq (step (prog1 (.mfc0 8#32 13#32)) { regs0 with cp0Cause := 0x34#32 }) 8 0x34#32
+#guard nextRegEq (step (prog1 (.mfc0 8#32 14#32)) { regs0 with cp0Epc := 0x3000#32 }) 8 0x3000#32
+
+-- mtc0 writes each of the three real CP0 registers from a GPR.
+#guard (match stepState (prog1 (.mtc0 8#32 12#32)) (setRegs regs0 [(8, 0x2#32)]) with
+        | some s' => s'.cp0Status == 0x2#32
+        | none => false)
+#guard (match stepState (prog1 (.mtc0 8#32 13#32)) (setRegs regs0 [(8, 0x34#32)]) with
+        | some s' => s'.cp0Cause == 0x34#32
+        | none => false)
+#guard (match stepState (prog1 (.mtc0 8#32 14#32)) (setRegs regs0 [(8, 0x3000#32)]) with
+        | some s' => s'.cp0Epc == 0x3000#32
+        | none => false)
+
+-- mtc0 then mfc0 round-trips an arbitrary value through each of the three
+-- registers (Status/Cause/EPC in turn).
+#guard (match stepState (prog1 (.mtc0 8#32 12#32)) (setRegs regs0 [(8, 0xabcd#32)]) with
+        | some s' => nextRegEq (step (prog1 (.mfc0 9#32 12#32)) { s' with pc := textBase }) 9
+            0xabcd#32
+        | none => false)
+#guard (match stepState (prog1 (.mtc0 8#32 13#32)) (setRegs regs0 [(8, 0xabcd#32)]) with
+        | some s' => nextRegEq (step (prog1 (.mfc0 9#32 13#32)) { s' with pc := textBase }) 9
+            0xabcd#32
+        | none => false)
+#guard (match stepState (prog1 (.mtc0 8#32 14#32)) (setRegs regs0 [(8, 0xabcd#32)]) with
+        | some s' => nextRegEq (step (prog1 (.mfc0 9#32 14#32)) { s' with pc := textBase }) 9
+            0xabcd#32
+        | none => false)
+
+-- mfc0/mtc0 with an out-of-scope `rd` (this model has no CP0 register other
+-- than 12/13/14) halt with `illegalInstruction`, the documented choice over
+-- silently reading back `0` or silently dropping the write.
+#guard isHaltIllegal (step (prog1 (.mfc0 8#32 0#32)) regs0) (encode (.mfc0 8#32 0#32))
+#guard isHaltIllegal (step (prog1 (.mtc0 8#32 0#32)) (setRegs regs0 [(8, 1#32)]))
+  (encode (.mtc0 8#32 0#32))
+
+-- eret: restores `pc` from `cp0Epc` and clears `Status.EXL` (bit 1, the same
+-- bit `takeException` sets) in a *single* `step` call -- no delay-slot
+-- scheduling (`pendingBranch` stays `none`, confirming `eret` bypasses
+-- `mkNext` entirely rather than landing one instruction later).
+private def eretReadyState : State :=
+  { regs0 with cp0Epc := 0x3000#32, cp0Status := statusExlMask, pendingBranch := none }
+#guard nextPcEq (step (prog1 .eret) eretReadyState) 0x3000#32
+#guard (match stepState (prog1 .eret) eretReadyState with
+        | some s' => s'.cp0Status == 0#32 && s'.pendingBranch == none
+        | none => false)
+
+-- full round trip: `teq` traps from `textBase` to `exceptionVectorAddr`
+-- (confirming `cp0Epc`/`pc` land at the expected places, same as the
+-- existing teq tests above), then `eret` placed at the vector returns
+-- `pc` exactly to the original trapping instruction's address and clears
+-- `Status.EXL`.
+private def teqEretProg : Program :=
+  ((∅ : Program).insert textBase (encode (.teq 8#32 9#32))).insert exceptionVectorAddr (encode .eret)
+#guard (match stepState teqEretProg (setRegs regs0 [(8, 5#32), (9, 5#32)]) with
+        | some s1 =>
+          s1.cp0Epc == textBase && s1.pc == exceptionVectorAddr && s1.cp0Status == statusExlMask &&
+            (match stepState teqEretProg s1 with
+             | some s2 => s2.pc == textBase && s2.cp0Status == 0#32
+             | none => false)
+        | none => false)
+
+-- wait: a documented no-op (no interrupt/timer model exists to wait for),
+-- falls through to `pc + 4` with all state otherwise untouched.
+#guard nextPcEq (step (prog1 .wait) regs0) (textBase + 4#32)
+#guard (match stepState (prog1 .wait) regs0 with
+        | some s' => s'.cp0Status == regs0.cp0Status && s'.cp0Cause == regs0.cp0Cause
+                       && s'.cp0Epc == regs0.cp0Epc
+        | none => false)
+
 -- ### Undecodable word → illegalInstruction
 
 -- opcode 0x11 (COP1) is implemented for the fmt/funct combinations decoded
@@ -1364,6 +1812,18 @@ private def badProg : Program := (∅ : Program).insert textBase badWord
 #guard (match stepState (prog1 (.mtc1 8#32 3#32)) (setRegs regs0 [(8, 0x12345678#32)]) with
         | some s' => nextRegEq (step (prog1 (.mfc1 9#32 3#32)) { s' with pc := textBase }) 9
             0x12345678#32
+        | none => false)
+
+-- ### Coprocessor 1 (FPU): cfc1/ctc1 (control-register move, scratch-slot model)
+
+-- ctc1 then cfc1 round-trips an arbitrary bit pattern through the shared
+-- `fpRegs` scratch slot (register 31, standing in for FCSR) -- same shape
+-- as the mtc1/mfc1 round-trip above.
+#guard nextFpRegEq (step (prog1 (.ctc1 8#32 31#32)) (setRegs regs0 [(8, 0x00000003#32)])) 31
+  0x00000003#32
+#guard (match stepState (prog1 (.ctc1 8#32 31#32)) (setRegs regs0 [(8, 0x00000003#32)]) with
+        | some s' => nextRegEq (step (prog1 (.cfc1 9#32 31#32)) { s' with pc := textBase }) 9
+            0x00000003#32
         | none => false)
 
 private def fpMemTestState : State :=
@@ -1398,6 +1858,22 @@ private def fpMemTestState : State :=
 #guard nextFpRegEq (step (prog1 (.movS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40400000#32)])) 10
   0x40400000#32
 
+-- ### Coprocessor 1 (FPU): sqrt.s/abs.s/neg.s
+
+-- sqrt.s: 4.0 (0x40800000) -> 2.0 (0x40000000)
+#guard nextFpRegEq (step (prog1 (.sqrtS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40800000#32)])) 10
+  0x40000000#32
+-- abs.s: -3.0 (0xc0400000) -> 3.0 (0x40400000); 3.0 -> 3.0 (already positive)
+#guard nextFpRegEq (step (prog1 (.absS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0400000#32)])) 10
+  0x40400000#32
+#guard nextFpRegEq (step (prog1 (.absS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40400000#32)])) 10
+  0x40400000#32
+-- neg.s: 3.0 (0x40400000) -> -3.0 (0xc0400000); -3.0 -> 3.0
+#guard nextFpRegEq (step (prog1 (.negS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40400000#32)])) 10
+  0xc0400000#32
+#guard nextFpRegEq (step (prog1 (.negS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0400000#32)])) 10
+  0x40400000#32
+
 -- ### Coprocessor 1 (FPU): cvt.s.w / cvt.w.s numeric conversions
 
 -- cvt.s.w: int bit pattern -> float value; 5 -> 5.0, -5 (0xfffffffb) -> -5.0
@@ -1414,6 +1890,40 @@ private def fpMemTestState : State :=
 #guard nextFpRegEq (step (prog1 (.cvtWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0bccccd#32)])) 10
   0xfffffffb#32
 
+-- ### Coprocessor 1 (FPU): round.w.s/trunc.w.s/ceil.w.s/floor.w.s
+
+-- 5.9 = 0x40bccccd, -5.9 = 0xc0bccccd (reusing cvt.w.s's test values above)
+-- round.w.s: nearest integer, ties away from zero (`Float32.round`/`roundf`,
+-- not ties-to-even -- see `Instruction.roundWS`'s docstring); 5.9 -> 6,
+-- -5.9 -> -6
+#guard nextFpRegEq (step (prog1 (.roundWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40bccccd#32)])) 10
+  0x00000006#32
+#guard nextFpRegEq (step (prog1 (.roundWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0bccccd#32)])) 10
+  0xfffffffa#32
+-- round.w.s at an exact tie: 2.5 (0x40200000) -> 3, -2.5 (0xc0200000) -> -3
+-- (ties away from zero, not to even -- documented divergence from real
+-- MIPS32's ties-to-even default)
+#guard nextFpRegEq (step (prog1 (.roundWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40200000#32)])) 10
+  0x00000003#32
+#guard nextFpRegEq (step (prog1 (.roundWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0200000#32)])) 10
+  0xfffffffd#32
+-- trunc.w.s: truncate toward zero (identical to cvt.w.s under this model);
+-- 5.9 -> 5, -5.9 -> -5
+#guard nextFpRegEq (step (prog1 (.truncWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40bccccd#32)])) 10
+  0x00000005#32
+#guard nextFpRegEq (step (prog1 (.truncWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0bccccd#32)])) 10
+  0xfffffffb#32
+-- ceil.w.s: round toward +Infinity; 5.9 -> 6, -5.9 -> -5
+#guard nextFpRegEq (step (prog1 (.ceilWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40bccccd#32)])) 10
+  0x00000006#32
+#guard nextFpRegEq (step (prog1 (.ceilWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0bccccd#32)])) 10
+  0xfffffffb#32
+-- floor.w.s: round toward -Infinity; 5.9 -> 5, -5.9 -> -6
+#guard nextFpRegEq (step (prog1 (.floorWS 10#32 8#32)) (setFpRegs regs0 [(8, 0x40bccccd#32)])) 10
+  0x00000005#32
+#guard nextFpRegEq (step (prog1 (.floorWS 10#32 8#32)) (setFpRegs regs0 [(8, 0xc0bccccd#32)])) 10
+  0xfffffffa#32
+
 -- ### Coprocessor 1 (FPU): c.eq.s/c.lt.s/c.le.s set `fpCondFlag`; bc1t/bc1f branch on it
 
 #guard nextFpCondFlagEq (step (prog1 (.cEqS 8#32 9#32))
@@ -1426,6 +1936,46 @@ private def fpMemTestState : State :=
   (setFpRegs regs0 [(8, 0x40000000#32), (9, 0x3f800000#32)])) false  -- 2.0 < 1.0 is false
 #guard nextFpCondFlagEq (step (prog1 (.cLeS 8#32 9#32))
   (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) true   -- 1.0 <= 1.0
+
+-- ### Coprocessor 1 (FPU): c.f.s/c.un.s/c.ueq.s/c.olt.s/c.ult.s/c.ole.s/c.ule.s
+
+-- quiet NaN = 0x7fc00000
+-- c.f.s: always false, regardless of operands (even equal, non-NaN ones)
+#guard nextFpCondFlagEq (step (prog1 (.cFS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) false  -- 1.0 vs 1.0
+-- c.un.s: true iff either operand is NaN ("unordered")
+#guard nextFpCondFlagEq (step (prog1 (.cUnS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x7fc00000#32), (9, 0x3f800000#32)])) true   -- NaN vs 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cUnS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) false  -- 1.0 vs 1.0
+-- c.ueq.s: equal, or unordered
+#guard nextFpCondFlagEq (step (prog1 (.cUeqS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) true   -- 1.0 == 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cUeqS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x7fc00000#32), (9, 0x3f800000#32)])) true   -- NaN vs 1.0 (unordered)
+#guard nextFpCondFlagEq (step (prog1 (.cUeqS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x40000000#32)])) false  -- 1.0 vs 2.0
+-- c.olt.s: ordered and less-than; false (not true!) when either operand is
+-- NaN, unlike a plain `<` applied carelessly to the "unordered" case
+#guard nextFpCondFlagEq (step (prog1 (.cOltS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x40000000#32)])) true   -- 1.0 < 2.0
+#guard nextFpCondFlagEq (step (prog1 (.cOltS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x7fc00000#32), (9, 0x3f800000#32)])) false  -- NaN < 1.0 is false
+-- c.ult.s: less-than, or unordered
+#guard nextFpCondFlagEq (step (prog1 (.cUltS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x7fc00000#32), (9, 0x3f800000#32)])) true   -- NaN vs 1.0 (unordered)
+#guard nextFpCondFlagEq (step (prog1 (.cUltS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x40000000#32), (9, 0x3f800000#32)])) false  -- 2.0 < 1.0 is false, not NaN
+-- c.ole.s: ordered and less-or-equal
+#guard nextFpCondFlagEq (step (prog1 (.cOleS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x3f800000#32), (9, 0x3f800000#32)])) true   -- 1.0 <= 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cOleS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x7fc00000#32), (9, 0x3f800000#32)])) false  -- NaN <= 1.0 is false
+-- c.ule.s: less-or-equal, or unordered
+#guard nextFpCondFlagEq (step (prog1 (.cUleS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x7fc00000#32), (9, 0x3f800000#32)])) true   -- NaN vs 1.0 (unordered)
+#guard nextFpCondFlagEq (step (prog1 (.cUleS 8#32 9#32))
+  (setFpRegs regs0 [(8, 0x40000000#32), (9, 0x3f800000#32)])) false  -- 2.0 <= 1.0 is false, not NaN
 
 -- `bc1t`/`bc1f` get the same delay slot as every other branch (dev/v2
 -- integration: upgraded from the fpu track's original immediate-jump

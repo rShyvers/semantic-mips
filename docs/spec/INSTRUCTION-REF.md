@@ -18,6 +18,12 @@ plus `cp0Status`/`cp0Cause`/`cp0Epc`). That addition is grounded in the real
 MIPS32 ISA, not MARS — see the dedicated
 ["Coprocessor 0 / traps and exceptions"](#coprocessor-0--traps-and-exceptions-real-mips32-isa)
 section below, which is explicit about this difference in sourcing.
+A further addition on top of that (`docs/spec/MIPS-COVERAGE-GAPS.md` §3.10A)
+adds `mfc0`/`mtc0` (generic CP0-register move, scoped to the same three
+registers), `eret` (exception return — closing the "no way to leave
+exception level" gap the original CP0 model left open), and `wait`
+(documented no-op idle instruction); see the same "Coprocessor 0" section
+below for all four.
 A further v1.x addition ("MIPS32 GPR multiply and variable shifts" section,
 at the end of this document) adds `mul`, `sllv`, `srlv`, and `srav` — also
 grounded directly in the standard MIPS32 ISA, not MARS — per
@@ -37,6 +43,19 @@ linked/store-conditional) have since been added on top of the v1 set, along
 with a new `State.llBit` field; see the dedicated
 ["Atomic synchronization (`ll`/`sc`)"](#atomic-synchronization-llsc--v1x-addition)
 section near the end of this document.
+Most recently, the real MIPS32 integer multiply-accumulate family
+(`madd`/`maddu`/`msub`/`msubu`) and the write-direction HI/LO register moves
+(`mthi`/`mtlo`, the counterparts to the existing `mfhi`/`mflo`) have been
+added, per `docs/spec/MIPS-COVERAGE-GAPS.md` §3.5 — see the dedicated
+["Integer multiply-accumulate and HI/LO register moves"](#integer-multiply-accumulate-and-hilo-register-moves-v1x-addition)
+section at the end of this document.
+Finally, the real MIPS32 immediate-operand trap family `teqi`/`tnei`/
+`tgei`/`tgeiu`/`tlti`/`tltiu` has been added as the sign-extended-16-bit-
+immediate counterpart of the `teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu` family
+above (docs/spec/MIPS-COVERAGE-GAPS.md section 3.8), sharing the REGIMM
+opcode with `bltz`/`bgez`/`bltzal`/`bgezal`; see the dedicated
+["REGIMM trap-immediate family"](#regimm-trap-immediate-family-real-mips32-isa--v1x-addition)
+section just after the REGIMM zero-comparison branches below.
 
 Conventions pinned elsewhere and assumed here (see
 [`SPEC-NOTES.md`](SPEC-NOTES.md)): one real-MIPS32 branch delay slot per
@@ -111,6 +130,16 @@ execution logic (method `populate()`, lines 77–3236).
 | `tltu` | R | `if ($rs < $rt) trap`, unsigned |
 | `tgeu` | R | `if ($rs >= $rt) trap`, unsigned |
 | `break` | R | unconditional trap |
+| `teqi` | I-branch (REGIMM) | `if ($rs == sext16(imm)) trap`, signed |
+| `tnei` | I-branch (REGIMM) | `if ($rs != sext16(imm)) trap`, signed |
+| `tgei` | I-branch (REGIMM) | `if ($rs >= sext16(imm)) trap`, signed |
+| `tgeiu` | I-branch (REGIMM) | `if ($rs >= sext16(imm)) trap`, unsigned compare on sign-extended imm |
+| `tlti` | I-branch (REGIMM) | `if ($rs < sext16(imm)) trap`, signed |
+| `tltiu` | I-branch (REGIMM) | `if ($rs < sext16(imm)) trap`, unsigned compare on sign-extended imm |
+| `mfc0` | R (COP0) | `$rt = ` named CP0 register (`rd` = 12/13/14 only) |
+| `mtc0` | R (COP0) | named CP0 register (`rd` = 12/13/14 only) `:= $rt` |
+| `eret` | R (COP0) | `PC := cp0Epc; Status.EXL := 0` — no delay slot |
+| `wait` | R (COP0) | no-op (falls through to `PC_next`); no interrupt model exists to wait for |
 | `ll` | I | `$rt = MEM32[$rs + offset]`, word-aligned; sets `llBit` |
 | `sc` | I | if `llBit`: `MEM32[$rs + offset] = $rt`, `$rt := 1`; else `$rt := 0`; clears `llBit` either way |
 
@@ -934,6 +963,65 @@ displacement, identical convention to `blez`/`bgtz`).
   pre-link-value resolution as `bltzal`.
 - **Source**: MD00086 Rev 2.50, `BGEZAL`, p. 75.
 
+## REGIMM trap-immediate family (real MIPS32 ISA) — v1.x addition
+
+The six instructions in this section (`teqi`, `tnei`, `tgei`, `tgeiu`,
+`tlti`, `tltiu`) are the sign-extended-16-bit-immediate counterpart of the
+`teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu` register-register trap family
+documented in the
+["Coprocessor 0 / traps and exceptions"](#coprocessor-0--traps-and-exceptions-real-mips32-isa)
+section below, identified as a coverage gap in
+[`MIPS-COVERAGE-GAPS.md`](MIPS-COVERAGE-GAPS.md) §3.8. Per this addition's
+house rule (same precedent as the REGIMM zero-comparison branches above),
+their semantics/encodings are grounded directly in the **real MIPS32
+architecture** — MIPS32 Architecture For Programmers, Volume II-A
+(`MD00086` Rev 2.50), §3.2, Table 3-9, p. 27 (`TEQI` p. 296, `TNEI` p. 308,
+`TGEI` p. 298, `TGEIU` p. 299, `TLTI` p. 302, `TLTIU` p. 304) — not
+derived from `InstructionSet.java`, even though MARS does also implement
+all six (per this track's process requirements, MARS is not consulted as
+the spec source).
+
+All six share **opcode `0x01`** (the same `REGIMM` major opcode as
+`bltz`/`bgez`/`bltzal`/`bgezal`): the 5-bit `rt` field (bits 20–16) again
+carries no register operand, instead selecting which of the ten REGIMM
+instructions this is. Field layout: `000001 fffff ttttt ssssssssssssssss`
+→ `rs=fffff` (operand 0, the register tested), `rt=ttttt` (sub-opcode
+selector, not a register), `imm=ssss...` (operand 1, 16-bit immediate,
+sign-extended — **not** a PC-relative branch displacement, unlike every
+other REGIMM instruction's `offset` field of the same bit position).
+
+| Mnemonic | `rt` field | Semantics |
+|---|---|---|
+| `teqi` | `0x0c` | `if ($rs == sext16(imm)) trap`, signed |
+| `tnei` | `0x0e` | `if ($rs != sext16(imm)) trap`, signed |
+| `tgei` | `0x08` | `if ($rs >= sext16(imm)) trap`, signed |
+| `tgeiu` | `0x09` | `if ($rs >=u sext16(imm)) trap`, unsigned compare on sign-extended imm |
+| `tlti` | `0x0a` | `if ($rs < sext16(imm)) trap`, signed |
+| `tltiu` | `0x0b` | `if ($rs <u sext16(imm)) trap`, unsigned compare on sign-extended imm |
+
+- **Semantics**: evaluate the named condition on `$rs` vs. `sext16(imm)` —
+  `teqi`: `$rs == sext16(imm)`; `tnei`: `$rs != sext16(imm)`; `tgei`:
+  `$rs >=s sext16(imm)` (signed); `tlti`: `$rs <s sext16(imm)` (signed).
+  `tgeiu`/`tltiu` sign-extend the 16-bit immediate to 32 bits **first**,
+  then compare the resulting bit pattern against `$rs` as **unsigned** —
+  the same "sign-extend, then compare unsigned" convention this codebase's
+  `sltiu` already uses (see the `slti`/`sltiu` section above), not a
+  zero-extend. If the condition holds, take the exception described in the
+  "Coprocessor 0 / traps and exceptions" section below with
+  `excCode = excCodeTr` (identical mechanism to `teq`/`tne`/etc. —
+  `Step.lean`'s `takeException` helper). If the condition does not hold,
+  the instruction is a complete no-op other than the ordinary fall-through
+  to `pc + 4` — no CP0 state is touched at all.
+- **Errors/halts**: none beyond the exception transition itself (which is
+  `StepResult.next`, not a halt).
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  MARS does implement this family in its own `InstructionSet.java`, but per
+  this track's process requirements the ground truth cited here is the real
+  MIPS32 ISA, not MARS's implementation of it.
+- **Source**: MD00086 Rev 2.50, §3.2, Table 3-9, p. 27; per-instruction
+  pages `TEQI` p. 296, `TNEI` p. 308, `TGEI` p. 298, `TGEIU` p. 299,
+  `TLTI` p. 302, `TLTIU` p. 304.
+
 ---
 
 ## MIPS32 / MIPS32r2 additions (beyond the MARS-matched v1 baseline)
@@ -1142,19 +1230,23 @@ This is a **minimal** CP0 model: three registers, not the full coprocessor.
 
 | Field (on `State`) | Real MIPS32 register | Modeled behavior |
 |---|---|---|
-| `cp0Status` | `Status` (CP0 register 12) | Only bit 1 (`EXL`, exception level) is ever set, on any exception; no other bit (`IE`, `ERL`, `KSU`, `UM`, `BEV`, `IM7..IM0`, ...) is modeled. Initialized to `0`. |
-| `cp0Cause` | `Cause` (CP0 register 13) | Only the `ExcCode` field (bits 6..2) is ever written, as `excCode <<< 2`; no other field (`BD`, `CE`, `IV`, `WP`, the `IP` pending-interrupt bits, ...) is modeled. Initialized to `0`. |
-| `cp0Epc` | `EPC` (CP0 register 14) | Set to the trapping instruction's own address (`pc` at the time of the trap/`break`, *not* `pc + 4`) on every exception. Initialized to `0`. |
+| `cp0Status` | `Status` (CP0 register 12) | Only bit 1 (`EXL`, exception level) is ever set by an exception, on any exception, and cleared by `eret`; no other bit (`IE`, `ERL`, `KSU`, `UM`, `BEV`, `IM7..IM0`, ...) is modeled. Readable/writable in full via `mfc0`/`mtc0 $rt, 12`. Initialized to `0`. |
+| `cp0Cause` | `Cause` (CP0 register 13) | Only the `ExcCode` field (bits 6..2) is ever written by an exception, as `excCode <<< 2`; no other field (`BD`, `CE`, `IV`, `WP`, the `IP` pending-interrupt bits, ...) is modeled. Readable/writable in full via `mfc0`/`mtc0 $rt, 13`. Initialized to `0`. |
+| `cp0Epc` | `EPC` (CP0 register 14) | Set to the trapping instruction's own address (`pc` at the time of the trap/`break`, *not* `pc + 4`) on every exception; read by `eret` to restore `pc`. Readable/writable in full via `mfc0`/`mtc0 $rt, 14`. Initialized to `0`. |
 
 **Explicitly out of scope** (documented here rather than silently omitted,
 per this track's process requirements): every other CP0 register (`Index`,
 `Random`, `EntryLo0/1`, `Context`, `PageMask`, `Wired`, `BadVAddr`, `Count`,
 `EntryHi`, `Compare`, `Config0-7`, `PRId`, `EBase`, ...), the full `Status`/
 `Cause` bitfields beyond `EXL`/`ExcCode`, interrupts (hardware or software),
-TLB/MMU behavior, `eret` (there is no way to leave exception level once
-entered — `EXL` is set and never cleared), and any notion of kernel/user
-mode. This model answers exactly one question: "did a trap/`break` fire,
-and where did control transfer to" — nothing more.
+TLB/MMU behavior, and any notion of kernel/user mode. This model answers one
+narrow question beyond "did a trap/`break` fire, and where did control
+transfer to": "can a kernel-style handler read/write the three CP0 registers
+this model has, and return from the exception it is handling" — nothing
+more. (`mfc0`/`mtc0`/`eret`/`wait`, documented in their own subsections
+below, close exactly that loop for the three registers that already exist;
+see `docs/spec/MIPS-COVERAGE-GAPS.md` §3.10A for why TLB/interrupt-mask
+support stays out of scope.)
 
 ### Exception mechanism (shared by all seven new instructions)
 
@@ -1244,6 +1336,104 @@ is just ordinary code at an ordinary (if high) address.
 - **Errors/halts**: none beyond the exception transition itself.
 - **MARS note**: not applicable, as for the trap family above.
 
+### mfc0 / mtc0 (R, COP0 generic register move) — v1.x addition
+
+A further v1.x addition on top of the `teq`/.../`break` trap model above,
+per `docs/spec/MIPS-COVERAGE-GAPS.md` §3.10A ("the OS-kernel-essential CP0
+instructions that don't require the much larger TLB/virtual-memory
+machinery"). Ground truth: MD00086 Rev 2.50 §3.2, Table 3-23, p. 31
+(`mfc0`/`mtc0`), the real MIPS32 ISA, not MARS (same sourcing discipline as
+the rest of this section).
+
+- **Encoding**: `opcode=010000` (0x10, COP0). Fields:
+  `010000 fffff ttttt ddddd 00000 000000` → `rt=ttttt` (the GPR), `rd=ddddd`
+  (the CP0 register number); `fff` (the `rs`-field format selector) is
+  `00000` (`MF` = 0x00) for `mfc0` and `00100` (`MT` = 0x04) for `mtc0`;
+  `shamt`/`funct` are unused/fixed 0. Assembly syntax: `mfc0 $rt, rd` /
+  `mtc0 $rt, rd`, where `rd` is a **plain numeric** CP0 register reference
+  (e.g. `mfc0 $t0, 12`) — this project has no named CP0 register aliases.
+- **Register scoping**: real MIPS32 has 32 CP0 registers (0-31, several with
+  multiple `sel` sub-registers); this project models exactly three
+  (`cp0Status`/`cp0Cause`/`cp0Epc`, at their real MIPS32 register numbers
+  12/13/14 — see the "Coprocessor 0 state modeled" table above). `rd=12`
+  maps to `cp0Status`, `rd=13` to `cp0Cause`, `rd=14` to `cp0Epc`; no other
+  CP0 register exists in this model, and no `sel` field is modeled (always
+  implicitly `sel=0`, the only `sel` any of these three registers has on
+  real hardware).
+- **Semantics**: `mfc0`: `$rt := ` the CP0 register named by `rd`. `mtc0`:
+  the CP0 register named by `rd := $rt`. Either direction, for any `rd`
+  other than 12/13/14 (i.e. every one of the other 29 real CP0 registers,
+  none of which exist in this model): **halts with
+  `HaltReason.illegalInstruction`**, rather than silently fabricating a `0`
+  read or silently dropping a write. This is a deliberate, documented
+  choice over the two alternatives the brief allowed (reading back `0`, or
+  halting): real hardware's behavior for an unmodeled register genuinely
+  varies by register (some read as reserved/garbage, some trap), so there
+  is no single "more realistic" fabricated value to return, and inventing
+  one risks silently masking a test program's bug; a clean, diagnosable
+  halt is the more honest choice for architecture this model has
+  deliberately placed out of scope (same judgment call the brief flagged as
+  the "more defensible" option).
+- **Errors/halts**: `HaltReason.illegalInstruction` for any `rd` other than
+  12/13/14, as above; otherwise none.
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  ground truth is the real MIPS32 ISA, per this section's sourcing
+  discipline.
+
+### eret (R, COP0 exception return) — v1.x addition
+
+Ground truth: MD00086 Rev 2.50 §3.2, Table 3-23, p. 31 (`eret`), the real
+MIPS32 ISA. This instruction closes the gap the original CP0 model left
+open (previously documented here as "there is no way to leave exception
+level once entered") for the three registers that model already has.
+
+- **Encoding**: `opcode=010000` (0x10, COP0), `rs`-field = `10000` (`CO`
+  = 0x10, the "coprocessor operation" sub-format, as opposed to the `MF`/
+  `MT` register-move sub-formats `mfc0`/`mtc0` use), `funct=011000` (0x18).
+  Zero operands; all other fields are 0
+  (`010000 10000 00000 00000 00000 011000`).
+- **Semantics**: `PC := cp0Epc`; `Status.EXL := 0` (bit 1, the same bit
+  `takeException` sets on exception entry — see the "Exception mechanism"
+  section above — cleared here, not just left set, which is the one state
+  change that actually lets a handler return to normal execution and take
+  a *second* exception later). **Real MIPS32 architectural note: `eret` is
+  not delay-slotted.** Every branch/jump in this project's v1+ scope
+  (`beq`/`bne`/`j`/`jal`/`jr`/`jalr`/etc.) has exactly one real-MIPS32
+  architectural delay slot (Global rule 3; `SPEC-NOTES.md` §9 item 1); real
+  MIPS32 `eret` is an explicit, documented exception to that general rule —
+  it takes effect immediately, with **no** delay slot of its own (MD00086
+  Rev 2.50 §3.2's `ERET` pseudocode transfers control on the same cycle,
+  unlike every delay-slotted branch/jump instruction in the same table).
+  This project's `step` therefore does not route `eret` through the
+  `pendingBranch` delay-slot machinery at all — a single `step` call lands
+  `pc` exactly on `cp0Epc`'s value.
+- **Errors/halts**: none; `eret` always succeeds (it has no out-of-scope
+  operand to reject, unlike `mfc0`/`mtc0`).
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  ground truth is the real MIPS32 ISA.
+
+### wait (R, COP0 enter standby mode) — v1.x addition
+
+Ground truth: MD00086 Rev 2.50 §3.2, Table 3-23, p. 32 (`wait`), the real
+MIPS32 ISA.
+
+- **Encoding**: `opcode=010000` (0x10, COP0), `rs`-field = `10000` (`CO` =
+  0x10, same sub-format as `eret`), `funct=100000` (0x20). Zero operands;
+  all other fields are 0 (`010000 10000 00000 00000 00000 100000`).
+- **Semantics**: real MIPS32 hardware halts the pipeline until an interrupt
+  arrives. **This simulator has no interrupt/timer model of any kind** (no
+  `Count`/`Compare` registers, no `Status.IM`/`Cause.IP` interrupt-mask/
+  pending bits — see the "Explicitly out of scope" list above), so there is
+  nothing for `wait` to meaningfully wait *for*. This is therefore modeled
+  as a **documented no-op**: it falls through to `PC_next` exactly like any
+  other non-control-flow instruction, via the same `mkNext` path every
+  arithmetic/logic instruction uses. This is a deliberate simplification
+  flagged explicitly, not a silent pretense that idle/standby behavior is
+  modeled.
+- **Errors/halts**: none.
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  ground truth is the real MIPS32 ISA.
+
 ## Flagged MARS deviations (summary)
 
 1. **`div`/`divu` by zero**: no exception, `hi`/`lo` left unchanged
@@ -1254,7 +1444,7 @@ is just ordinary code at an ordinary (if high) address.
    jumps to the target immediately with no delay-slot instruction executed.
    Our semantics does **not** follow that default: it implements real
    MIPS32's architecturally-mandated one-instruction delay slot instead
-   (Global rule 3; SPEC-NOTES \u00a79 item 1) \u2014 the one case in this reference
+   (Global rule 3; SPEC-NOTES \u00a79 item 1) — the one case in this reference
    where we deliberately diverge from MARS's default configuration rather
    than documenting it as a quirk to match.
 3. **`lw`/`sw` offset sign-extension asymmetry** (flagged as a source
@@ -1328,12 +1518,25 @@ consulted as ground truth for this section.
   according to the current FCSR rounding mode (default: round-to-nearest,
   ties-to-even), since there is no `FCSR` in this project's scope. This is a
   deliberate, documented simplification, not an oversight.
-- **Only `ADD.S`/`SUB.S`/`MUL.S`/`DIV.S`/`MOV.S`** of the arithmetic-format
-  instructions are implemented; `SQRT.S`, `ABS.S`, `NEG.S`, and the
-  `ROUND`/`TRUNC`/`CEIL`/`FLOOR` family are out of scope for this pass.
-- **Only `C.EQ.S`/`C.LT.S`/`C.LE.S`** of the sixteen `C.cond.S` compares are
-  implemented (the three most common; the rest — `C.UN.S`, `C.OLE.S`, etc. —
-  are out of scope).
+- **`ADD.S`/`SUB.S`/`MUL.S`/`DIV.S`/`MOV.S`/`SQRT.S`/`ABS.S`/`NEG.S`** are all
+  implemented, along with the directed-rounding-to-integer family
+  (`ROUND.W.S`/`TRUNC.W.S`/`CEIL.W.S`/`FLOOR.W.S`; this pass — see the
+  "Encoding summary" table and its notes below). `ABS.S`/`NEG.S` are modeled
+  as raw sign-bit operations (clear/flip bit 31), not `Float32` arithmetic —
+  see `Instruction.absS`/`negS`'s docstrings.
+- **10 of the sixteen `C.cond.S` compares are implemented**: `C.EQ.S`/
+  `C.LT.S`/`C.LE.S` (original v1.x addition) plus `C.F.S`/`C.UN.S`/`C.UEQ.S`/
+  `C.OLT.S`/`C.ULT.S`/`C.OLE.S`/`C.ULE.S` (this pass, cond numbers 0/1/3/4/5/
+  6/7 — see "Encoding summary" and "Scope note: predicates not implemented"
+  below). The 6 remaining predicates are the
+  *signaling* counterparts of `C.UN.S`/`C.EQ.S`/`C.UEQ.S`/`C.ULT.S`/
+  `C.ULE.S` (`C.SF.S`/`C.SEQ.S`/`C.NGLE.S`/`C.NGL.S`/`C.NGE.S`/`C.NGT.S`,
+  cond numbers 8/9/10/11/13/15) — out of scope, since this model has no
+  FP-exception mechanism to distinguish a signaling predicate's behavior
+  from its already-implemented quiet counterpart's.
+- **`CFC1`/`CTC1`** (GPR↔FPU-control-register move; this pass, see the
+  "Encoding summary" notes below) are implemented with no actual FCSR/FIR
+  semantics behind them (documented simplification, not an oversight).
 
 ### Register/state model
 
@@ -1361,13 +1564,91 @@ consulted as ground truth for this section.
 | `mul.s $fd, $fs, $ft` | fmt=S, funct=0x02 | `$fd = $fs * $ft` |
 | `div.s $fd, $fs, $ft` | fmt=S, funct=0x03 | `$fd = $fs / $ft`; `$ft=0` → ±Inf/NaN, no trap |
 | `mov.s $fd, $fs` | fmt=S, funct=0x06 | `$fd = $fs`, raw copy |
+| `sqrt.s $fd, $fs` | fmt=S, funct=0x04 | `$fd = sqrt($fs)` (IEEE-754, via `Float32.sqrt`/`sqrtf`) |
+| `abs.s $fd, $fs` | fmt=S, funct=0x05 | `$fd = $fs` with sign bit (31) cleared; raw bit op |
+| `neg.s $fd, $fs` | fmt=S, funct=0x07 | `$fd = $fs` with sign bit (31) flipped; raw bit op |
 | `cvt.s.w $fd, $fs` | fmt=`W`=0x14, funct=0x20 | `$fd = float32(int32bits($fs))` |
 | `cvt.w.s $fd, $fs` | fmt=S, funct=0x24 | `$fd = int32bits(trunc($fs))` |
-| `c.eq.s $fs, $ft` | fmt=S, funct=0x32, cc=0 | `fpCondFlag := ($fs == $ft)` |
-| `c.lt.s $fs, $ft` | fmt=S, funct=0x3c, cc=0 | `fpCondFlag := ($fs < $ft)` |
-| `c.le.s $fs, $ft` | fmt=S, funct=0x3e, cc=0 | `fpCondFlag := ($fs <= $ft)` |
+| `round.w.s $fd, $fs` | fmt=S, funct=0x0c | `$fd = int32bits(round($fs))`; ties away from zero (`Float32.round`/`roundf`, **not** real MIPS32's ties-to-even — documented divergence) |
+| `trunc.w.s $fd, $fs` | fmt=S, funct=0x0d | `$fd = int32bits(trunc($fs))`; numerically identical to `cvt.w.s` under this model |
+| `ceil.w.s $fd, $fs` | fmt=S, funct=0x0e | `$fd = int32bits(ceil($fs))` (`Float32.ceil`/`ceilf`) |
+| `floor.w.s $fd, $fs` | fmt=S, funct=0x0f | `$fd = int32bits(floor($fs))` (`Float32.floor`/`floorf`) |
+| `c.f.s $fs, $ft` | fmt=S, funct=0x30, cc=0, cond=0 | `fpCondFlag := false` |
+| `c.un.s $fs, $ft` | fmt=S, funct=0x31, cc=0, cond=1 | `fpCondFlag := isNaN($fs) ∨ isNaN($ft)` ("unordered") |
+| `c.eq.s $fs, $ft` | fmt=S, funct=0x32, cc=0, cond=2 | `fpCondFlag := ($fs == $ft)` |
+| `c.ueq.s $fs, $ft` | fmt=S, funct=0x33, cc=0, cond=3 | `fpCondFlag := ($fs == $ft) ∨ unordered` |
+| `c.olt.s $fs, $ft` | fmt=S, funct=0x34, cc=0, cond=4 | `fpCondFlag := ¬unordered ∧ ($fs < $ft)` |
+| `c.ult.s $fs, $ft` | fmt=S, funct=0x35, cc=0, cond=5 | `fpCondFlag := ($fs < $ft) ∨ unordered` |
+| `c.ole.s $fs, $ft` | fmt=S, funct=0x36, cc=0, cond=6 | `fpCondFlag := ¬unordered ∧ ($fs <= $ft)` |
+| `c.ule.s $fs, $ft` | fmt=S, funct=0x37, cc=0, cond=7 | `fpCondFlag := ($fs <= $ft) ∨ unordered` |
+| `c.lt.s $fs, $ft` | fmt=S, funct=0x3c, cc=0, cond=12 | `fpCondFlag := ($fs < $ft)` |
+| `c.le.s $fs, $ft` | fmt=S, funct=0x3e, cc=0, cond=14 | `fpCondFlag := ($fs <= $ft)` |
+| `cfc1 $rt, $fs` | opcode 0x11, `rs`-position=`CF`=0x02 | `$rt = fpRegs[$fs]` (scratch-slot model, see below) |
+| `ctc1 $rt, $fs` | opcode 0x11, `rs`-position=`CT`=0x06 | `fpRegs[$fs] = $rt` (scratch-slot model, see below) |
 | `bc1t target` | opcode 0x11, fmt=`BC1`=0x08, tf=1 | `if fpCondFlag: PC = PC_next + (offset<<2)` |
 | `bc1f target` | fmt=BC1, tf=0 | `if !fpCondFlag: PC = PC_next + (offset<<2)` |
+
+Notes on the rows above:
+
+- **`sqrt.s`** is computed via Lean core's `Float32.sqrt` (`@[extern
+  "sqrtf"]`), correctly-rounded IEEE-754 single-precision square root.
+- **`abs.s`/`neg.s`** are implemented as raw bit operations (`&&& 0x7fffffff`
+  / `^^^ 0x80000000`) in `Step.lean`, not `Float32` arithmetic — clearing/
+  flipping the sign bit is exact for every bit pattern (including `NaN`),
+  so there is no rounding/NaN question to resolve.
+- **`round.w.s`** uses Lean core's `Float32.round` (`roundf`), which rounds
+  ties **away from zero**. Real MIPS32 always rounds `ROUND.W.fmt` to
+  nearest with **ties-to-even**, regardless of the FCSR rounding mode. Lean
+  core exposes no ties-to-even float-to-float rounding primitive, so this is
+  a documented divergence from the real hardware (only observable at exact
+  tie values like `2.5`), in the same spirit as `cvt.w.s`'s pre-existing
+  FCSR-rounding-mode simplification.
+- **`trunc.w.s`** is numerically **identical** to the pre-existing `cvt.w.s`
+  under this model: both truncate toward zero via `Float32.toInt32`
+  (`cvt.w.s`'s truncating behavior was already a documented simplification
+  of real MIPS32, where it would instead honor the current FCSR rounding
+  mode). Two constructors/mnemonics are kept because they are genuinely
+  distinct real-MIPS32 encodings, not because the model needs two separate
+  implementations.
+- **`c.olt.s`/`c.ole.s`** are numerically **identical** to the pre-existing
+  `c.lt.s`/`c.le.s` under this model: `Float32.lt`/`Float32.le` already
+  return `false` for any NaN operand (IEEE-754-correct), so they already
+  compute exactly the ordered-less-than/ordered-less-or-equal predicates.
+  The *only* real-hardware difference between `c.lt.s` (cond 12, the
+  signaling `LT` variant) and `c.olt.s` (cond 4, the quiet `OLT` variant) is
+  whether a quiet-NaN operand raises an Invalid Operation exception; since
+  this model has no FP-exception mechanism for either, both constructors
+  compute the same `fpCondFlag` value. Same relationship for `c.le.s`
+  (cond 14, `LE`) vs. `c.ole.s` (cond 6, `OLE`).
+- **`c.un.s`/`c.ult.s`/`c.ule.s`** are built from `Float32.isNaN` explicitly
+  in `Step.lean`, **not** derived from `<`/`<=` — Lean core's `Float32`
+  `<`/`<=` operators already return `false` for any NaN operand (the
+  IEEE-754-correct behavior for ordered comparisons), so naively deriving
+  "unordered" from them (e.g. `!(a < b) && !(b < a)`) would silently be
+  wrong; these three predicates instead read `isNaN` directly to get the
+  IEEE-754 "unordered" semantics exactly right.
+- **`cfc1`/`ctc1`** have **no FCSR/FIR control-register semantics** behind
+  them — this project models no FPU control/status register state at all.
+  Per this track's brief, the simplest available option was chosen: both
+  instructions read/write the *same* `State.fpRegs` array the data
+  instructions use (so `cfc1 $rt, $f31` / `ctc1 $rt, $f31` move `$rt`
+  to/from an ordinary addressable 32-bit scratch slot, register 31
+  conventionally standing in for `FCSR`), with no rounding-mode or
+  exception-sticky-bit behavior actually implemented behind it. This is a
+  deliberate simplification, not an oversight.
+
+### Scope note: predicates not implemented
+
+The 6 "signaling" `C.cond.S` predicates not implemented by this pass —
+`c.sf.s` (cond 8), `c.ngle.s` (cond 9), `c.seq.s` (cond 10), `c.ngl.s`
+(cond 11), `c.nge.s` (cond 13), `c.ngt.s` (cond 15) — are the signaling
+counterparts of `c.un.s`/`c.eq.s`/`c.ueq.s`/`c.ult.s`/`c.ule.s`. On real
+hardware they differ from their quiet counterparts only in raising an
+Invalid Operation exception on a quiet-NaN operand; since this model has no
+FP-exception mechanism, implementing them would require duplicating an
+already-implemented predicate's `fpCondFlag` formula under a new name with
+no observable behavioral difference. This is the one documented cut from
+this pass's assigned priority list.
 
 Field layout for the arithmetic/compare format (`add.s` etc.): opcode(31-26)
 = 0x11, `fmt`(25-21), `ft`(20-16), `fs`(15-11), `fd`(10-6), `funct`(5-0) — the
@@ -1381,22 +1662,37 @@ to `lw`/`sw`. `bc1t`/`bc1f` are also I-type-shaped: opcode 0x11, `rs`-position
 field = `BC1` sub-opcode `0x08`, `rt`-position field holds `cc`(bits 4-2,
 forced 0)/`nd`(bit 1, forced 0)/`tf`(bit 0) — so the whole `rt`-position field
 is exactly `0` (`bc1f`) or `1` (`bc1t`) in this subset — and a 16-bit
-sign-extended branch offset, exactly like `beq`/`bne`.
+sign-extended branch offset, exactly like `beq`/`bne`. `sqrt.s`/`abs.s`/
+`neg.s`/`round.w.s`/`trunc.w.s`/`ceil.w.s`/`floor.w.s` share `mov.s`'s
+unary layout (`fmt`/`fs`/`fd`/`funct` populated, `ft`-position fixed 0).
+`c.f.s`/`c.un.s`/`c.ueq.s`/`c.olt.s`/`c.ult.s`/`c.ole.s`/`c.ule.s` share
+`c.eq.s`/`c.lt.s`/`c.le.s`'s compare layout (`fd`-position holds `cc`, forced
+0). `cfc1`/`ctc1` share `mfc1`/`mtc1`'s exact field shape, differing only in
+the `rs`-position sub-opcode (`CF`=0x02/`CT`=0x06 vs `MF`=0x00/`MT`=0x04).
 
 ### Citation
 
 Standard MIPS32 instruction-set architecture (the public "MIPS32 Architecture
 For Programmers" reference manual family, Volume II-A, "The MIPS32
-Instruction Set" — the COP1/FPU chapter). All opcode/fmt/funct values above
-(COP1 = 0x11, `LWC1`/`SWC1` = 0x31/0x39, `fmt` codes `MF`=0, `MT`=4, `BC1`=8,
-`S`=0x10, `W`=0x14, and `funct` codes 0x00/0x01/0x02/0x03/0x06/0x20/0x24 and
-the `C.cond.fmt` family `0x30 | cond` with `cond(EQ)=2`, `cond(LT)=12`,
-`cond(LE)=14`) are the standard, invariant MIPS32 COP1 encodings, not
-MARS-specific or implementation-chosen values. No internet access was used to
-write this section; these are well-established, memorized ISA constants, and
-any single value a future reader doubts should be cross-checked against a
-primary MIPS32 ISA reference before relying on it for anything beyond this
-simulator.
+Instruction Set" — the COP1/FPU chapter, MD00086 §3.2). All opcode/fmt/funct
+values above (COP1 = 0x11, `LWC1`/`SWC1` = 0x31/0x39, `fmt` codes `MF`=0,
+`MT`=4, `CF`=2, `CT`=6, `BC1`=8, `S`=0x10, `W`=0x14, and `funct` codes
+0x00/0x01/0x02/0x03/0x04/0x05/0x06/0x07/0x0c/0x0d/0x0e/0x0f/0x20/0x24 and the
+`C.cond.fmt` family `0x30 | cond` with `cond(F)=0`, `cond(UN)=1`,
+`cond(EQ)=2`, `cond(UEQ)=3`, `cond(OLT)=4`, `cond(ULT)=5`, `cond(OLE)=6`,
+`cond(ULE)=7`, `cond(LT)=12`, `cond(LE)=14`) are the standard, invariant
+MIPS32 COP1 encodings, not MARS-specific or implementation-chosen values. No
+internet access was used to write this section; these are well-established,
+memorized ISA constants, and any single value a future reader doubts should
+be cross-checked against a primary MIPS32 ISA reference before relying on it
+for anything beyond this simulator. The one genuine uncertainty flagged in
+this pass: `cfc1`/`ctc1`'s `rs`-position sub-opcode values (`CF`=0x02,
+`CT`=0x06) are memorized from the standard MIPS32 COP1 field layout and were
+not independently re-derived from a primary source during this pass (no
+internet access); they match this track's brief and are believed correct,
+but a future reader with ISA-reference access should double-check them
+before relying on this simulator's `cfc1`/`ctc1` encoding for anything
+beyond this project's own test suite.
 
 ---
 
@@ -1613,3 +1909,275 @@ to write this section; these are well-established, memorized ISA constants
 and any single value a future reader doubts should be cross-checked against
 a primary MIPS32 ISA reference before relying on it for anything beyond this
 simulator.
+
+## Integer multiply-accumulate and HI/LO register moves (v1.x addition)
+
+This section documents a v1.x addition: the real MIPS32 integer multiply-
+accumulate family (`madd`, `maddu`, `msub`, `msubu`) and the write-direction
+HI/LO register moves (`mthi`, `mtlo` — the counterparts to the existing
+`mfhi`/`mflo`). Per `docs/spec/MIPS-COVERAGE-GAPS.md` §3.5, `madd`/`maddu`/
+`msub`/`msubu` are the core loop instruction in DSP filters, vector
+dot-products, and numerical libraries, and `mthi`/`mtlo` are mandatory for OS
+context switching and setjmp/longjmp to save/restore the `hi`/`lo` registers
+(this project already modeled the read direction, `mfhi`/`mflo`, but not the
+write direction). **Grounding note**: like the other v1.x additions above,
+all six are grounded directly in the **standard MIPS32 architecture** —
+specifically MD00086 ("MIPS32 Architecture For Programmers, Volume II-A: The
+MIPS32 Instruction Set"), §3.2, Table 3-1 (`MADD`/`MADDU`/`MSUB`/`MSUBU`) and
+Table 3-7 (`MTHI`/`MTLO`) — not MARS-specific behavior; MARS is this
+project's differential-testing oracle, not the spec source.
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `madd $rs, $rt` | R (SPECIAL2) | `{hi,lo} += $rs * $rt`, signed 64-bit |
+| `maddu $rs, $rt` | R (SPECIAL2) | `{hi,lo} += $rs * $rt`, unsigned 64-bit |
+| `msub $rs, $rt` | R (SPECIAL2) | `{hi,lo} -= $rs * $rt`, signed 64-bit |
+| `msubu $rs, $rt` | R (SPECIAL2) | `{hi,lo} -= $rs * $rt`, unsigned 64-bit |
+| `mthi $rs` | R (SPECIAL) | `hi = $rs` |
+| `mtlo $rs` | R (SPECIAL) | `lo = $rs` |
+
+### madd (R, SPECIAL2)
+
+- **Encoding**: `opcode=011100` (0x1c, SPECIAL2, same opcode as `clo`/`clz`/
+  `mul`), `funct=000000` (0x00). Fields: `011100 sssss ttttt 00000 00000
+  000000` → `rs=sssss`, `rt=ttttt`; `rd`/`shamt` unused (always 0) — the
+  same `rs, rt`-only shape as the existing `mult`/`div` (no `rd` field is
+  written directly).
+- **Semantics**: Multiply and Add Word to HI/LO. Forms the signed 64-bit
+  product `$rs * $rt` exactly like `mult` does (both operands sign-extended
+  to 64 bits before multiplying), then **adds** that product to the
+  *existing* `{hi,lo}` 64-bit pair, rather than overwriting it the way
+  `mult` does: `{hi,lo} := {hi,lo} + ($rs * $rt)` as a 64-bit addition,
+  with `hi` the high 32 bits and `lo` the low 32 bits of the result.
+- **Errors/halts**: none; no overflow trap. Matching `mult`'s existing
+  non-trapping precedent (see `mult` entry above), the 64-bit accumulator
+  wraps on overflow like any other fixed-width arithmetic in this model —
+  real MIPS32 hardware has no overflow-trap concept for this instruction
+  either.
+- **ISA note**: standard MIPS32 instruction (present since MIPS32 Release 1).
+  The canonical use is a DSP-style multiply-accumulate loop (`for` loop
+  computing a dot product or FIR filter tap), where each iteration's
+  `madd $a, $b` adds one more product into a running 64-bit sum without an
+  intervening `mflo`/`add`/`mthi` round trip through a GPR.
+
+### maddu (R, SPECIAL2)
+
+- **Encoding**: `opcode=011100` (0x1c), `funct=000001` (0x01). Same field
+  layout as `madd`.
+- **Semantics**: Multiply and Add Unsigned Word to HI/LO. Same as `madd`,
+  but the product is formed from the **unsigned** 64-bit zero-extension of
+  `$rs`/`$rt` (mirroring `multu`): `{hi,lo} := {hi,lo} + (unsigned($rs) *
+  unsigned($rt))`. The addition itself is plain 64-bit wraparound arithmetic
+  either way — only the product's formation differs between the signed and
+  unsigned variants.
+- **Errors/halts**: none; same non-trapping precedent as `madd`/`multu`.
+- **ISA note**: standard MIPS32 instruction. Used for unsigned dot-products
+  and big-integer multiply-accumulate routines.
+
+### msub (R, SPECIAL2)
+
+- **Encoding**: `opcode=011100` (0x1c), `funct=000100` (0x04). Same field
+  layout as `madd`.
+- **Semantics**: Multiply and Subtract Word to HI/LO. Forms the signed
+  64-bit product `$rs * $rt` exactly like `madd`, but **subtracts** it from
+  the existing `{hi,lo}` pair instead of adding: `{hi,lo} := {hi,lo} -
+  ($rs * $rt)`, a 64-bit subtraction with the same wraparound-on-underflow
+  behavior as `madd`'s wraparound-on-overflow.
+- **Errors/halts**: none; same non-trapping precedent as `madd`.
+- **ISA note**: standard MIPS32 instruction. Used in DSP filter routines
+  that need to subtract a tap's contribution from a running accumulator.
+
+### msubu (R, SPECIAL2)
+
+- **Encoding**: `opcode=011100` (0x1c), `funct=000101` (0x05). Same field
+  layout as `madd`.
+- **Semantics**: Multiply and Subtract Unsigned Word to HI/LO. Same as
+  `msub`, but the product is formed unsigned, mirroring `maddu`/`multu`:
+  `{hi,lo} := {hi,lo} - (unsigned($rs) * unsigned($rt))`.
+- **Errors/halts**: none; same non-trapping precedent as `msub`.
+- **ISA note**: standard MIPS32 instruction. Unsigned counterpart to `msub`.
+
+### mthi (R)
+
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=010001` (0x11 — the next
+  funct value immediately after `mfhi`'s 0x10, the same kind of adjacency
+  as `syscall`'s 0x0c/`break`'s 0x0d). Fields: `000000 sssss 00000 00000
+  00000 010001` → `rs=sssss`(source register); `rt`/`rd`/`shamt` unused
+  (always 0) — the same one-operand `rs`-only shape as `jr`.
+- **Semantics**: Move to HI Register. `hi := $rs`. No GPR is written; `lo`
+  is left unchanged.
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32 instruction (present since MIPS I). The
+  write-direction counterpart to the already-implemented `mfhi`. Mandatory
+  for OS context-switch code and `setjmp`/`longjmp` implementations that
+  must save and later restore the `hi`/`lo` registers around arbitrary
+  multiply/divide usage elsewhere in a program (MD00086 §3.2, Table 3-7).
+
+### mtlo (R)
+
+- **Encoding**: `opcode=000000` (SPECIAL), `funct=010011` (0x13 — the next
+  funct value immediately after `mflo`'s 0x12). Same field layout as
+  `mthi`.
+- **Semantics**: Move to LO Register. `lo := $rs`. No GPR is written; `hi`
+  is left unchanged.
+- **Errors/halts**: none.
+- **ISA note**: standard MIPS32 instruction. The write-direction counterpart
+  to `mflo`, same context-switch/`setjmp`/`longjmp` rationale as `mthi`.
+## MIPS32r2 rotate and bitfield extract/insert (v1.x addition)
+
+This section documents a v1.x addition: five more real MIPS32r2 instructions
+(`rotr`, `rotrv`, `ext`, `ins`, `wsbh`) added on top of the v1 scope and the
+previous v1.x addition sections above. Per `docs/spec/MIPS-COVERAGE-GAPS.md`
+§3.4, `ext`/`ins` are ubiquitous in MIPS32r2-compiled C for struct bitfields
+and protocol decoding, `rotr`/`rotrv` are common in cryptographic hash
+implementations, and `wsbh` is common in endianness-conversion pipelines.
+**Grounding note**: like the other v1.x addition sections, this is grounded
+directly in the **real MIPS32r2 architecture** — specifically MD00086 ("MIPS32
+Architecture For Programmers, Volume II-A: The MIPS32 Instruction Set"),
+Rev 2.50, §3.2 — not MARS-specific behavior.
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `rotr $rd, $rt, sa` | R (overloaded `srl`) | `$rd = $rt` rotated right by constant `sa` |
+| `rotrv $rd, $rt, $rs` | R (overloaded `srlv`) | `$rd = $rt` rotated right by `$rs & 0x1f` |
+| `ext $rt, $rs, pos, size` | R (SPECIAL3) | `$rt = zext($rs[pos+size-1 .. pos])` |
+| `ins $rt, $rs, pos, size` | R (SPECIAL3) | `$rt[pos+size-1 .. pos] = $rs[size-1 .. 0]`, rest of `$rt` unchanged |
+| `wsbh $rd, $rt` | R (SPECIAL3/BSHFL) | swap bytes within each halfword of `$rt` independently |
+
+### rotr (R) / rotrv (R)
+
+- **Encoding**: `rotr` shares `srl`'s opcode (`000000`, SPECIAL) and funct
+  (`000010`, 0x02); `rotrv` shares `srlv`'s opcode (SPECIAL) and funct
+  (`000110`, 0x06). Real MIPS32r2 distinguishes rotate from shift by
+  overloading a field that is otherwise unused/fixed-zero in the plain-shift
+  encodings: for `rotr` (shift-by-constant format), the normally-`00000`
+  `rs` field (bits 25-21) is set to `00001`; for `rotrv` (shift-by-register
+  format), the normally-`00000` `shamt` field (bits 10-6) is set to `00001`.
+  Everything else matches `srl`/`srlv`'s field layout exactly (`rotr`:
+  `rd rt sa`; `rotrv`: `rd rt rs`). This is a **new decode/encode branch
+  added alongside** the existing `srl`/`srlv` handling, not a replacement —
+  a word with `rs=0`/`shamt=0` still decodes to plain `srl`/`srlv`.
+- **Semantics**: Rotate Word Right (`rotr`) / Rotate Word Right Variable
+  (`rotrv`). Bits shifted off the bottom wrap around to fill the top — this
+  is the one bit that distinguishes rotate from `srl`/`srlv`'s **zero-fill**
+  on the exact same input. Worked example: `rotr $t0, $t1, 4` with
+  `$t1 = 0x12345678` gives `$t0 = 0x81234567` (the low nibble `0x8` wraps
+  around to the top byte), whereas `srl $t0, $t1, 4` on the same input gives
+  `$t0 = 0x01234567` (zero-fill instead). `rotrv`'s rotate amount is `$rs`'s
+  low 5 bits, masked exactly like `sllv`/`srlv`/`srav`'s shift amount (e.g.
+  `$rs = 36` behaves identically to `$rs = 4`).
+- **Errors/halts**: none.
+- **ISA note**: MIPS32r2 instruction (not present in MIPS32 Release 1).
+  MD00086 §3.2, Table 3-8 (p. 27, entries 245 `ROTR` and 246 `ROTRV`).
+
+### ext (R, SPECIAL3)
+
+- **Encoding**: `opcode=011111` (0x1f, SPECIAL3), `funct=000000` (0x00).
+  Fields: `011111 sssss ttttt mmmmm lllll 000000` → `rs=sssss` (source),
+  `rt=ttttt` (destination), and two compile-time constants packed into the
+  remaining fields: `lsb` (bits 10-6, this project's `shamt`-position field)
+  is `pos` directly; `msbd` (bits 15-11, this project's `rd`-position field)
+  is `size - 1` — **not** `size` itself (the real MIPS32 ISA pseudocode
+  computes `size = msbd + 1`, so `Instruction.decode`/`encode` do this `±1`
+  arithmetic so that `Step.lean` only ever sees the semantic `pos`/`size`
+  pair directly, the same way this codebase already hides `clo`/`clz`'s
+  duplicated-rt-field quirk).
+- **Semantics**: Extract Bit Field. `$rt = zero-extend($rs[pos+size-1 ..
+  pos])` — a `size`-bit field starting at bit `pos` of `$rs`, zero-extended
+  into `$rt`. Worked example: `ext $t0, $t1, 6, 10` with
+  `$t1 = 0x12345678` extracts the 10-bit field at bits [15:6]
+  (`(0x12345678 >> 6) & 0x3ff`), giving `$t0 = 0x159`.
+- **Real hardware constraint**: `pos + size <= 32` is required; violating it
+  is architecturally `UNPREDICTABLE`. This simulator makes **no special
+  case** for the violation — `Step.lean`'s `execInstr` just computes
+  whatever the plain bit-shift-and-mask arithmetic implies, per this
+  track's brief — but the assembler (`Asm.lean`) does reject out-of-range
+  `pos`/`size`/`pos+size` at assembly time, the same way it already rejects
+  an out-of-range `shamt` for `sll`/`srl`/`sra`.
+- **Errors/halts**: none at execution time (see above).
+- **ISA note**: MIPS32r2 instruction. MD00086 §3.2, Table 3-6 (p. 26,
+  entry 140 `EXT`).
+
+### ins (R, SPECIAL3)
+
+- **Encoding**: `opcode=011111` (0x1f, SPECIAL3), `funct=000100` (0x04).
+  Same `rs`/`rt`/`lsb` field roles as `ext` (`lsb` = `pos`), but the
+  `rd`-position field (bits 15-11, called `msb` for this instruction) holds
+  a **different** quantity than `ext`'s `msbd`: `msb = pos + size - 1` (the
+  real MIPS32 ISA pseudocode sets `lsb = pos; msb = pos + size - 1`). This
+  is a genuinely different field computation from `ext`'s `size - 1`, not a
+  typo — `Instruction.decode`/`encode` do the matching `±1` arithmetic for
+  each instruction separately.
+- **Semantics**: Insert Bit Field. Inserts the low `size` bits of `$rs` into
+  `$rt` starting at bit `pos`; bits of `$rt` **outside** `[pos+size-1 ..
+  pos]` are left completely unchanged (the same "partially update a
+  register" shape as `movn`/`movz`, though the bit-level masking here is
+  new). Worked example: `ins $t0, $t1, 6, 10` with `$t1 = 0x159` and
+  `$t0 = 0x12345678` beforehand re-inserts exactly the field `ext` extracted
+  above, reproducing `$t0 = 0x12345678` unchanged — `ext`/`ins` round-trip
+  by construction. A second example starting from `$t0 = 0`: with
+  `$t1 = 0xfffffc01` (`size = 10`, so only the low 10 bits `0x001` are
+  used, the rest of `$t1` is ignored), `ins $t0, $t1, 6, 10` gives
+  `$t0 = 0x00000040` (`0x001 << 6`) — the bits of `$t0` outside `[15:6]`
+  stay `0`, demonstrating the "unchanged outside the field" guarantee.
+- **Real hardware constraint**: same `pos + size <= 32` note as `ext`.
+- **Errors/halts**: none.
+- **ISA note**: MIPS32r2 instruction. MD00086 §3.2, Table 3-6 (p. 26,
+  entry 148 `INS`).
+
+### wsbh (R, SPECIAL3/BSHFL)
+
+- **Encoding**: `opcode=011111` (0x1f, SPECIAL3), `funct=100000` (0x20) —
+  the same BSHFL funct family as the already-implemented `seb`/`seh`,
+  distinguished by the shamt-position sub-field: `seb` is `0x10`, `seh` is
+  `0x18`, `wsbh` is `0x02` (`rs` unused/fixed 0, same as `seb`/`seh`). This
+  is a **new case added alongside** the existing `seb`/`seh` dispatch on
+  that sub-field, not a replacement.
+- **Semantics**: Word Swap Bytes Within Halfwords. Swaps the byte order
+  **within** each 16-bit half of `$rt` independently (byte 0 ↔ byte 1,
+  byte 2 ↔ byte 3) — the two halfwords themselves stay in their original
+  word positions. This is **not** a full 32-bit byte-reverse; that needs
+  `wsbh` followed by `rotr $rd, $rd, 16` (swap bytes within each halfword,
+  then swap the halfwords themselves), the standard MIPS32r2
+  endianness-conversion idiom — `wsbh` alone does not do this. Worked
+  example: `wsbh $t0, $t1` with `$t1 = 0x12345678` gives `$t0 =
+  0x34127856` (halfword `0x5678` → `0x7856`; halfword `0x1234` → `0x3412`;
+  halfword *positions* unchanged).
+- **Errors/halts**: none.
+- **ISA note**: MIPS32r2 instruction. MD00086 §3.2, Table 3-6 (p. 26,
+  entry 321 `WSBH`).
+
+### Citation
+
+"MIPS32 Architecture For Programmers, Volume II-A: The MIPS32 Instruction
+Set" (MD00086, Rev 2.50), §3.2: Table 3-1 (p. 24) for `MADD` (entry 182),
+`MADDU` (entry 184), `MSUB` (entry 209), and `MSUBU` (entry 211) — all four
+SPECIAL2-opcoded (0x1c) with `funct` 0x00/0x01/0x04/0x05 respectively, same
+opcode family as the already-implemented `MUL`/`CLO`/`CLZ`; Table 3-7 (p. 27)
+for `MTHI` (entry 215) and `MTLO` (entry 216) — both SPECIAL-opcoded
+(opcode 0) with `funct` 0x11/0x13, the funct values immediately following
+`MFHI`'s 0x10/`MFLO`'s 0x12. No internet access was used to write this
+section; these are well-established, memorized ISA constants,
+cross-referenced against `docs/spec/MIPS-COVERAGE-GAPS.md`'s independent
+research pass (§3.5, which cites the same table/page/entry numbers) before
+being relied upon here. As with every hand-encoded constant in this project,
+any single value a future reader doubts should be cross-checked against a
+primary MIPS32 ISA reference before relying on it for anything beyond this
+simulator.
+Set" (MD00086, Rev 2.50), §3.2: Table 3-8 (p. 27, entries 245/246) for
+`ROTR`/`ROTRV`'s opcode/funct encodings and rotate pseudocode; Table 3-6
+(p. 26, entries 140/148/321) for `EXT`/`INS`/`WSBH`'s SPECIAL3 opcode
+(0x1f) and funct (0x00/0x04/0x20) encodings and their bitfield/byte-swap
+pseudocode. No internet access was used to write this section; these are
+well-established, memorized ISA constants, cross-referenced against
+`docs/spec/MIPS-COVERAGE-GAPS.md`'s independent research pass (§3.4, which
+cites the same table/page/entry numbers) before being relied upon here.
+**One detail flagged for independent double-checking**: the `EXT`/`INS`
+`msbd`/`msb` field encodings above (`size - 1` for `ext`, `pos + size - 1`
+for `ins`) are reconstructed from memorized MD00086 pseudocode
+(`pos = lsb; size = msbd + 1` for `EXT`, `lsb = pos; msb = pos + size - 1`
+for `INS`) rather than verified against a primary source in this
+no-internet-access environment; the `decode (encode i) = some i` round-trip
+tests in `Instruction.lean` confirm the two fields are mutually consistent
+within this codebase, but do not by themselves prove the packing matches
+real MIPS32r2 silicon bit-for-bit.
