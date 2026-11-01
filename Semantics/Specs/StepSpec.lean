@@ -1234,6 +1234,52 @@ theorem movn_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
   dsimp only
   rfl
 
+/-! ## Group 5 — remaining memory instructions (`sw`, `lh`, `lhu`, `sh`, `ll`, `sc`)
+
+Same `lw`/`lb`/`lbu`-style raw specs (Group 2), for the rest of the memory
+instruction set. Each one restates its `step` case with public names
+(`readMemHalf`/`writeMemWord`/`writeMemHalf`, …), halting with
+`addressError` on a misaligned effective address exactly like `lw`/`lb` do,
+and is backed by a concrete `#guard` witness in the same style as Group 3.
+
+`lwl`/`lwr`/`swl`/`swr` (the unaligned-load/store family) are **not covered
+here**: they are not implemented anywhere in this codebase.  There is no
+`Instruction.lwl`/`.lwr`/`.swl`/`.swr` constructor in `Instruction.lean` and
+no corresponding case in `Step.lean`'s `execInstr` — `docs/spec/
+MIPS-COVERAGE-GAPS.md` §3.6 lists all four as an explicit, documented
+coverage gap ("Unaligned Memory Access (Classic MIPS Feature)"), not an
+oversight. There is therefore no `Instruction` value to write a theorem
+statement about and no closed example to fall back on either — both would
+require inventing a constructor/semantics this codebase does not have,
+which is out of this file's scope (it specs `step`, it does not extend
+`Instruction`/`Step.lean`). -/
+
+/-- **`sw` stores `$rt` as a big-endian word at `$rs + sext16(offset)` and
+clears `llBit`** (any store invalidates a pending `ll`/`sc` pair, so a
+subsequent `sc` correctly fails if memory changed underneath it), or halts
+with `addressError` on a misaligned effective address (INSTRUCTION-REF "sw"
+section). -/
+theorem sw_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.sw rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let addr := readReg s (regIdxSpec rs) + signExt16 imm
+      match writeMemWord s addr (readReg s (regIdxSpec rt)) with
+      | none => StepResult.halt (.addressError addr)
+      | some s' =>
+        StepResult.next
+          { ({ s' with llBit := false }) with
+            pc := ({ s' with llBit := false }).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
 -- `mult_spec_raw`: `5 * 7 = 35` fits entirely in `lo`, `hi = 0`.
 #guard (match step (prog1Spec (.mult 8#32 9#32))
           (setRegsSpec (initialState textBase) [(8, 5#32), (9, 7#32)]) with
@@ -1372,6 +1418,74 @@ theorem mflo_spec_raw (p : Program) (s : State) (w rd : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) s.lo) with
           pc := (writeReg s (regIdxSpec rd) s.lo).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`lh` sign-extends the loaded halfword; `lhu` zero-extends it** —
+same effective address, same halfword, different widening
+(INSTRUCTION-REF "lh"/"lhu" sections), halting with `addressError` when the
+address is not halfword-aligned. Packaged as one theorem, mirroring
+`lb_lbu_spec_raw`. -/
+theorem lh_lhu_spec_raw (p : Program) (s : State) (wh whu rs rt imm : W32)
+    (hfetchH : fetchWord p s.pc = some wh) (hdecodeH : decode wh = some (.lh rs rt imm))
+    (hfetchHU : fetchWord p s.pc = some whu) (hdecodeHU : decode whu = some (.lhu rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    (step p s =
+      let addr := readReg s (regIdxSpec rs) + signExt16 imm
+      match readMemHalf s addr with
+      | none => StepResult.halt (.addressError addr)
+      | some h =>
+        StepResult.next
+          { (writeReg s (regIdxSpec rt) (signExt16 h)) with
+            pc := (writeReg s (regIdxSpec rt) (signExt16 h)).pc + 4#32 })
+    ∧
+    (step p s =
+      let addr := readReg s (regIdxSpec rs) + signExt16 imm
+      match readMemHalf s addr with
+      | none => StepResult.halt (.addressError addr)
+      | some h =>
+        StepResult.next
+          { (writeReg s (regIdxSpec rt) h) with
+            pc := (writeReg s (regIdxSpec rt) h).pc + 4#32 }) := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  constructor
+  · unfold step
+    rw [hfetchH]
+    dsimp only
+    rw [hdecodeH]
+    dsimp only
+    rfl
+  · unfold step
+    rw [hfetchHU]
+    dsimp only
+    rw [hdecodeHU]
+    dsimp only
+    rfl
+
+/-- **`sh` stores the low 16 bits of `$rt` as a big-endian halfword at
+`$rs + sext16(offset)` and clears `llBit`**, or halts with `addressError`
+on a halfword-misaligned effective address (INSTRUCTION-REF "sh" section).
+-/
+theorem sh_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.sh rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let addr := readReg s (regIdxSpec rs) + signExt16 imm
+      match writeMemHalf s addr (readReg s (regIdxSpec rt)) with
+      | none => StepResult.halt (.addressError addr)
+      | some s' =>
+        StepResult.next
+          { ({ s' with llBit := false }) with
+            pc := ({ s' with llBit := false }).pc + 4#32 } := by
   obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
@@ -1605,6 +1719,31 @@ theorem mfhi_spec_raw (p : Program) (s : State) (w rd : W32)
   dsimp only
   rfl
 
+/-- **`ll` loads a word exactly like `lw`, and additionally sets
+`llBit`** — the link flag that a later `sc` to the same address checks
+(INSTRUCTION-REF "ll" section). Halts with `addressError` on a
+word-misaligned effective address, exactly like `lw`. -/
+theorem ll_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.ll rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let addr := readReg s (regIdxSpec rs) + signExt16 imm
+      match readMemWord s addr with
+      | none => StepResult.halt (.addressError addr)
+      | some v =>
+        StepResult.next
+          { ({ (writeReg s (regIdxSpec rt) v) with llBit := true }) with
+            pc := ({ (writeReg s (regIdxSpec rt) v) with llBit := true }).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
 /-- **`mthi` copies `$rs` into `hi`; `lo` is left unchanged.** Write-direction
 counterpart to `mfhi_spec_raw` (INSTRUCTION-REF "mthi (R)" section); no GPR
 is written, never halts. -/
@@ -1702,6 +1841,43 @@ theorem madd_spec_raw (p : Program) (s : State) (w rs rt : W32)
       let sum64 := acc64 + prod64
       StepResult.next
         { s with lo := sum64.extractLsb 31 0, hi := sum64.extractLsb 63 32, pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`sc` is conditional on `llBit`, checked before it is cleared.** The
+effective address is computed and alignment-checked unconditionally, just
+like `sw` (so a misaligned `sc` halts with `addressError` regardless of
+`llBit`). Once the address is valid: if `s.llBit` was `true`, the store
+commits (`$rt`'s old value is written to memory) and `$rt` is overwritten
+with `1` (success); if `s.llBit` was `false`, the store does **not**
+commit and `$rt` is overwritten with `0` (failure). Either way `llBit`
+ends up `false`. This single theorem states both outcomes together
+(mirroring how `beq_spec_raw` states taken/not-taken as one `if`), because
+the whole point of `ll`/`sc` is this exact atomic-primitive contract, not
+just "some memory operation happened" (INSTRUCTION-REF "sc" section). -/
+theorem sc_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.sc rs rt imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let addr := readReg s (regIdxSpec rs) + signExt16 imm
+      match writeMemWord s addr (readReg s (regIdxSpec rt)) with
+      | none => StepResult.halt (.addressError addr)
+      | some stored =>
+        if s.llBit then
+          StepResult.next
+            { ({ (writeReg stored (regIdxSpec rt) 1#32) with llBit := false }) with
+              pc := ({ (writeReg stored (regIdxSpec rt) 1#32) with llBit := false }).pc + 4#32 }
+        else
+          StepResult.next
+            { ({ (writeReg s (regIdxSpec rt) 0#32) with llBit := false }) with
+              pc := ({ (writeReg s (regIdxSpec rt) 0#32) with llBit := false }).pc + 4#32 } := by
   obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
@@ -1816,3 +1992,70 @@ theorem msubu_spec_raw (p : Program) (s : State) (w rs rt : W32)
           { (setRegsSpec (initialState textBase) [(8, 5#32), (9, 7#32)]) with hi := 0#32, lo := 100#32 } with
         | .next s => s.lo == 65#32 && s.hi == 0#32
         | .halt _ => false) = true
+-- `sw_spec_raw`: a stored word reads back exactly, and clears a
+-- previously-set `llBit`.
+#guard (match step (prog1Spec (.sw 8#32 9#32 0#32))
+          { (setRegsSpec (initialState textBase) [(8, 0x10010000#32), (9, 0x12345678#32)]) with
+            llBit := true } with
+        | .next s => readMemWord s 0x10010000#32 == some 0x12345678#32 && s.llBit == false
+        | .halt _ => false) = true
+
+-- `sw_spec_raw`: a misaligned `sw` halts with `addressError`, it never
+-- rounds the address and stores anyway.
+#guard (match step (prog1Spec (.sw 8#32 9#32 1#32))
+          (setRegsSpec (initialState textBase) [(8, 0x10010000#32)]) with
+        | .next _ => false
+        | .halt r => r == .addressError 0x10010001#32) = true
+
+-- `lh_lhu_spec_raw`: the same high-bit halfword sign-extends under `lh`
+-- and zero-extends under `lhu`.
+#guard (match (writeMemHalf (setRegsSpec (initialState textBase) [(8, 0x10010000#32)])
+          0x10010000#32 0x8001#32).bind
+          (fun s => some (step (prog1Spec (.lh 8#32 9#32 0#32)) s)) with
+        | some (.next s) => readReg s 9 == 0xffff8001#32
+        | _ => false) = true
+#guard (match (writeMemHalf (setRegsSpec (initialState textBase) [(8, 0x10010000#32)])
+          0x10010000#32 0x8001#32).bind
+          (fun s => some (step (prog1Spec (.lhu 8#32 9#32 0#32)) s)) with
+        | some (.next s) => readReg s 9 == 0x00008001#32
+        | _ => false) = true
+
+-- `sh_spec_raw`: only the low 16 bits of `$rt` are stored, and `llBit` is
+-- cleared.
+#guard (match step (prog1Spec (.sh 8#32 9#32 0#32))
+          { (setRegsSpec (initialState textBase) [(8, 0x10010000#32), (9, 0xffff1234#32)]) with
+            llBit := true } with
+        | .next s => readMemHalf s 0x10010000#32 == some 0x00001234#32 && s.llBit == false
+        | .halt _ => false) = true
+
+-- `ll_spec_raw`: loads like `lw` and sets `llBit`.
+#guard (match (writeMemWord (setRegsSpec (initialState textBase) [(8, 0x10010000#32)])
+          0x10010000#32 0x2a#32).bind
+          (fun s => some (step (prog1Spec (.ll 8#32 9#32 0#32)) s)) with
+        | some (.next s) => readReg s 9 == 0x2a#32 && s.llBit == true
+        | _ => false) = true
+
+-- `sc_spec_raw`, success case: `llBit` set means the store commits and
+-- `$rt` becomes `1`.
+#guard (match step (prog1Spec (.sc 8#32 9#32 0#32))
+          { (setRegsSpec (initialState textBase) [(8, 0x10010000#32), (9, 0x99#32)]) with
+            llBit := true } with
+        | .next s =>
+          readReg s 9 == 1#32 && s.llBit == false && readMemWord s 0x10010000#32 == some 0x99#32
+        | .halt _ => false) = true
+
+-- `sc_spec_raw`, failure case: `llBit` clear means the store does NOT
+-- commit (memory stays `0`) and `$rt` becomes `0`.
+#guard (match step (prog1Spec (.sc 8#32 9#32 0#32))
+          { (setRegsSpec (initialState textBase) [(8, 0x10010000#32), (9, 0x99#32)]) with
+            llBit := false } with
+        | .next s =>
+          readReg s 9 == 0#32 && s.llBit == false && readMemWord s 0x10010000#32 == some 0#32
+        | .halt _ => false) = true
+
+-- `sc_spec_raw`: a misaligned `sc` halts with `addressError` regardless of
+-- `llBit` (the alignment check is unconditional).
+#guard (match step (prog1Spec (.sc 8#32 9#32 1#32))
+          { (setRegsSpec (initialState textBase) [(8, 0x10010000#32)]) with llBit := true } with
+        | .next _ => false
+        | .halt r => r == .addressError 0x10010001#32) = true
