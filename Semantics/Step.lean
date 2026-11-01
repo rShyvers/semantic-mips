@@ -22,15 +22,20 @@ trap/exception model (`teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu`/`break` and
 `takeException` below) is grounded in the real MIPS32 ISA instead, per
 INSTRUCTION-REF's dedicated "Coprocessor 0 / traps and exceptions" section.
 
-The coprocessor-1 (FPU) instructions (v1.x addition; single-precision only,
-double-precision out of scope — see `docs/spec/INSTRUCTION-REF.md`'s
+The coprocessor-1 (FPU) instructions (v1.x addition; single-precision, plus a
+v2 double-precision addition -- see `docs/spec/INSTRUCTION-REF.md`'s
 floating-point section) are grounded directly in the real MIPS32 ISA, not
-MARS; their arithmetic uses Lean core's native `Float32` (`Init.Data.Float.
-Float32`), which implements IEEE-754 binary32 exactly, including
-`Float32.ofBits`/`Float32.toBits` for the lossless bit-pattern round-trip
-`fpRegs` storage needs. No FP traps are modeled: divide-by-zero and invalid
-operations propagate IEEE-754 Infinity/NaN naturally, the same precedent as
-integer `div`/`divu` by zero (SPEC-NOTES §9 item 2).
+MARS; single-precision arithmetic uses Lean core's native `Float32`
+(`Init.Data.Float.Float32`), which implements IEEE-754 binary32 exactly,
+including `Float32.ofBits`/`Float32.toBits` for the lossless bit-pattern
+round-trip `fpRegs` storage needs. Double-precision arithmetic uses Lean
+core's native 64-bit `Float` (`Init.Data.Float.Float`, IEEE-754 binary64)
+over a *pair* of adjacent `fpRegs` entries, per the classic MIPS32 FR=0
+register-pair convention (`$fN` = low 32 bits, `$f(N+1)` = high 32 bits) --
+see `doubleOfRegPair`/`regPairOfDouble` below. No FP traps are modeled:
+divide-by-zero and invalid operations propagate IEEE-754 Infinity/NaN
+naturally, the same precedent as integer `div`/`divu` by zero (SPEC-NOTES §9
+item 2).
 
 `ll`/`sc` (v1.x addition; real MIPS32 atomic synchronization primitives, not
 part of the original v1 instruction set) are grounded directly in the real
@@ -94,17 +99,29 @@ it). -/
 private def mkNext (orig result : State) : StepResult :=
   StepResult.next (advance orig result)
 
-/-- Whether `instr` is one of the twelve branch/jump instructions that
-schedule a delay-slot transfer (`beq`,`bne`,`blez`,`bgtz`,`bltz`,`bgez`,
-`bltzal`,`bgezal`,`j`,`jal`,`jr`,`jalr`). Used to detect a branch/jump
-occurring itself inside another's delay slot (real MIPS32 leaves this
-architecturally discouraged/implementation-defined), so `execInstr` can
-halt with `HaltReason.branchInDelaySlot` instead of guessing. -/
+/-- Whether `instr` is one of the twenty branch/jump instructions that
+schedule a delay-slot transfer when taken (`beq`,`bne`,`blez`,`bgtz`,
+`bltz`,`bgez`,`bltzal`,`bgezal`,`j`,`jal`,`jr`,`jalr`, plus the eight
+"branch likely" instructions `beql`,`bnel`,`blezl`,`bgtzl`,`bltzl`,`bgezl`,
+`bltzall`,`bgezall` -- real MIPS32, deprecated in MIPS32/removed in Release 6,
+MIPS-COVERAGE-GAPS.md §3.3). Used to detect a branch/jump occurring itself
+inside another's delay slot (real MIPS32 leaves this architecturally
+discouraged/implementation-defined), so `execInstr` can halt with
+`HaltReason.branchInDelaySlot` instead of guessing. The branch-likely
+instructions are included here on the same footing as every other branch:
+this check only ever fires when `s.pendingBranch.isSome`, i.e. when a
+previous *taken* branch/jump's delay slot is still pending -- exactly the
+same condition under which `beq` in a delay slot halts -- and is unrelated
+to `State.squashNext`/the not-taken-branch-likely squash mechanism (see its
+docstring in `Types.lean`), which is enforced separately by `run`, one
+level above `step`/`execInstr` entirely (see `run`'s docstring below). -/
 private def isBranchLike (instr : Instruction) : Bool :=
   match instr with
   | .beq _ _ _ | .bne _ _ _ | .blez _ _ | .bgtz _ _
   | .bltz _ _ | .bgez _ _ | .bltzal _ _ | .bgezal _ _
-  | .j _ | .jal _ | .jr _ | .jalr _ _ => true
+  | .j _ | .jal _ | .jr _ | .jalr _ _
+  | .beql _ _ _ | .bnel _ _ _ | .blezl _ _ | .bgtzl _ _
+  | .bltzl _ _ | .bgezl _ _ | .bltzall _ _ | .bgezall _ _ => true
   | _ => false
 
 /-- Signed-overflow predicate for `add`/`addi`, following INSTRUCTION-REF's
@@ -259,6 +276,62 @@ private def intBitsOfFloatCeil (f : Float32) : W32 :=
 (`Float32.floor`, `floorf`), then clamp/convert to `Int32`. -/
 private def intBitsOfFloatFloor (f : Float32) : W32 :=
   f.floor.toInt32.toBitVec
+
+-- ### Double-precision (`.d`) register-pair bit-pattern composition
+--
+-- Classic MIPS32 FR=0 convention (this project's `fpRegs : Array W32`
+-- already follows it): a double value in assembly register `$fN` occupies
+-- the *pair* of adjacent 32-bit FPRs `fpRegs[n]` (low 32 bits) and
+-- `fpRegs[n+1]` (high 32 bits). `doubleOfRegPair`/`regPairOfDouble` compose/
+-- decompose that pair into/from Lean core's 64-bit `Float`, mirroring
+-- `floatOfBits`/`bitsOfFloat`'s raw-bit-pattern round-trip above but for
+-- `Float.ofBits`/`Float.toBits` (`Init.Data.Float.Float`) instead of
+-- `Float32.ofBits`/`Float32.toBits`. Public (not `private`): used by both
+-- `execInstr`'s double-precision cases below and available to `StepSpec`
+-- reasoning about double-precision results.
+
+/-- Compose the raw 64-bit bit pattern of a double-precision value from an
+FPR register pair `(lo, hi)` -- `lo` is the low 32 bits (the register named
+`$fN` in assembly), `hi` is the high 32 bits (`$f(N+1)`) -- into a `Float`
+via Lean core's `Float.ofBits : UInt64 → Float`. Real MIPS32 requires `N`
+to be even for double operands; this is not checked/enforced here, the
+function just follows the register-pair convention when composing. -/
+def doubleOfRegPair (lo hi : W32) : Float :=
+  Float.ofBits (hi ++ lo : BitVec 64).toNat.toUInt64
+
+/-- Inverse of `doubleOfRegPair`: decompose `f`'s raw 64-bit bit pattern
+(`Float.toBits`) into an FPR register pair `(lo, hi)` -- `lo` (low 32 bits)
+goes in `$fN`, `hi` (high 32 bits) goes in `$f(N+1)`. -/
+def regPairOfDouble (f : Float) : W32 × W32 :=
+  let bits : BitVec 64 := BitVec.ofNat 64 f.toBits.toNat
+  (bits.extractLsb 31 0, bits.extractLsb 63 32)
+
+/-- `cvt.d.w`'s numeric conversion: read `w`'s bit pattern as a 32-bit
+two's-complement int (`Int32.ofBitVec`), then convert that integer *value*
+to the nearest `Float` (`Int32.toFloat`, exact for every `Int32` -- binary64
+has 52 mantissa bits). -/
+private def doubleOfIntBits (w : W32) : Float :=
+  (Int32.ofBitVec w).toFloat
+
+/-- `cvt.w.d`'s numeric conversion: truncate `f` toward zero to a 32-bit
+two's-complement int (`Float.toInt32`, which clamps on overflow and maps
+`NaN` to `0`, the double-precision counterpart of `intBitsOfFloatTrunc`),
+returned as a raw bit pattern. Same truncating-vs-FCSR-rounding-mode
+simplification as `intBitsOfFloatTrunc`/`cvtWS`. -/
+private def intBitsOfDoubleTrunc (f : Float) : W32 :=
+  f.toInt32.toBitVec
+
+/-- Read the double-precision `Float` held in the FPR pair named by `f` (the
+raw 5-bit field of the pair's *low* register, e.g. `fs`/`ft`/`fd` as decoded)
+in `s`'s `fpRegs`, composing via `doubleOfRegPair`. -/
+private def readDoubleReg (s : State) (f : W32) : Float :=
+  doubleOfRegPair (readFpReg s (regIdx f)) (readFpReg s (regIdx (f + 1#32)))
+
+/-- Write double-precision `Float` value `v` into the FPR pair named by `f`
+(the low register) in `s`, decomposing via `regPairOfDouble`. -/
+private def writeDoubleReg (s : State) (f : W32) (v : Float) : State :=
+  let (lo, hi) := regPairOfDouble v
+  writeFpReg (writeFpReg s (regIdx f) lo) (regIdx (f + 1#32)) hi
 
 /-- Execute a single already-fetched-and-decoded instruction. `w` is the raw
 instruction word (needed only to report `illegalInstruction` for an unknown
@@ -559,6 +632,28 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
         mkNext s { (writeReg stored (regIdx rt) 1#32) with llBit := false }
       else
         mkNext s { (writeReg s (regIdx rt) 0#32) with llBit := false }
+  -- `sync`: real MIPS32 memory-ordering barrier (opcode 0, funct 0x0f;
+  -- MD00086 Rev 2.50 §3.2), completing the atomics story alongside `ll`/
+  -- `sc` above (`docs/spec/MIPS-COVERAGE-GAPS.md` §3.7). Real hardware
+  -- ensures every load/store issued before `sync` completes (as observed
+  -- by other processors/coherent I/O) before any issued after it; this
+  -- single-hart simulator models no concurrency or out-of-order execution
+  -- for such a barrier to order anything against, so `sync` is a documented
+  -- no-op that falls through to `pc + 4` via `mkNext`, touching no state at
+  -- all -- same convention as `wait` below.
+  | .sync => mkNext s s
+  -- `synci`: real MIPS32 instruction-cache-flush hint (REGIMM opcode 0x01,
+  -- `rt` field 0x1f; MIPS32r2, `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7),
+  -- used by self-modifying code / JIT compilers to flush a stale
+  -- instruction-cache line after writing new code bytes. Computes the same
+  -- effective address as `lw`/`sw` for architectural fidelity, but this
+  -- simulator has no instruction-cache model at all, so the address is
+  -- never read from or written to memory -- a documented no-op that falls
+  -- through to `pc + 4` via `mkNext`, touching no state at all (not even a
+  -- memory read).
+  | .synci rs imm =>
+    let _addr := readReg s (regIdx rs) + signExt16 imm
+    mkNext s s
   -- `lwl`/`lwr`/`swl`/`swr`: real MIPS32 classic (pre-r6) unaligned
   -- load/store pair (MD00086 Rev 2.50 §3.2, Table 3-4; `docs/spec/
   -- MIPS-COVERAGE-GAPS.md` §3.6). Unlike `lw`/`sw`, `addr` has no alignment
@@ -723,6 +818,77 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
       StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
     else
       mkNext s s'
+  -- "Branch likely" family (real MIPS32; deprecated in MIPS32, removed in
+  -- Release 6 -- MD00086 Rev 2.50 §3.2, Table 3-10, p. 28;
+  -- docs/spec/MIPS-COVERAGE-GAPS.md §3.3). Architecturally different from
+  -- every other branch/jump above: a **taken** branch-likely behaves
+  -- exactly like its non-likely counterpart (falls through to `pcNext`,
+  -- schedules the real target in `pendingBranch` -- the delay slot
+  -- executes normally). A **not-taken** branch-likely does *not* fall
+  -- through normally: it sets `State.squashNext := true` and leaves `pc`
+  -- at `pcNext` (the delay-slot instruction's own address) -- `run`'s `go`
+  -- loop (see its docstring below) is what actually skips that
+  -- instruction's fetch/decode/execution on the *next* iteration, advancing
+  -- `pc` one further word without ever calling `step` on it. `step` itself
+  -- is never told about `squashNext` (so this one `execInstr` case is the
+  -- only place in this file, other than `run`, that mentions the field at
+  -- all). No `mkNext`/`advance` call is used for the not-taken case (unlike the
+  -- non-likely branches' `mkNext s s`), since `advance`'s normal
+  -- `pendingBranch`-or-`pc+4` logic has no notion of squashing; incoming
+  -- `s.pendingBranch` is always `none` here regardless, since `execInstr`'s
+  -- `isBranchLike` check above already intercepts (and halts) any
+  -- branch-likely instruction reached with a pending transfer already
+  -- scheduled.
+  | .beql rs rt imm =>
+    let pcNext := s.pc + 4#32
+    if readReg s (regIdx rs) == readReg s (regIdx rt) then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s with pc := pcNext, squashNext := true }
+  | .bnel rs rt imm =>
+    let pcNext := s.pc + 4#32
+    if readReg s (regIdx rs) == readReg s (regIdx rt) then
+      StepResult.next { s with pc := pcNext, squashNext := true }
+    else
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+  | .blezl rs imm =>
+    let pcNext := s.pc + 4#32
+    if asSigned (readReg s (regIdx rs)) ≤ 0 then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s with pc := pcNext, squashNext := true }
+  | .bgtzl rs imm =>
+    let pcNext := s.pc + 4#32
+    if 0 < asSigned (readReg s (regIdx rs)) then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s with pc := pcNext, squashNext := true }
+  | .bltzl rs imm =>
+    let pcNext := s.pc + 4#32
+    if asSigned (readReg s (regIdx rs)) < 0 then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s with pc := pcNext, squashNext := true }
+  | .bgezl rs imm =>
+    let pcNext := s.pc + 4#32
+    if 0 ≤ asSigned (readReg s (regIdx rs)) then
+      StepResult.next { s with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s with pc := pcNext, squashNext := true }
+  | .bltzall rs imm =>
+    let pcNext := s.pc + 4#32
+    let s' := writeReg s 31 (pcNext + 4#32)
+    if asSigned (readReg s (regIdx rs)) < 0 then
+      StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s' with pc := pcNext, squashNext := true }
+  | .bgezall rs imm =>
+    let pcNext := s.pc + 4#32
+    let s' := writeReg s 31 (pcNext + 4#32)
+    if 0 ≤ asSigned (readReg s (regIdx rs)) then
+      StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
+    else
+      StepResult.next { s' with pc := pcNext, squashNext := true }
   | .j target =>
     let pcNext := s.pc + 4#32
     StepResult.next
@@ -782,6 +948,31 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     match writeMemWord s addr (readFpReg s (regIdx ft)) with
     | none => StepResult.halt (.addressError addr)
     | some s' => mkNext s { s' with llBit := false }
+  -- `ldc1`/`sdc1`: two `readMemWord`/`writeMemWord` calls at `addr`/
+  -- `addr + 4` (`Instruction.ldc1`'s docstring) instead of dedicated 64-bit
+  -- memory helpers -- reuses `readMemWord`/`writeMemWord`'s already-correct
+  -- big-endian byte order and (per-half) alignment checking. Big-endian
+  -- doubleword order matches the existing big-endian word order: the word
+  -- at the lower address (`addr`) is the *more*-significant half, so it
+  -- maps to the high register (`$ft+1`); `addr + 4` is the low register
+  -- (`$ft`).
+  | .ldc1 rs ft imm =>
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    match readMemWord s addr, readMemWord s (addr + 4#32) with
+    | some hi, some lo =>
+      let s' := writeFpReg s (regIdx ft) lo
+      mkNext s (writeFpReg s' (regIdx (ft + 1#32)) hi)
+    | _, _ => StepResult.halt (.addressError addr)
+  | .sdc1 rs ft imm =>
+    let addr := readReg s (regIdx rs) + signExt16 imm
+    let lo := readFpReg s (regIdx ft)
+    let hi := readFpReg s (regIdx (ft + 1#32))
+    match writeMemWord s addr hi with
+    | none => StepResult.halt (.addressError addr)
+    | some s' =>
+      match writeMemWord s' (addr + 4#32) lo with
+      | none => StepResult.halt (.addressError addr)
+      | some s'' => mkNext s { s'' with llBit := false }
   | .addS fd fs ft =>
     let v := (floatOfBits (readFpReg s (regIdx fs))).add (floatOfBits (readFpReg s (regIdx ft)))
     mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat v))
@@ -860,6 +1051,86 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
   | .cUleS fs ft =>
     let a := floatOfBits (readFpReg s (regIdx fs))
     let b := floatOfBits (readFpReg s (regIdx ft))
+    mkNext s { s with fpCondFlag := a.le b || a.isNaN || b.isNaN }
+  -- Double-precision (`.d`): exact same shape as the single-precision cases
+  -- above, but operating on `readDoubleReg`/`writeDoubleReg`-composed
+  -- 64-bit `Float` values from register pairs instead of `floatOfBits`/
+  -- `bitsOfFloat`-composed `Float32` values from single registers (module
+  -- docstring; `Instruction.lean`'s double-precision bullet).
+  | .addD fd fs ft =>
+    let v := (readDoubleReg s fs).add (readDoubleReg s ft)
+    mkNext s (writeDoubleReg s fd v)
+  | .subD fd fs ft =>
+    let v := (readDoubleReg s fs).sub (readDoubleReg s ft)
+    mkNext s (writeDoubleReg s fd v)
+  | .mulD fd fs ft =>
+    let v := (readDoubleReg s fs).mul (readDoubleReg s ft)
+    mkNext s (writeDoubleReg s fd v)
+  | .divD fd fs ft =>
+    -- IEEE-754 division; `$ft == 0` yields +/-Infinity/NaN, never a trap,
+    -- same as `divS`.
+    let v := (readDoubleReg s fs).div (readDoubleReg s ft)
+    mkNext s (writeDoubleReg s fd v)
+  -- `mov.d`: raw pair-to-pair bit copy, both 32-bit halves
+  -- (`Instruction.movD`'s docstring) -- no `Float` arithmetic involved.
+  | .movD fd fs =>
+    let s' := writeFpReg s (regIdx fd) (readFpReg s (regIdx fs))
+    mkNext s (writeFpReg s' (regIdx (fd + 1#32)) (readFpReg s (regIdx (fs + 1#32))))
+  -- `cvt.d.s`/`cvt.s.d`: single<->double numeric conversion, via Lean core's
+  -- `Float32.toFloat`/`Float.toFloat32` (`Instruction.cvtDS`/`cvtSD`'s
+  -- docstrings).
+  | .cvtDS fd fs =>
+    mkNext s (writeDoubleReg s fd (floatOfBits (readFpReg s (regIdx fs))).toFloat)
+  | .cvtSD fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (bitsOfFloat (readDoubleReg s fs).toFloat32))
+  | .cvtDW fd fs =>
+    mkNext s (writeDoubleReg s fd (doubleOfIntBits (readFpReg s (regIdx fs))))
+  | .cvtWD fd fs =>
+    mkNext s (writeFpReg s (regIdx fd) (intBitsOfDoubleTrunc (readDoubleReg s fs)))
+  | .cEqD fs ft =>
+    let flag := (readDoubleReg s fs).beq (readDoubleReg s ft)
+    mkNext s { s with fpCondFlag := flag }
+  | .cLtD fs ft =>
+    let flag := (readDoubleReg s fs).lt (readDoubleReg s ft)
+    mkNext s { s with fpCondFlag := flag }
+  | .cLeD fs ft =>
+    let flag := (readDoubleReg s fs).le (readDoubleReg s ft)
+    mkNext s { s with fpCondFlag := flag }
+  | .sqrtD fd fs =>
+    mkNext s (writeDoubleReg s fd (readDoubleReg s fs).sqrt)
+  -- `abs.d`/`neg.d`: raw sign-bit operations on the **high** half only
+  -- (`Instruction.absD`/`negD`'s docstrings) -- a double's sign bit is bit
+  -- 63 of the 64-bit value, i.e. bit 31 of the high register; the low
+  -- register is copied unchanged, no `Float` arithmetic involved.
+  | .absD fd fs =>
+    let s' := writeFpReg s (regIdx fd) (readFpReg s (regIdx fs))
+    mkNext s (writeFpReg s' (regIdx (fd + 1#32)) (readFpReg s (regIdx (fs + 1#32)) &&& 0x7fffffff#32))
+  | .negD fd fs =>
+    let s' := writeFpReg s (regIdx fd) (readFpReg s (regIdx fs))
+    mkNext s (writeFpReg s' (regIdx (fd + 1#32)) (readFpReg s (regIdx (fs + 1#32)) ^^^ 0x80000000#32))
+  | .cFD _ _ =>
+    mkNext s { s with fpCondFlag := false }
+  | .cUnD fs ft =>
+    let a := readDoubleReg s fs
+    let b := readDoubleReg s ft
+    mkNext s { s with fpCondFlag := a.isNaN || b.isNaN }
+  | .cUeqD fs ft =>
+    let a := readDoubleReg s fs
+    let b := readDoubleReg s ft
+    mkNext s { s with fpCondFlag := a.beq b || a.isNaN || b.isNaN }
+  | .cOltD fs ft =>
+    let flag := (readDoubleReg s fs).lt (readDoubleReg s ft)
+    mkNext s { s with fpCondFlag := flag }
+  | .cUltD fs ft =>
+    let a := readDoubleReg s fs
+    let b := readDoubleReg s ft
+    mkNext s { s with fpCondFlag := a.lt b || a.isNaN || b.isNaN }
+  | .cOleD fs ft =>
+    let flag := (readDoubleReg s fs).le (readDoubleReg s ft)
+    mkNext s { s with fpCondFlag := flag }
+  | .cUleD fs ft =>
+    let a := readDoubleReg s fs
+    let b := readDoubleReg s ft
     mkNext s { s with fpCondFlag := a.le b || a.isNaN || b.isNaN }
   -- `bc1t`/`bc1f`: upgraded during dev/v2 integration to use the same
   -- `pendingBranch` delay-slot scheduling as `beq`/`bne`/etc. (real MIPS32
@@ -982,7 +1253,19 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
 
 /-- Execute a single instruction: fetch at `s.pc`, decode, and dispatch.
 Total: fetch/decode failure and syscall-dispatch failure all become defined
-`HaltReason`s rather than partial behavior. -/
+`HaltReason`s rather than partial behavior.
+
+Deliberately does **not** inspect `s.squashNext` at all: `step` is otherwise
+unchanged from before the "branch likely" family existed (not touching this
+function's behavior keeps every pre-existing `Specs/StepSpec.lean` theorem
+about `step` valid with zero changes, since they all reason about a fully
+generic `State` with no constraint on `squashNext`). The actual squash
+enforcement -- skipping fetch/decode/execution of the instruction sitting
+at `pc` when `squashNext` is set -- lives one level up, in `run`'s `go`
+loop below, which checks the flag on the *incoming* state before ever
+calling `step`. `squashNext` still exists as a `State` field (so the
+not-taken branch-likely `execInstr` cases above can set it), `step` just
+never reads it back. -/
 def step (p : Program) (s : State) : StepResult :=
   match fetchWord p s.pc with
   | none => StepResult.halt (.addressError s.pc)
@@ -1002,14 +1285,31 @@ inductive RunResult where
 /-- Run `step` repeatedly from `s₀` until it halts or `maxSteps` instructions
 have been executed, whichever comes first. Total by structural recursion on
 the fuel parameter. `steps` counts every executed instruction, including the
-one that produces a halt (if any). -/
+one that produces a halt (if any).
+
+This is also where the "branch likely" family's not-taken squash is
+actually enforced (see `State.squashNext`'s docstring in `Types.lean`):
+before calling `step` at all, `go` checks the *incoming* state's
+`squashNext` flag. If set, the instruction sitting at `pc` is the
+nullified delay-slot instruction -- real MIPS32 hardware never fetches or
+decodes it -- so `go` skips `step` entirely for this iteration, directly
+advancing `pc` by one word, clearing the flag, and consuming one unit of
+the step budget (matching real hardware's instruction-issue timing: a
+squashed slot still occupies one pipeline cycle, it just has no effect).
+This holds even when the word at that address is undecodable garbage --
+`step`/`decode` are never even called on it, so no `illegalInstruction`
+halt is possible there. Only when `squashNext` is `false` does `go` fall
+through to the ordinary `step` call. -/
 def run (p : Program) (s₀ : State) (maxSteps : Nat) : RunResult :=
   let rec go : Nat → State → Nat → RunResult
     | 0, s, steps => .limitReached s steps
     | fuel + 1, s, steps =>
-      match step p s with
-      | .halt r => .halted r s (steps + 1)
-      | .next s' => go fuel s' (steps + 1)
+      if s.squashNext then
+        go fuel { s with pc := s.pc + 4#32, squashNext := false } (steps + 1)
+      else
+        match step p s with
+        | .halt r => .halted r s (steps + 1)
+        | .next s' => go fuel s' (steps + 1)
   go maxSteps s₀ 0
 
 -- ## Tests
@@ -1112,6 +1412,16 @@ private def nextLlBitEq (r : StepResult) (b : Bool) : Bool :=
   match r with
   | .next s => s.llBit == b
   | .halt _ => false
+
+/-- Every `State` field except `pc` is unchanged between `s` and `s'`. Used
+to confirm a genuinely-no-op instruction (`sync`/`synci`) touches *no*
+state at all, not just the few fields any individual existing test happens
+to check. -/
+private def sameStateExceptPc (s s' : State) : Bool :=
+  s'.regs == s.regs && s'.hi == s.hi && s'.lo == s.lo && s'.fpRegs == s.fpRegs &&
+    s'.fpCondFlag == s.fpCondFlag && s'.mem == s.mem && s'.out == s.out &&
+    s'.pendingBranch == s.pendingBranch && s'.llBit == s.llBit &&
+    s'.cp0Status == s.cp0Status && s'.cp0Cause == s.cp0Cause && s'.cp0Epc == s.cp0Epc
 
 -- `sll $zero, $zero, 0` — the canonical MIPS encoding of `nop` (word
 -- `0x00000000`) — used as an inert delay-slot filler instruction below.
@@ -1711,6 +2021,97 @@ private def swlSwrIdiomProg : Program :=
 #guard nextPcEq (step (prog1 (.bgezal 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)]))
   (textBase + 4#32)
 
+-- ### beql/bnel/blezl/bgtzl/bltzl/bgezl/bltzall/bgezall: "branch likely"
+-- family (real MIPS32; deprecated in MIPS32, removed in Release 6 --
+-- MIPS-COVERAGE-GAPS.md \u00a73.3). This is the one family in this file that is
+-- architecturally *not* a `pendingBranch` variant: a **taken** instance
+-- behaves exactly like its non-likely counterpart (`stepThroughDelaySlot`,
+-- same as `beq`/`bltz` above); a **not-taken** instance instead squashes
+-- (nullifies) its own delay-slot instruction -- `step` never fetches,
+-- decodes, or executes whatever word sits there, even if it is
+-- undecodable garbage.
+
+-- `beql` taken: identical two-step shape to `beq` taken.
+#guard stepThroughDelaySlot textBase (.beql 8#32 9#32 3#32) (setRegs regs0 [(8, 5#32), (9, 5#32)])
+  = some (textBase + 4#32 + 12#32)
+-- `beql` not taken: the branch's own step falls through to `pcNext` (the
+-- delay-slot instruction's own address) with `squashNext` set and *no*
+-- `pendingBranch` scheduled -- unlike the non-likely `beq`'s not-taken
+-- case (`mkNext s s`, an ordinary ignorable fallthrough), this flags the
+-- next instruction to be skipped rather than executed.
+#guard (match step (prog1 (.beql 8#32 9#32 3#32)) (setRegs regs0 [(8, 5#32), (9, 6#32)]) with
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true && s.pendingBranch == none
+        | .halt _ => false)
+
+-- The key behavioral difference from every other branch in this codebase:
+-- when not taken, the delay-slot instruction is skipped entirely -- *even
+-- when it is an undecodable garbage word that would otherwise halt with
+-- `illegalInstruction`* -- because real hardware never even looks at it.
+-- The actual skip is enforced by `run` (not a bare `step` call -- see
+-- `run`'s docstring), so this needs `run` with a 2-step budget: step 1 is
+-- the not-taken `beql` itself (sets `squashNext`), step 2 is `run`
+-- consuming the squashed slot directly without ever calling `step` on it.
+private def squashGarbageWord : W32 := (0x11#32 <<< 26) ||| (0x1f#32 <<< 21)  -- undecodable: COP1 fmt 0x1f is not MF/MT/BC1/S/W
+private def beqlNotTakenGarbageProg : Program :=
+  ((∅ : Program).insert textBase (encode (.beql 8#32 9#32 3#32))).insert (textBase + 4#32) squashGarbageWord
+#guard (match run beqlNotTakenGarbageProg (setRegs regs0 [(8, 5#32), (9, 6#32)]) 2 with
+        | .limitReached s2 steps => steps == 2 && s2.pc == textBase + 8#32 && s2.squashNext == false
+        | .halted _ _ _ => false)  -- must NOT halt (e.g. illegalInstruction) on the squashed garbage word
+
+-- `bnel`: opposite polarity to `beql`, same mechanism.
+#guard stepThroughDelaySlot textBase (.bnel 8#32 9#32 3#32) (setRegs regs0 [(8, 5#32), (9, 6#32)])
+  = some (textBase + 4#32 + 12#32)
+#guard (match step (prog1 (.bnel 8#32 9#32 3#32)) (setRegs regs0 [(8, 5#32), (9, 5#32)]) with
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true && s.pendingBranch == none
+        | .halt _ => false)
+
+-- `blezl`/`bgtzl`: same conditions as `blez`/`bgtz`, squash instead of
+-- ordinary fallthrough when not taken.
+#guard stepThroughDelaySlot textBase (.blezl 8#32 2#32) (setRegs regs0 [(8, 0xfffffffb#32)])  -- -5 \u2264 0
+  = some (textBase + 4#32 + 8#32)
+#guard (match step (prog1 (.blezl 8#32 2#32)) (setRegs regs0 [(8, 5#32)]) with  -- 5 \u2264 0 is false
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true
+        | .halt _ => false)
+#guard stepThroughDelaySlot textBase (.bgtzl 8#32 2#32) (setRegs regs0 [(8, 5#32)])  -- 5 > 0
+  = some (textBase + 4#32 + 8#32)
+#guard (match step (prog1 (.bgtzl 8#32 2#32)) (setRegs regs0 [(8, 0#32)]) with  -- 0 > 0 is false
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true
+        | .halt _ => false)
+
+-- `bltzl`/`bgezl` (REGIMM): same conditions as `bltz`/`bgez`.
+#guard stepThroughDelaySlot textBase (.bltzl 8#32 2#32) (setRegs regs0 [(8, 0xfffffffb#32)])  -- -5 < 0
+  = some (textBase + 4#32 + 8#32)
+#guard (match step (prog1 (.bltzl 8#32 2#32)) (setRegs regs0 [(8, 0#32)]) with  -- 0 < 0 is false
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true
+        | .halt _ => false)
+#guard stepThroughDelaySlot textBase (.bgezl 8#32 2#32) (setRegs regs0 [(8, 0#32)])  -- 0 >= 0
+  = some (textBase + 4#32 + 8#32)
+#guard (match step (prog1 (.bgezl 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)]) with  -- -5>=0 false
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true
+        | .halt _ => false)
+
+-- `bltzall`/`bgezall` (REGIMM): same unconditional-`$ra`-link convention as
+-- `bltzal`/`bgezal` -- the link happens whether the branch is taken or
+-- squashed.
+#guard nextRegEq (step (prog1 (.bltzall 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)])) 31
+  (textBase + 8#32)  -- taken: -5 < 0
+#guard nextRegEq (step (prog1 (.bltzall 8#32 2#32)) (setRegs regs0 [(8, 5#32)])) 31
+  (textBase + 8#32)  -- squashed: 5 < 0 is false, $ra still linked
+#guard stepThroughDelaySlot textBase (.bltzall 8#32 2#32) (setRegs regs0 [(8, 0xfffffffb#32)])
+  = some (textBase + 4#32 + 8#32)
+#guard (match step (prog1 (.bltzall 8#32 2#32)) (setRegs regs0 [(8, 5#32)]) with
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true
+        | .halt _ => false)
+#guard nextRegEq (step (prog1 (.bgezall 8#32 2#32)) (setRegs regs0 [(8, 5#32)])) 31
+  (textBase + 8#32)  -- taken: 5 >= 0
+#guard nextRegEq (step (prog1 (.bgezall 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)])) 31
+  (textBase + 8#32)  -- squashed: -5 >= 0 is false, $ra still linked
+#guard stepThroughDelaySlot textBase (.bgezall 8#32 2#32) (setRegs regs0 [(8, 5#32)])
+  = some (textBase + 4#32 + 8#32)
+#guard (match step (prog1 (.bgezall 8#32 2#32)) (setRegs regs0 [(8, 0xfffffffb#32)]) with
+        | .next s => s.pc == textBase + 4#32 && s.squashNext == true
+        | .halt _ => false)
+
 -- ### j/jal: exact targets including top-4-bit preservation from `pc_next`;
 -- jal $ra links to `pc + 8` (past the delay slot), not `pc + 4`
 
@@ -1801,6 +2202,15 @@ private def crossRegionState : State := { regs0 with pc := 0x90400000#32 }
         | some s1 =>
           isHaltBranchInDelaySlot
             (step (buildProg textBase [.beq 8#32 9#32 1#32, .bltz 8#32 0#32]) s1)
+        | none => false)
+-- `beql` right after a taken `beq` halts the same way (confirms the
+-- branch-likely family is included in `isBranchLike`, same `pendingBranch`
+-- condition as every other branch/jump -- unrelated to `squashNext`).
+#guard (match stepState (buildProg textBase [.beq 8#32 9#32 1#32, .beql 8#32 8#32 0#32])
+          (setRegs regs0 [(8, 5#32), (9, 5#32)]) with
+        | some s1 =>
+          isHaltBranchInDelaySlot
+            (step (buildProg textBase [.beq 8#32 9#32 1#32, .beql 8#32 8#32 0#32]) s1)
         | none => false)
 
 -- ### syscalls
@@ -2019,6 +2429,25 @@ private def teqEretProg : Program :=
                        && s'.cp0Epc == regs0.cp0Epc
         | none => false)
 
+-- sync: a documented no-op (no concurrency/out-of-order execution exists to
+-- order), falls through to `pc + 4` with *every* other field of `State`
+-- left exactly as it was (`sameStateExceptPc`, not just a handful of
+-- hand-picked fields the way the `wait` check above does).
+#guard nextPcEq (step (prog1 .sync) regs0) (textBase + 4#32)
+#guard (match stepState (prog1 .sync) regs0 with
+        | some s' => sameStateExceptPc regs0 s'
+        | none => false)
+
+-- synci: a documented no-op (no instruction-cache model exists to flush),
+-- same full-state-untouched check as `sync` above, run from a state with a
+-- nonzero base register so the (unused) address computation actually reads
+-- something -- confirms the computation itself has no observable effect.
+private def synciTestState : State := setRegs regs0 [(8, 0x10010000#32)]
+#guard nextPcEq (step (prog1 (.synci 8#32 4#32)) synciTestState) (textBase + 4#32)
+#guard (match stepState (prog1 (.synci 8#32 4#32)) synciTestState with
+        | some s' => sameStateExceptPc synciTestState s'
+        | none => false)
+
 -- ### Undecodable word → illegalInstruction
 
 -- opcode 0x11 (COP1) is implemented for the fmt/funct combinations decoded
@@ -2212,6 +2641,117 @@ private def fpFlagState (b : Bool) : State := { regs0 with fpCondFlag := b }
 #guard nextPcEq (step (prog1 (.bc1t 3#32)) (fpFlagState false)) (textBase + 4#32)
 #guard stepThroughDelaySlot textBase (.bc1f 3#32) (fpFlagState false) = some (textBase + 4#32 + 12#32)
 #guard nextPcEq (step (prog1 (.bc1f 3#32)) (fpFlagState true)) (textBase + 4#32)
+
+-- ### Coprocessor 1 (FPU), double-precision: ldc1/sdc1 (register-pair doubleword load/store)
+
+-- Register-pair convention: `$fN` (low) / `$f(N+1)` (high). Memory is
+-- big-endian doubleword order: the word at the lower address is the *more*
+-- significant half (the high register), `addr + 4` is the low register --
+-- same convention `readMemWord`/`writeMemWord` already use for single
+-- words, extended one level up.
+-- 1.0 (double) = hi 0x3ff00000, lo 0x00000000.
+private def dpMemTestState : State :=
+  { (setRegs regs0 [(8, 0x10010000#32)]) with
+      mem := (((∅ : Std.HashMap W32 UInt8).insert 0x10010004#32 0x3f).insert 0x10010005#32 0xf0)
+               |>.insert 0x10010006#32 0x00 |>.insert 0x10010007#32 0x00 }
+#guard nextFpRegEq (step (prog1 (.ldc1 8#32 9#32 4#32)) dpMemTestState) 9 0x00000000#32    -- $f9 (lo)
+#guard nextFpRegEq (step (prog1 (.ldc1 8#32 9#32 4#32)) dpMemTestState) 10 0x3ff00000#32   -- $f10 (hi)
+#guard (stepState (prog1 (.sdc1 8#32 9#32 4#32))
+          (setFpRegs (setRegs regs0 [(8, 0x10010000#32)]) [(9, 0x00000000#32), (10, 0x3ff00000#32)])).bind
+        (fun s' => readMemWord s' 0x10010004#32) = some 0x3ff00000#32   -- hi word at addr (low addr = high half)
+#guard (stepState (prog1 (.sdc1 8#32 9#32 4#32))
+          (setFpRegs (setRegs regs0 [(8, 0x10010000#32)]) [(9, 0x00000000#32), (10, 0x3ff00000#32)])).bind
+        (fun s' => readMemWord s' 0x10010008#32) = some 0x00000000#32   -- lo word at addr+4
+-- ldc1/sdc1 alignment rules match lwc1/swc1 exactly (each half independently)
+#guard isHaltAddr (step (prog1 (.ldc1 8#32 9#32 1#32)) (setRegs regs0 [(8, 0x10010000#32)]))
+  0x10010001#32
+
+-- ### Coprocessor 1 (FPU), double-precision: add.d/sub.d/mul.d/div.d/mov.d
+
+-- 1.0 = (lo 0, hi 0x3ff00000), 2.0 = (lo 0, hi 0x40000000),
+-- 3.0 = (lo 0, hi 0x40080000), 5.0 = (lo 0, hi 0x40140000),
+-- 6.0 = (lo 0, hi 0x40180000) (standard IEEE-754 binary64 bit patterns,
+-- hand-computed and cross-checked against Python's `struct.pack('>d', v)`).
+#guard nextFpRegEq (step (prog1 (.addD 10#32 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x40000000#32)])) 10 0#32
+#guard nextFpRegEq (step (prog1 (.addD 10#32 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x40000000#32)])) 11 0x40080000#32  -- 1.0+2.0=3.0
+#guard nextFpRegEq (step (prog1 (.subD 10#32 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40140000#32), (6, 0), (7, 0x40000000#32)])) 11 0x40080000#32  -- 5.0-2.0=3.0
+#guard nextFpRegEq (step (prog1 (.mulD 10#32 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40000000#32), (6, 0), (7, 0x40080000#32)])) 11 0x40180000#32  -- 2.0*3.0=6.0
+#guard nextFpRegEq (step (prog1 (.divD 10#32 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40180000#32), (6, 0), (7, 0x40000000#32)])) 11 0x40080000#32  -- 6.0/2.0=3.0
+-- div.d by zero: IEEE-754 Infinity, no trap (same as divS)
+#guard nextFpRegEq (step (prog1 (.divD 10#32 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0)])) 11 0x7ff00000#32  -- 1.0/0.0=+Inf
+#guard nextFpRegEq (step (prog1 (.movD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40080000#32)])) 10 0#32
+#guard nextFpRegEq (step (prog1 (.movD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40080000#32)])) 11 0x40080000#32
+
+-- ### Coprocessor 1 (FPU), double-precision: sqrt.d/abs.d/neg.d
+
+-- sqrt.d: 4.0 -> 2.0
+#guard nextFpRegEq (step (prog1 (.sqrtD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40100000#32)])) 11 0x40000000#32
+-- abs.d: -3.0 -> 3.0 (sign bit lives in the high half only)
+#guard nextFpRegEq (step (prog1 (.absD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0xc0080000#32)])) 11 0x40080000#32
+#guard nextFpRegEq (step (prog1 (.absD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0xc0080000#32)])) 10 0#32  -- low half copied unchanged
+-- neg.d: 3.0 -> -3.0; -3.0 -> 3.0
+#guard nextFpRegEq (step (prog1 (.negD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40080000#32)])) 11 0xc0080000#32
+#guard nextFpRegEq (step (prog1 (.negD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0xc0080000#32)])) 11 0x40080000#32
+
+-- ### Coprocessor 1 (FPU), double-precision: cvt.d.s/cvt.s.d/cvt.d.w/cvt.w.d
+
+-- cvt.d.s: single 1.0 (0x3f800000) -> double 1.0 (lo 0, hi 0x3ff00000)
+#guard nextFpRegEq (step (prog1 (.cvtDS 10#32 8#32)) (setFpRegs regs0 [(8, 0x3f800000#32)])) 10 0#32
+#guard nextFpRegEq (step (prog1 (.cvtDS 10#32 8#32)) (setFpRegs regs0 [(8, 0x3f800000#32)])) 11
+  0x3ff00000#32
+-- cvt.s.d: double 3.0 (lo 0, hi 0x40080000) -> single 3.0 (0x40400000)
+#guard nextFpRegEq (step (prog1 (.cvtSD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x40080000#32)])) 10 0x40400000#32
+-- cvt.d.w: int bit pattern -> double value; 5 -> 5.0, -5 (0xfffffffb) -> -5.0
+#guard nextFpRegEq (step (prog1 (.cvtDW 10#32 8#32)) (setFpRegs regs0 [(8, 5#32)])) 11
+  0x40140000#32
+#guard nextFpRegEq (step (prog1 (.cvtDW 10#32 8#32)) (setFpRegs regs0 [(8, 0xfffffffb#32)])) 11
+  0xc0140000#32
+-- cvt.w.d: double value -> int bit pattern, truncating toward zero;
+-- 5.9 (lo 0x9999999a, hi 0x40179999) -> 5, -5.9 (lo 0x9999999a, hi 0xc0179999) -> -5
+#guard nextFpRegEq (step (prog1 (.cvtWD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0x9999999a#32), (9, 0x40179999#32)])) 10 0x00000005#32
+#guard nextFpRegEq (step (prog1 (.cvtWD 10#32 8#32))
+  (setFpRegs regs0 [(8, 0x9999999a#32), (9, 0xc0179999#32)])) 10 0xfffffffb#32
+
+-- ### Coprocessor 1 (FPU), double-precision: c.eq.d/c.lt.d/c.le.d and the 7 extra predicates
+
+-- quiet double NaN = (lo 0, hi 0x7ff80000)
+#guard nextFpCondFlagEq (step (prog1 (.cEqD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- 1.0 == 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cEqD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x40000000#32)])) false  -- 1.0 != 2.0
+#guard nextFpCondFlagEq (step (prog1 (.cLtD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x40000000#32)])) true   -- 1.0 < 2.0
+#guard nextFpCondFlagEq (step (prog1 (.cLeD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- 1.0 <= 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cFD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x3ff00000#32)])) false  -- always false
+#guard nextFpCondFlagEq (step (prog1 (.cUnD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x7ff80000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- NaN vs 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cUeqD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x7ff80000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- NaN (unordered)
+#guard nextFpCondFlagEq (step (prog1 (.cOltD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x7ff80000#32), (6, 0), (7, 0x3ff00000#32)])) false  -- NaN < 1.0 is false
+#guard nextFpCondFlagEq (step (prog1 (.cUltD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x7ff80000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- NaN (unordered)
+#guard nextFpCondFlagEq (step (prog1 (.cOleD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x3ff00000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- 1.0 <= 1.0
+#guard nextFpCondFlagEq (step (prog1 (.cUleD 8#32 6#32))
+  (setFpRegs regs0 [(8, 0), (9, 0x7ff80000#32), (6, 0), (7, 0x3ff00000#32)])) true   -- NaN (unordered)
 
 -- ### `run`: a short program that computes something and exits
 

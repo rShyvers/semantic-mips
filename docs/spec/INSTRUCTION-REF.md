@@ -1489,12 +1489,15 @@ consulted as ground truth for this section.
 
 ### Scope
 
-- **Single precision only.** All 32 FP registers `$f0`..`$f31` are modeled as
-  independent 32-bit registers holding a raw IEEE-754 binary32 bit pattern
-  (`State.fpRegs`). **Double precision (`.d`) is out of scope for this pass**
-  — real MIPS32 pairs adjacent `$f` registers for 64-bit doubles, which this
-  v1.x addition does not model at all. This is flagged as a documented
-  follow-up, not a silent gap.
+- **Single precision only, in this section.** All 32 FP registers
+  `$f0`..`$f31` are modeled as independent 32-bit registers holding a raw
+  IEEE-754 binary32 bit pattern (`State.fpRegs`). A v2 addition now also
+  implements a double-precision (`.d`) subset on top of this same register
+  file, pairing adjacent `$f` registers for 64-bit doubles per the classic
+  MIPS32 FR=0 convention — see the dedicated "Floating point (coprocessor 1,
+  double precision)" section immediately below this one for its scope and
+  encodings; everything in *this* section concerns the single-precision
+  instructions only.
 - **One FP condition flag, not eight.** Real MIPS32 has 8 FP condition-code
   registers (the 3-bit `cc` field in compare/branch encodings). This addition
   models only `cc = 0`, as a single `State.fpCondFlag : Bool`. Any encoding
@@ -1699,6 +1702,165 @@ internet access); they match this track's brief and are believed correct,
 but a future reader with ISA-reference access should double-check them
 before relying on this simulator's `cfc1`/`ctc1` encoding for anything
 beyond this project's own test suite.
+
+---
+
+## Floating point (coprocessor 1, double precision) — v2 addition
+
+This section documents a v2 addition: a double-precision (`.d`) subset of
+the coprocessor-1 (FPU) instruction set, built directly on top of the
+single-precision subset documented in the section immediately above (same
+`State.fpRegs` array, same `State.fpCondFlag`, same grounding note: this
+section's semantics come from the real MIPS32 architecture, not MARS).
+Ground truth: `docs/spec/MIPS-COVERAGE-GAPS.md` §3.9A, which identifies
+missing double precision as "the single biggest remaining FPU gap" (MIPS32
+compliance technically requires double precision if the FPU exists at all).
+
+### Register-pair convention (classic MIPS32 FR=0)
+
+This project's `fpRegs : Array W32` models the classic 32-bit-wide FPR file
+(FR=0 in real MIPS32's `Status.FR` terminology), the same convention the
+single-precision subset already uses. A double-precision value named `$fN`
+in assembly therefore occupies a **pair** of adjacent 32-bit FPRs:
+
+- `$fN` (the low register, the one written in assembly/encoding operand
+  position) holds the **low** 32 bits of the 64-bit IEEE-754 binary64 value.
+- `$f(N+1)` (the next register up) holds the **high** 32 bits.
+
+Real MIPS32 requires `N` to be even for double operands; this project does
+**not** check or enforce that (an odd `N` just means `$f(N+1)` is the next
+register up, same as any other register-pair arithmetic) — a documented
+simplification, not an oversight. `Step.lean`'s `doubleOfRegPair`/
+`regPairOfDouble` (public helpers) compose/decompose a `Float` to/from this
+register pair; mirrors `floatOfBits`/`bitsOfFloat`'s single-precision
+raw-bit-pattern round-trip but for Lean core's 64-bit `Float`
+(`Init.Data.Float.Float`, `Float.ofBits : UInt64 → Float` / `Float.toBits :
+Float → UInt64`, exact IEEE-754 binary64 bit-pattern round-trip — the
+64-bit analogue of `Float32.ofBits`/`Float32.toBits`).
+
+### Scope
+
+- **Implemented**: `ldc1`/`sdc1` (doubleword load/store), `add.d`/`sub.d`/
+  `mul.d`/`div.d` (arithmetic), `mov.d` (raw pair copy), `cvt.d.s`/`cvt.s.d`
+  (single↔double conversion), `cvt.d.w`/`cvt.w.d` (int↔double conversion),
+  `sqrt.d`/`abs.d`/`neg.d`, and the same 10 quiet `C.cond.d` predicates this
+  project already implements for `.s` (`c.eq.d`/`c.lt.d`/`c.le.d`/`c.f.d`/
+  `c.un.d`/`c.ueq.d`/`c.olt.d`/`c.ult.d`/`c.ole.d`/`c.ule.d`). That is every
+  instruction in this track's assigned priority list, priorities 1 through 7
+  — nothing was deliberately cut from the required/optional list itself.
+- **Not implemented** (same reasons as the single-precision section's
+  equivalent cuts, extended to `.d`):
+  - The 6 "signaling" `C.cond.D` predicates (`c.sf.d`/`c.ngle.d`/`c.seq.d`/
+    `c.ngl.d`/`c.nge.d`/`c.ngt.d`, cond numbers 8/9/10/11/13/15) — this model
+    has no FP-exception mechanism, so they would compute an identical
+    `fpCondFlag` result to their already-implemented quiet counterparts.
+  - `round.d`/`trunc.d`/`ceil.d`/`floor.d` (the directed-rounding-to-integer
+    family for doubles, the `.d` counterparts of `round.w.s`/`trunc.w.s`/
+    `ceil.w.s`/`floor.w.s`) — not in this track's assigned priority list;
+    `cvt.w.d` (truncating) is implemented, but the other three rounding
+    modes for double→int conversion are not.
+  - Multi-`cc` compares (only FP condition code 0 is modeled, same
+    simplification as the single-precision section).
+  - `cvt.l.d`/`cvt.d.l`/`cvt.l.s`/`cvt.s.l` (64-bit-integer `L` format) — out
+    of scope, no 64-bit GPR integer type exists in this project.
+  - `ldxc1`/`sdxc1`/`luxc1`/`suxc1` (indexed FPU load/store, MIPS32r2) — out
+    of scope, mirrors this project's scope for the integer side (no indexed
+    loads/stores at all).
+- **No doubleword-alignment check.** `ldc1`/`sdc1` are implemented as two
+  `readMemWord`/`writeMemWord` calls (at `addr` and `addr + 4`) rather than
+  dedicated 64-bit memory helpers, reusing `lw`/`sw`'s already-correct
+  big-endian byte-order and alignment logic. This means each 32-bit half is
+  checked for 4-byte alignment independently (`addr % 4 == 0`), **not** real
+  MIPS32's 8-byte doubleword alignment requirement (`addr % 8 == 0`) — an
+  `addr` that is a multiple of 4 but not 8 is accepted here but would fault
+  on real hardware. Documented simplification per this track's brief
+  ("prefer [two `readMemWord` calls] unless it proves awkward" — it did not
+  prove awkward, but the alignment relaxation is the direct consequence).
+- **No FP traps**, same precedent as the single-precision section:
+  divide-by-zero and invalid operations propagate IEEE-754 ±Infinity/NaN
+  naturally.
+- **`abs.d`/`neg.d` touch only the high register's sign bit.** A double's
+  sign bit is bit 63 of the 64-bit value, which lives in bit 31 of the
+  *high* register (`$fs+1`) under the register-pair convention; the low
+  register (`$fs`) is copied unchanged. Raw bit operations
+  (`&&& 0x7fffffff` / `^^^ 0x80000000` on the high half only), not `Float`
+  arithmetic, same rationale as `abs.s`/`neg.s`.
+
+### Encoding summary
+
+All double-precision instructions share opcode `0x11` (COP1); the key
+distinguishing detail is `fmt` = `D` = `0x11` for instructions whose
+*operand* is a double — **not** the same value as single-precision's
+`fmt` = `S` = `0x10`, and easy to confuse with the opcode itself (also
+`0x11`) since both happen to be the same bit pattern by coincidence.
+`cvt.d.s`/`cvt.d.w` are the one exception: per the existing `cvt.s.w`/
+`cvt.w.s` convention, a `CVT.dstfmt.srcfmt` instruction's `fmt` field names
+the *source* format, not the destination, so `cvt.d.s`'s `fmt` is `S`
+(0x10) and `cvt.d.w`'s `fmt` is `W` (0x14).
+
+| Mnemonic | Encoding | One-line semantics |
+|---|---|---|
+| `ldc1 $ft, off($rs)` | opcode 0x35 | `{$ft,$ft+1} = MEM64[$rs + off]`, raw bits |
+| `sdc1 $ft, off($rs)` | opcode 0x3d | `MEM64[$rs + off] = rawbits({$ft,$ft+1})` |
+| `add.d $fd, $fs, $ft` | opcode 0x11, fmt=`D`=0x11, funct=0x00 | `{$fd,$fd+1} = {$fs,$fs+1} + {$ft,$ft+1}` (IEEE-754) |
+| `sub.d $fd, $fs, $ft` | fmt=D, funct=0x01 | `{$fd,$fd+1} = {$fs,$fs+1} - {$ft,$ft+1}` |
+| `mul.d $fd, $fs, $ft` | fmt=D, funct=0x02 | `{$fd,$fd+1} = {$fs,$fs+1} * {$ft,$ft+1}` |
+| `div.d $fd, $fs, $ft` | fmt=D, funct=0x03 | `{$fd,$fd+1} = {$fs,$fs+1} / {$ft,$ft+1}`; `{$ft,..}=0` → ±Inf/NaN, no trap |
+| `mov.d $fd, $fs` | fmt=D, funct=0x06 | `{$fd,$fd+1} = {$fs,$fs+1}`, raw pair copy |
+| `sqrt.d $fd, $fs` | fmt=D, funct=0x04 | `{$fd,$fd+1} = sqrt({$fs,$fs+1})` (via `Float.sqrt`/`sqrt`) |
+| `abs.d $fd, $fs` | fmt=D, funct=0x05 | high half sign bit (31) cleared; low half copied; raw bit op |
+| `neg.d $fd, $fs` | fmt=D, funct=0x07 | high half sign bit (31) flipped; low half copied; raw bit op |
+| `cvt.d.s $fd, $fs` | fmt=`S`=0x10 (source fmt), funct=0x21 | `{$fd,$fd+1} = float64(float32bits($fs))`; exact |
+| `cvt.s.d $fd, $fs` | fmt=D, funct=0x20 | `$fd = float32(float64bits({$fs,$fs+1}))`; rounds, may overflow to ±Inf |
+| `cvt.d.w $fd, $fs` | fmt=`W`=0x14 (source fmt), funct=0x21 | `{$fd,$fd+1} = float64(int32bits($fs))`; exact |
+| `cvt.w.d $fd, $fs` | fmt=D, funct=0x24 | `$fd = int32bits(trunc({$fs,$fs+1}))` |
+| `c.f.d $fs, $ft` | fmt=D, funct=0x30, cc=0, cond=0 | `fpCondFlag := false` |
+| `c.un.d $fs, $ft` | fmt=D, funct=0x31, cc=0, cond=1 | `fpCondFlag := isNaN({$fs,..}) ∨ isNaN({$ft,..})` |
+| `c.eq.d $fs, $ft` | fmt=D, funct=0x32, cc=0, cond=2 | `fpCondFlag := ({$fs,..} == {$ft,..})` |
+| `c.ueq.d $fs, $ft` | fmt=D, funct=0x33, cc=0, cond=3 | `fpCondFlag := ({$fs,..} == {$ft,..}) ∨ unordered` |
+| `c.olt.d $fs, $ft` | fmt=D, funct=0x34, cc=0, cond=4 | `fpCondFlag := ¬unordered ∧ ({$fs,..} < {$ft,..})` |
+| `c.ult.d $fs, $ft` | fmt=D, funct=0x35, cc=0, cond=5 | `fpCondFlag := ({$fs,..} < {$ft,..}) ∨ unordered` |
+| `c.ole.d $fs, $ft` | fmt=D, funct=0x36, cc=0, cond=6 | `fpCondFlag := ¬unordered ∧ ({$fs,..} <= {$ft,..})` |
+| `c.ule.d $fs, $ft` | fmt=D, funct=0x37, cc=0, cond=7 | `fpCondFlag := ({$fs,..} <= {$ft,..}) ∨ unordered` |
+| `c.lt.d $fs, $ft` | fmt=D, funct=0x3c, cc=0, cond=12 | `fpCondFlag := ({$fs,..} < {$ft,..})` |
+| `c.le.d $fs, $ft` | fmt=D, funct=0x3e, cc=0, cond=14 | `fpCondFlag := ({$fs,..} <= {$ft,..})` |
+
+Field layout is identical in shape to the single-precision arithmetic/
+compare format documented in the section above (opcode(31-26)=0x11,
+`fmt`(25-21), `ft`(20-16), `fs`(15-11), `fd`(10-6), `funct`(5-0)) — only the
+`fmt` value and the register-pair interpretation of `fd`/`fs`/`ft` differ.
+`ldc1`/`sdc1` are ordinary I-type words, identical in shape to `lwc1`/
+`swc1` (opcode/`rs`=base/`rt`-position=`ft`/16-bit offset).
+
+### Worked example: `add.d` arithmetic, hand-verified against IEEE-754
+
+`Step.lean`'s test suite includes a concrete execution check verified
+against a hand-computed IEEE-754 double value (not just a round-trip): with
+`$f8/$f9` holding `1.0` (lo `0x00000000`, hi `0x3ff00000`) and `$f6/$f7`
+holding `2.0` (lo `0x00000000`, hi `0x40000000`), `add.d $f10, $f8, $f6`
+produces `$f10/$f11` = `0x00000000` / `0x40080000` — the IEEE-754 binary64
+bit pattern for `3.0` (sign 0, biased exponent `0x400` = 1024 → unbiased 1,
+mantissa `0x8...` → `1.5 × 2¹ = 3.0`), cross-checked against Python's
+`struct.pack('>d', 3.0)`.
+
+### Citation
+
+Standard MIPS32 instruction-set architecture (MD00086 §3.2, the same COP1/
+FPU chapter cited by the single-precision section above). All opcode/fmt/
+funct values above (`LDC1`/`SDC1` = 0x35/0x3d, `fmt` code `D`=0x11, and
+`funct` codes 0x00/0x01/0x02/0x03/0x04/0x05/0x06/0x07/0x20/0x21/0x24 and the
+`C.cond.D` family `0x30 | cond` with the same `cond` numbering as
+`C.cond.S` above) are the standard, invariant MIPS32 COP1 encodings. No
+internet access was used to write this section. **Explicit confidence
+notes, per this track's house rules**: the author is fully confident in
+every funct/fmt value in the table above (they follow directly from the
+well-established `C.cond.fmt`/arithmetic-format numbering already
+cross-checked for the single-precision section, with `fmt` swapped from
+`S`=0x10 to `D`=0x11, which is a standard, memorized MIPS32 ISA constant).
+The one area flagged for a future reader to double-check independently:
+the real-hardware 8-byte doubleword alignment requirement for `ldc1`/`sdc1`
+(this project only checks 4-byte alignment per half, a documented, explicit
+simplification, not an uncertain encoding value).
 
 ---
 
@@ -2351,4 +2513,303 @@ Rev 6.04 §2.1.2. No internet access was used to write this section; these
 are well-established, memorized ISA constants (the same citation already
 used by `docs/spec/MIPS-COVERAGE-GAPS.md` §3.6), and any single value a
 future reader doubts should be cross-checked against a primary MIPS32 ISA
+reference before relying on it for anything beyond this simulator.
+
+## Memory-ordering / cache-hint instructions (`sync`/`synci`) — v1.x addition
+
+This section documents a v1.x addition: the real MIPS32 memory-ordering
+barrier (`sync`) and instruction-cache-flush hint (`synci`), identified as
+a coverage gap in `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7 ("Atomic Memory
+Operations & Synchronization", the same section that documents `ll`/`sc`
+above) as the instructions that complete this project's atomics story.
+**Grounding note**: like every other v1.x addition in this reference, this
+section is grounded directly in the **real MIPS32 architecture** —
+specifically "MIPS32 Architecture For Programmers, Volume II-A: The MIPS32
+Instruction Set" (MD00086, Rev 2.50, §3.2, Table 3-4, p. 26, entries 288
+(`SYNC`) and 290 (`SYNCI`, MIPS32r2)) — not against MARS, which does not
+implement either instruction (per `MIPS-COVERAGE-GAPS.md` §3.7, the same
+section that documents `ll`/`sc`'s absence from MARS).
+
+### Why both are no-ops in this model
+
+Real MIPS32 hardware uses `sync` to order a core's own loads/stores against
+what other cores/coherent I/O devices observe, and `synci` to flush a stale
+instruction-cache line after self-modifying code or a JIT compiler writes
+new instruction bytes. Both instructions exist to manage hazards that only
+arise from things this simulator does not model at all: **`sync`** orders
+against other cores and out-of-order/speculative execution, and this is a
+single-hart simulator with no multiprocessor state and no instruction
+reordering of any kind (every instruction's effect is fully committed,
+in program order, before the next one is fetched — see `Step.lean`'s
+`execInstr`/`mkNext`); **`synci`** orders against a hardware instruction
+cache that might otherwise serve stale fetched bytes, and this simulator
+has no instruction cache (or any cache) at all — `fetchWord` always reads
+the current contents of `Program` directly. With neither hazard able to
+exist in this model, both instructions are **documented no-ops**: each
+falls through to `PC_next` exactly like any other non-control-flow
+instruction, via the same `mkNext` path every arithmetic/logic instruction
+uses, touching no other part of `State` at all. This is the same
+simplification rationale already used for `wait` above (real hardware
+behavior this simulator has no state to usefully model), not a silent
+pretense that ordering or cache-coherence is implemented.
+
+### sync (R, SPECIAL)
+
+- **Encoding**: `opcode=000000` (0, SPECIAL), `funct=001111` (0x0f — the
+  next funct value after `break`'s 0x0d, skipping the unassigned 0x0e).
+  Real MIPS32 additionally carries an optional 5-bit `stype` hint field in
+  bits 10..6 (`rs`/`rt`/`rd`-position bits are otherwise reserved and
+  conventionally 0) selecting which kind of ordering to enforce (e.g.
+  "completion barrier" vs. weaker load/store-ordering-only variants); since
+  this model enforces no ordering of any kind regardless of `stype`'s
+  value, **`stype` is not modeled as an `Instruction` field at all** —
+  `decode` matches funct `0x0f` and produces `.sync` regardless of what the
+  raw `shamt`-position bits hold, and `encode` always emits `stype = 0`
+  (the all-fields-zero default, `0x0000000F`). This mirrors `break`'s
+  already-documented omission of its real 20-bit "code" field one step up
+  in this reference: a field that exists in the real encoding but carries
+  no observable effect in this model is left out of the constructor
+  entirely, rather than stored and ignored.
+- **Semantics**: a complete no-op — see "Why both are no-ops in this
+  model" above. Falls through to `PC_next`; no register, memory, `hi`/`lo`,
+  FPU, or CP0 state is touched.
+- **Errors/halts**: none.
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  ground truth is the real MIPS32 ISA, and MARS does not implement `sync`.
+
+### synci (I, REGIMM)
+
+- **Encoding**: `opcode=000001` (0x01, REGIMM — the same major opcode as
+  `bltz`/`bgez`/the trap-immediate family above), `rt`-field = `11111`
+  (0x1f), selecting `synci` the same way `rt` multiplexes every other
+  REGIMM sub-instruction in this reference. `rs` (base register) and the
+  16-bit `offset` fields are laid out identically to `lw`/`sw`/`blez`.
+- **Semantics**: `addr = $rs + sext16(offset)` — the exact same effective-
+  address computation `lw`/`sw` perform, included for architectural
+  fidelity (a real implementation would use `addr` to identify which
+  cache line to flush) — but since this simulator has no instruction-cache
+  model, `addr` is computed and then **used for nothing**: no memory read,
+  no memory write, no state of any kind is touched. Falls through to
+  `PC_next`, same as `sync` above.
+- **Errors/halts**: none — unlike `lw`/`sw`/`ll`/`sc`, `synci` never
+  checks `addr`'s alignment, because `addr` is never actually dereferenced
+  (real MIPS32 `SYNCI`'s pseudocode does not fault on a misaligned address
+  either, for the same reason: it names a cache line, not a word-granular
+  memory operand).
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  ground truth is the real MIPS32 ISA, and MARS does not implement `synci`.
+
+## "Branch likely" family (real MIPS32; deprecated in MIPS32, removed in Release 6) — v1.x addition
+
+This section documents a v1.x addition: the eight real MIPS32 "branch
+likely" instructions `beql`, `bnel`, `blezl`, `bgtzl`, `bltzl`, `bgezl`,
+`bltzall`, `bgezall`, identified as a coverage gap in
+[`MIPS-COVERAGE-GAPS.md`](MIPS-COVERAGE-GAPS.md) §3.3. **Grounding note**:
+like the Coprocessor 0, floating-point, GPR-multiply/variable-shift,
+`ll`/`sc`, and unaligned-memory-access additions above, this section is
+grounded directly in the **real MIPS32 architecture** — "MIPS32
+Architecture For Programmers, Volume II-A: The MIPS32 Instruction Set"
+(MD00086, Rev 2.50), §3.2, Table 3-10 (p. 28) — not against MARS (which is
+this project's differential-testing oracle, not the spec source). **Scope
+note**: this entire family was formally deprecated in MIPS32 and removed
+outright in Release 6 (MD00086 Rev 6.04 §2.1.2, same removal note already
+cited for `lwl`/`lwr`/`swl`/`swr` above); this project targets MIPS32
+Release 2, where the family is still architecturally present, and it does
+still appear in real historical/legacy binaries and in code generated by
+older toolchains with `-mbranch-likely` — hence "real historical/
+compatibility part of the language" rather than purely academic. **All
+eight are implemented** (no subset was cut): the four `beq`/`bne`/`blez`/
+`bgtz`-shaped instructions (`beql`, `bnel`, `blezl`, `bgtzl`) and the four
+REGIMM zero-comparison-shaped instructions (`bltzl`, `bgezl`, `bltzall`,
+`bgezall`).
+
+### This is a real architectural difference, not a simplification
+
+**Every other branch/jump documented in this file always executes its
+delay-slot instruction, taken or not** — that is exactly what `pendingBranch`
+(Global rule 3 above) models: a taken `beq`/`bltz`/`j`/`jr`/etc. falls
+through to the delay slot first, and only *then* redirects `pc`; a
+not-taken `beq`/`bltz`/etc. just falls through normally, with the delay
+slot executing either way. The eight instructions in this section are the
+one documented exception to that global rule, by MIPS32's own architectural
+definition, not by any modeling choice of this project: **if the branch is
+*not* taken, the delay-slot instruction is architecturally nullified
+("squashed")** — real hardware never fetches, decodes, or executes it at
+all, and control falls straight through to `PC_next + 4` (i.e. `pc + 8`,
+past *both* the branch and its squashed delay slot). If the branch *is*
+taken, a branch-likely instruction behaves exactly like its non-likely
+counterpart — the delay slot *does* execute normally in that case, with no
+difference from `beq`/`bltz`/etc. at all.
+
+This is why `beql` is not simply "`beq` with a different opcode": the
+not-taken case has a genuinely different effect on what instructions
+execute, not just on where `pc` ends up. Historically, this existed so
+compilers could place a loop body (which, by construction, only needs to
+run when the loop continues) directly in the delay slot of the
+loop-continuation branch, without a wasted/no-op delay-slot instruction on
+loop exit — a micro-optimization for the classic MIPS in-order pipeline,
+which is also exactly why it was deprecated once pipelines/compilers moved
+past needing it, per MIPS32 Release 6's removal.
+
+### The squash mechanism (`State.squashNext`)
+
+Implementing this correctly needs a second, independent mechanism from
+`pendingBranch`, since `pendingBranch`'s whole model is "execute the
+delay-slot instruction, *then* redirect" — the opposite of "skip the
+delay-slot instruction entirely." This project adds `State.squashNext :
+Bool` (see its docstring in `Semantics/Types.lean`) for exactly this:
+
+- A **taken** branch-likely instruction never touches `squashNext` at all —
+  it schedules `pendingBranch` exactly like its non-likely counterpart (see
+  each entry below), and the delay slot executes normally.
+- A **not-taken** branch-likely instruction sets `squashNext := true` and
+  leaves `pc` at `pcNext` (`pc + 4`, the delay-slot instruction's own
+  address) — it does *not* fall through the ordinary way (contrast
+  `beq`'s not-taken case, which is an unremarkable `mkNext s s`).
+- Enforcement of the actual skip is **not** in `Semantics/Step.lean`'s
+  `step` function. `step` is deliberately left completely unaware that
+  `squashNext` exists as a concept (it is only a field `step`'s own
+  instruction cases can set, via `{ s with ... }`, never one `step` reads
+  back) — this keeps `step`'s fetch/decode/dispatch behavior, and every
+  existing `Specs/StepSpec.lean` theorem reasoning about it, completely
+  unchanged by this addition. Instead, `Semantics/Step.lean`'s `run` loop
+  enforces it: before calling `step` on each iteration, `run` checks the
+  *incoming* state's `squashNext` flag; if set, it skips calling `step`
+  entirely for that iteration, advancing `pc` by one word and clearing the
+  flag directly (still consuming one unit of the step budget, matching real
+  hardware's instruction-issue timing — a squashed slot still occupies one
+  pipeline cycle, it just has no effect). Because `step`/`decode` are never
+  invoked on the squashed instruction, this holds **even when the word
+  sitting there is undecodable garbage** that would otherwise halt with
+  `HaltReason.illegalInstruction` — real hardware never even looks at it,
+  and neither does this simulator in that case. A consequence worth noting
+  explicitly: a single bare call to `step` on a not-taken branch-likely
+  instruction only sets `squashNext` and advances to `pcNext` — the actual
+  skip of the instruction *after* that one is observable only through `run`
+  (or an equivalent two-call sequence that itself checks `squashNext`
+  before the second `step` call), not through a single `step` call by
+  itself.
+
+### beql / bnel (I-branch)
+
+- **Encoding**: `beql`: `opcode=010100` (0x14). `bnel`: `opcode=010101`
+  (0x15). Identical field layout to `beq`/`bne`: `rs=fffff`, `rt=sssss`,
+  `offset=tttt...` (16-bit signed word displacement).
+- **Semantics**: `beql`: if `$rs == $rt`, schedules `PC = PC_next +
+  (offset << 2)` exactly like `beq` (the delay slot executes normally);
+  otherwise sets `State.squashNext := true` and leaves `pc` at `PC_next`
+  (the delay slot is nullified — see above). `bnel` is the same with the
+  condition inverted (`$rs != $rt`), exactly mirroring `bne`.
+- **Errors/halts**: none directly; a branch/jump occupying a *taken*
+  `beql`/`bnel`'s own delay slot halts with `HaltReason.branchInDelaySlot`,
+  same as every other branch/jump (Global rule 3) — this check is unrelated
+  to and unaffected by the not-taken squash mechanism.
+- **ISA note**: real MIPS32 instruction (MIPS II onward), deprecated in
+  MIPS32 and removed in Release 6 (see the scope note above). Not MARS-
+  sourced; grounded directly in MD00086.
+- **Source**: MD00086 Rev 2.50, §3.2, Table 3-10, p. 28 (`BEQL` entry 69,
+  `BNEL` entry 92).
+
+### blezl / bgtzl (I-branch)
+
+- **Encoding**: `blezl`: `opcode=010110` (0x16), `rt` field fixed 0.
+  `bgtzl`: `opcode=010111` (0x17), `rt` field fixed 0. Identical field
+  layout to `blez`/`bgtz`.
+- **Semantics**: `blezl`: if `$rs <= 0` (signed), schedules `PC = PC_next +
+  (offset << 2)` exactly like `blez`; otherwise squashes the delay slot,
+  same mechanism as `beql`. `bgtzl`: if `$rs > 0` (signed), schedules the
+  same way as `bgtz`; otherwise squashes.
+- **Errors/halts**: same delay-slot-halt and squash behavior as `beql`.
+- **ISA note**: real MIPS32 instruction (MIPS II onward), deprecated in
+  MIPS32 and removed in Release 6. Not MARS-sourced.
+- **Source**: MD00086 Rev 2.50, §3.2, Table 3-10, p. 28 (`BLEZL` entry 83,
+  `BGTZL` entry 81).
+
+### bltzl / bgezl / bltzall / bgezall (I-branch, REGIMM)
+
+- **Encoding**: all four share REGIMM `opcode=000001` (0x01), same major
+  opcode as `bltz`/`bgez`/`bltzal`/`bgezal`/the trap-immediate family above
+  — the `rt` field (not the opcode) selects which instruction it is:
+  `bltzl` = `0x02`, `bgezl` = `0x03`, `bltzall` = `0x12`, `bgezall` = `0x13`.
+  Identical `rs, offset` field layout to `bltz`/`bgez`/`bltzal`/`bgezal`.
+
+  | Mnemonic | `rt` field | Semantics |
+  |---|---|---|
+  | `bltzl` | `0x02` | `if ($rs < 0) PC = PC_next + (offset << 2)`, signed; else squash |
+  | `bgezl` | `0x03` | `if ($rs >= 0) PC = PC_next + (offset << 2)`, signed; else squash |
+  | `bltzall` | `0x12` | `$ra = PC_next + 4` unconditionally; then same condition as `bltzl` |
+  | `bgezall` | `0x13` | `$ra = PC_next + 4` unconditionally; then same condition as `bgezl` |
+
+- **Semantics**: `bltzl`/`bgezl` are plain branch-likely versions of
+  `bltz`/`bgez` — taken schedules `pendingBranch` exactly like `bltz`/
+  `bgez`; not taken squashes, same mechanism as `beql`. `bltzall`/
+  `bgezall` additionally link `$ra = PC_next + 4` (`pc + 8`, past the delay
+  slot, same convention as `jal`/`bltzal`/`bgezal`) — real MIPS32 performs
+  this link **unconditionally**, on every execution of the instruction,
+  regardless of whether the branch itself is taken *or* squashed (same
+  "link always happens" rule already documented for `bltzal`/`bgezal`
+  above, now additionally confirmed to survive the squash case: the link
+  is a plain register write that happens before the taken/not-taken test,
+  completely independent of the delay-slot mechanism).
+- **Errors/halts**: same delay-slot-halt and squash behavior as `beql`.
+- **UNPREDICTABLE case**: `bltzall`/`bgezall` share the same `rs = $ra`
+  (31) UNPREDICTABLE case as `bltzal`/`bgezal`, resolved the same way (the
+  pre-link value of `$rs` is tested) — see `bltzal`'s entry above for the
+  full discussion; nothing about that resolution changes when the branch
+  is squashed rather than not-taken-and-falling-through, since the
+  resolution is about which value of `$rs` is read, not about the delay
+  slot at all.
+- **ISA note**: real MIPS32 instruction (MIPS II onward), deprecated in
+  MIPS32 and removed in Release 6. Not MARS-sourced.
+- **Source**: MD00086 Rev 2.50, §3.2, Table 3-10, p. 28 (`BLTZL` entry 89,
+  `BGEZL` entry 77, `BLTZALL` entry 88, `BGEZALL` entry 76).
+
+### Encoding summary
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `sync` | R, opcode 0, funct 0x0f | no-op (falls through to `PC_next`); no concurrency/reordering model exists to order against |
+| `synci offset($rs)` | I, REGIMM opcode 0x01, `rt`=0x1f | no-op (falls through to `PC_next`); `addr = $rs + sext16(offset)` computed but never used — no instruction-cache model exists to flush |
+
+| `beql $rs, $rt, target` | I, opcode 0x14 | if `$rs == $rt`, branch (delay slot executes); else squash the delay slot |
+| `bnel $rs, $rt, target` | I, opcode 0x15 | if `$rs != $rt`, branch; else squash |
+| `blezl $rs, target` | I, opcode 0x16 | if `$rs <= 0` (signed), branch; else squash |
+| `bgtzl $rs, target` | I, opcode 0x17 | if `$rs > 0` (signed), branch; else squash |
+| `bltzl $rs, target` | I, REGIMM, `rt`=0x02 | if `$rs < 0` (signed), branch; else squash |
+| `bgezl $rs, target` | I, REGIMM, `rt`=0x03 | if `$rs >= 0` (signed), branch; else squash |
+| `bltzall $rs, target` | I, REGIMM, `rt`=0x12 | `$ra = PC_next+4` always; if `$rs < 0`, branch; else squash |
+| `bgezall $rs, target` | I, REGIMM, `rt`=0x13 | `$ra = PC_next+4` always; if `$rs >= 0`, branch; else squash |
+
+("branch" = schedule `PC = PC_next + (sext16(offset) << 2)` via
+`pendingBranch`, delay slot executes normally, same as the non-likely
+counterpart; "squash" = set `State.squashNext := true`, the delay-slot
+instruction at `pc + 4` is never fetched/decoded/executed, `run` advances
+past it directly to `pc + 8` on its next iteration.)
+
+### Citation
+
+"MIPS32 Architecture For Programmers, Volume II-A: The MIPS32 Instruction
+Set" (MD00086, Rev 2.50), §3.2, Table 3-4 (p. 26): `SYNC` (entry 288,
+opcode 0, funct 0x0f) and `SYNCI` (entry 290, opcode 0x01 REGIMM, `rt`
+field 0x1f, MIPS32r2). No internet access was used to write this section;
+these are well-established, memorized ISA constants (the same citation
+already used by `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7, which lists both
+instructions' table/page/entry numbers independently), and any single value
+a future reader doubts — particularly the exact `funct`/`rt`-field values
+above, which were supplied directly rather than independently re-derived in
+this no-internet-access environment — should be cross-checked against a
+primary MIPS32 ISA reference before relying on it for anything beyond this
+simulator.
+
+Set" (MD00086, Rev 2.50), §3.2, Table 3-10, p. 28: `BEQL` (entry 69),
+`BNEL` (entry 92), `BLEZL` (entry 83), `BGTZL` (entry 81), `BLTZL`
+(entry 89), `BGEZL` (entry 77), `BLTZALL` (entry 88), `BGEZALL`
+(entry 76). Removal in MIPS32 Release 6: MD00086 Rev 6.04 §2.1.2 (same
+removal note already cited for `lwl`/`lwr`/`swl`/`swr` above). No internet
+access was used to write this section; these are well-established,
+memorized ISA constants, cross-referenced against
+`docs/spec/MIPS-COVERAGE-GAPS.md`'s independent research pass (§3.3, which
+cites the same table/page/entry numbers) before being relied upon here. As
+with every hand-encoded constant in this project, any single value a future
+reader doubts should be cross-checked against a primary MIPS32 ISA
 reference before relying on it for anything beyond this simulator.

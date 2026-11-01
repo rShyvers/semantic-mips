@@ -56,10 +56,25 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   (docs/spec/MIPS-COVERAGE-GAPS.md section 3.8): `teqi`/`tnei`/`tgei`/
   `tgeiu`/`tlti`/`tltiu` (`rs, imm` operands; REGIMM opcode 0x01, same
   opcode as `bltz`/`bgez`/etc. below, distinguished by the `rt` field).
+- The "branch likely" family (real MIPS32 ISA; deprecated in MIPS32,
+  removed in Release 6 -- see `docs/spec/MIPS-COVERAGE-GAPS.md` section 3.3
+  and `bTable`'s docstring below): `beql`/`bnel` (`rs, rt, target`,
+  identical shape to `beq`/`bne`), `blezl`/`bgtzl`/`bltzl`/`bgezl`/
+  `bltzall`/`bgezall` (`rs, target`, identical shape to `blez`/`bgtz`/
+  `bltz`/`bgez`/`bltzal`/`bgezal`). Same table-driven `bTable` encoding as
+  every other branch in this file -- the squash-on-not-taken semantics this
+  family adds is pure `Step.lean` behavior, invisible to the assembler.
 - `ll`/`sc` (real MIPS32 atomic synchronization primitives, added on top of
   the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): identical
   `rt, offset(rs)` shape and parsing to `lw`/`sw`, table-driven the same way
   (opcodes 0x30/0x38).
+- `sync` (zero operands, like `break`; opcode 0, funct 0x0f) and `synci
+  offset(rs)` (REGIMM opcode 0x01, `rt` field fixed 0x1f, same addressing
+  syntax as `lw`/`sw` but with no destination/source register operand --
+  table-driven via a new `IForm.memNoRt`) -- real MIPS32 memory-ordering
+  barrier and instruction-cache-flush hint, completing the atomics story
+  alongside `ll`/`sc` above (`docs/spec/MIPS-COVERAGE-GAPS.md` section 3.7;
+  see `docs/spec/INSTRUCTION-REF.md`).
 - `lwl`/`lwr`/`swl`/`swr` (real MIPS32 classic, pre-r6 unaligned load/store
   pair, added on top of the original v1 set -- see `docs/spec/
   MIPS-COVERAGE-GAPS.md` section 3.6 and `docs/spec/INSTRUCTION-REF.md`):
@@ -71,6 +86,15 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   `round.w.s`/`trunc.w.s`/`ceil.w.s`/`floor.w.s`, `cvt.s.w`/`cvt.w.s`,
   `c.eq.s`/`c.lt.s`/`c.le.s`/`c.f.s`/`c.un.s`/`c.ueq.s`/`c.olt.s`/`c.ult.s`/
   `c.ole.s`/`c.ule.s`, `bc1t`/`bc1f`.
+- Coprocessor-1 (FPU) double-precision subset (v2 addition,
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.9A; `docs/spec/INSTRUCTION-REF.md`'s
+  double-precision section): `ldc1`/`sdc1`, `add.d`/`sub.d`/`mul.d`/`div.d`,
+  `mov.d`, `sqrt.d`/`abs.d`/`neg.d`, `cvt.d.s`/`cvt.s.d`/`cvt.d.w`/`cvt.w.d`,
+  `c.eq.d`/`c.lt.d`/`c.le.d`/`c.f.d`/`c.un.d`/`c.ueq.d`/`c.olt.d`/`c.ult.d`/
+  `c.ole.d`/`c.ule.d`. `$fN` operands name the *low* register of the
+  register pair the double value occupies (same `$fN` parsing as the
+  single-precision instructions above, `parseFpRegister`); the assembler
+  does not check/enforce that `N` is even.
 - Coprocessor-0 (CP0) register move / execution control (real MIPS32 ISA,
   `docs/spec/MIPS-COVERAGE-GAPS.md` \u00a73.10A; see `Instruction.lean`/
   `Step.lean`): `mfc0 $rt, rd` / `mtc0 $rt, rd` (`rd` is a plain numeric CP0
@@ -367,6 +391,7 @@ private inductive IForm
   | lui      -- rt, imm
   | mem      -- rt, offset(rs)
   | trapImm (rtField : Nat)  -- rs, imm (rt field fixed to the given REGIMM trap selector)
+  | memNoRt (rtField : Nat)  -- offset(rs) only, no destination/source register (synci: rt field fixed 0x1f)
 
 private inductive BForm
   | two          -- rs, rt, target
@@ -414,7 +439,12 @@ private def iTable : List (String × Nat × IForm) :=
    -- load/store pair (opcodes 0x22/0x26/0x2a/0x2e; MD00086 Rev 2.50
    -- §3.2, Table 3-4), same `rt, offset(rs)` shape as `lw`/`sw` (see
    -- `Instruction.lean`/`docs/spec/INSTRUCTION-REF.md`).
-   ("lwl", 0x22, .mem), ("lwr", 0x26, .mem), ("swl", 0x2a, .mem), ("swr", 0x2e, .mem)]
+   ("lwl", 0x22, .mem), ("lwr", 0x26, .mem), ("swl", 0x2a, .mem), ("swr", 0x2e, .mem),
+   -- `synci`: real MIPS32 instruction-cache-flush hint (REGIMM opcode
+   -- 0x01, `rt` field fixed 0x1f; MIPS32r2, `docs/spec/MIPS-COVERAGE-GAPS.md`
+   -- section 3.7), `offset(rs)` only -- no destination/source register,
+   -- unlike every other `.mem`-shaped mnemonic above.
+   ("synci", 0x01, .memNoRt 0x1f)]
 
 /-- Static table of J-type mnemonics: (name, opcode). -/
 private def jTable : List (String × Nat) := [("j", 0x02), ("jal", 0x03)]
@@ -427,7 +457,17 @@ selects which one, per MD00086 Rev 2.50 §3.2, Table 3-2 (see
 private def bTable : List (String × Nat × BForm) :=
   [("beq", 0x04, .two), ("bne", 0x05, .two), ("blez", 0x06, .one), ("bgtz", 0x07, .one),
    ("bltz", 0x01, .regimm 0x00), ("bgez", 0x01, .regimm 0x01),
-   ("bltzal", 0x01, .regimm 0x10), ("bgezal", 0x01, .regimm 0x11)]
+   ("bltzal", 0x01, .regimm 0x10), ("bgezal", 0x01, .regimm 0x11),
+   -- "Branch likely" family (real MIPS32; deprecated in MIPS32, removed in
+   -- Release 6 -- MD00086 Rev 2.50 \u00a73.2, Table 3-10, p. 28; see
+   -- docs/spec/MIPS-COVERAGE-GAPS.md \u00a73.3 and `Instruction.lean`'s
+   -- `.beql`..`.bgezall` docstrings). Identical field shapes/operand syntax
+   -- to the non-likely branches directly above, so this table-driven
+   -- `encodeBForm` needs no changes at all -- the squash-on-not-taken
+   -- semantics is pure `Step.lean` behavior, invisible to the assembler.
+   ("beql", 0x14, .two), ("bnel", 0x15, .two), ("blezl", 0x16, .one), ("bgtzl", 0x17, .one),
+   ("bltzl", 0x01, .regimm 0x02), ("bgezl", 0x01, .regimm 0x03),
+   ("bltzall", 0x01, .regimm 0x12), ("bgezall", 0x01, .regimm 0x13)]
 
 /-- Coprocessor-1 (FPU) mnemonic operand shapes. The static parameters
 (`fmt`/`opcode`/`funct`/`tf`) needed to build each instruction's word are
@@ -441,8 +481,9 @@ private inductive Cop1Form
   | arith3 (fmt funct : Nat)    -- add.s/sub.s/mul.s/div.s: $fd, $fs, $ft
   | unary (fmt funct : Nat)     -- mov.s/cvt.s.w/cvt.w.s/sqrt.s/abs.s/neg.s/
                                 -- round.w.s/trunc.w.s/ceil.w.s/floor.w.s: $fd, $fs
-  | compare (funct : Nat)       -- c.eq.s/c.lt.s/c.le.s/c.f.s/c.un.s/c.ueq.s/
-                                -- c.olt.s/c.ult.s/c.ole.s/c.ule.s: $fs, $ft (fmt always S)
+  | compare (fmt funct : Nat)   -- c.eq.s/c.lt.s/c.le.s/c.f.s/c.un.s/c.ueq.s/
+                                -- c.olt.s/c.ult.s/c.ole.s/c.ule.s (fmt=S) and
+                                -- their c.cond.d counterparts (fmt=D): $fs, $ft
   | branch (tf : Nat)           -- bc1t (tf=1) / bc1f (tf=0): target
 
 /-- Static table of coprocessor-1 (FPU) mnemonics: (name, form). -/
@@ -457,17 +498,38 @@ private def cop1Table : List (String × Cop1Form) :=
    ("round.w.s", .unary 0x10 0x0c), ("trunc.w.s", .unary 0x10 0x0d),
    ("ceil.w.s", .unary 0x10 0x0e), ("floor.w.s", .unary 0x10 0x0f),
    ("cvt.s.w", .unary 0x14 0x20), ("cvt.w.s", .unary 0x10 0x24),
-   ("c.eq.s", .compare 0x32), ("c.lt.s", .compare 0x3c), ("c.le.s", .compare 0x3e),
-   ("c.f.s", .compare 0x30), ("c.un.s", .compare 0x31), ("c.ueq.s", .compare 0x33),
-   ("c.olt.s", .compare 0x34), ("c.ult.s", .compare 0x35),
-   ("c.ole.s", .compare 0x36), ("c.ule.s", .compare 0x37),
-   ("bc1t", .branch 1), ("bc1f", .branch 0)]
+   ("c.eq.s", .compare 0x10 0x32), ("c.lt.s", .compare 0x10 0x3c), ("c.le.s", .compare 0x10 0x3e),
+   ("c.f.s", .compare 0x10 0x30), ("c.un.s", .compare 0x10 0x31), ("c.ueq.s", .compare 0x10 0x33),
+   ("c.olt.s", .compare 0x10 0x34), ("c.ult.s", .compare 0x10 0x35),
+   ("c.ole.s", .compare 0x10 0x36), ("c.ule.s", .compare 0x10 0x37),
+   ("bc1t", .branch 1), ("bc1f", .branch 0),
+   -- Double-precision (`.d`) -- v2 addition, `docs/spec/MIPS-COVERAGE-GAPS.md`
+   -- §3.9A; `fmt` = `D` = 0x11 (see `Instruction.lean`'s double-precision
+   -- bullet for the register-pair convention `$fN` operands follow here).
+   ("ldc1", .mem 0x35), ("sdc1", .mem 0x3d),
+   ("add.d", .arith3 0x11 0x00), ("sub.d", .arith3 0x11 0x01),
+   ("mul.d", .arith3 0x11 0x02), ("div.d", .arith3 0x11 0x03),
+   ("mov.d", .unary 0x11 0x06),
+   ("sqrt.d", .unary 0x11 0x04), ("abs.d", .unary 0x11 0x05), ("neg.d", .unary 0x11 0x07),
+   -- `cvt.d.s`: source is single, so `fmt` = S = 0x10 (names the *source*
+   -- format, same convention as `cvt.s.w`/`cvt.w.s` above); `cvt.d.w`:
+   -- source is a word, `fmt` = W = 0x14.
+   ("cvt.d.s", .unary 0x10 0x21), ("cvt.s.d", .unary 0x11 0x20),
+   ("cvt.d.w", .unary 0x14 0x21), ("cvt.w.d", .unary 0x11 0x24),
+   ("c.eq.d", .compare 0x11 0x32), ("c.lt.d", .compare 0x11 0x3c), ("c.le.d", .compare 0x11 0x3e),
+   ("c.f.d", .compare 0x11 0x30), ("c.un.d", .compare 0x11 0x31), ("c.ueq.d", .compare 0x11 0x33),
+   ("c.olt.d", .compare 0x11 0x34), ("c.ult.d", .compare 0x11 0x35),
+   ("c.ole.d", .compare 0x11 0x36), ("c.ule.d", .compare 0x11 0x37)]
 
--- `break` is a real instruction, not a pseudo-op, but it is zero-operand
--- (like `syscall`) rather than fitting any `RForm` with register operands,
--- so it is special-cased alongside `syscall` the same way throughout this
--- file (`isKnownMnemonic`, `wordsForMnemonic`, `encodeInstruction`).
-private def pseudoSet : List String := ["li", "la", "move", "nop", "syscall", "break"]
+-- `break`/`sync` are real instructions, not pseudo-ops, but are
+-- zero-operand (like `syscall`) rather than fitting any `RForm` with
+-- register operands, so they are special-cased alongside `syscall` the
+-- same way throughout this file (`isKnownMnemonic`, `wordsForMnemonic`,
+-- `encodeInstruction`). `sync` (opcode 0, funct 0x0f; real MIPS32 memory-
+-- ordering barrier, `docs/spec/MIPS-COVERAGE-GAPS.md` section 3.7) does not
+-- carry the `stype` hint field this model omits -- see `Instruction.lean`'s
+-- `.sync` docstring.
+private def pseudoSet : List String := ["li", "la", "move", "nop", "syscall", "break", "sync"]
 private def directiveSet : List String := [".text", ".data", ".word", ".half", ".byte", ".asciiz", ".space"]
 
 /-- SPECIAL2/SPECIAL3 mnemonics with an opcode-bearing R-type-like shape that
@@ -653,6 +715,10 @@ private def wordsForMnemonic (mnemonic : String) (operands : List String) (lineN
     match operands with
     | [] => pure 1
     | _ => throw (.badOperand s!"break takes no operands" lineNo)
+  | "sync" =>
+    match operands with
+    | [] => pure 1
+    | _ => throw (.badOperand s!"sync takes no operands" lineNo)
   | _ => pure 1
 
 private def layoutLine (s : LState) (pl : ParsedLine) : Except AsmError LState := do
@@ -812,6 +878,12 @@ private def encodeIForm (name : String) (opcode : Nat) (form : IForm) (operands 
         let imm ← parseImmediate immT lineNo
         pure (itWord opcode rs rtField (ofInt32 imm))
     | _ => throw (.badOperand s!"{name} expects 'rs, imm'" lineNo)
+  | .memNoRt rtField =>
+    match operands with
+    | [memT] => do
+        let (imm, rs) ← parseMemOperand memT lineNo
+        pure (itWord opcode rs rtField (ofInt32 imm))
+    | _ => throw (.badOperand s!"{name} expects 'offset(rs)'" lineNo)
 
 private def encodeJForm (labels : Std.HashMap String W32) (opcode : Nat) (operands : List String)
     (lineNo : Nat) : Except AsmError W32 :=
@@ -897,12 +969,12 @@ private def encodeCop1Form (labels : Std.HashMap String W32) (name : String) (fo
         let fs ← parseFpRegister fsT lineNo
         pure (cop1RtWord fmt 0 fs fd funct)
     | _ => throw (.badOperand s!"{name} expects '$fd, $fs'" lineNo)
-  | .compare funct =>
+  | .compare fmt funct =>
     match operands with
     | [fsT, ftT] => do
         let fs ← parseFpRegister fsT lineNo
         let ft ← parseFpRegister ftT lineNo
-        pure (cop1RtWord 0x10 ft fs 0 funct)
+        pure (cop1RtWord fmt ft fs 0 funct)
     | _ => throw (.badOperand s!"{name} expects '$fs, $ft'" lineNo)
   | .branch tf =>
     match operands with
@@ -1142,6 +1214,10 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
     match item.operands with
     | [] => pure [0x0000000D#32]              -- all fields zero except funct = 0x0d
     | _ => throw (.badOperand s!"break takes no operands" item.lineNo)
+  | "sync" =>
+    match item.operands with
+    | [] => pure [0x0000000F#32]              -- all fields zero except funct = 0x0f (stype = 0)
+    | _ => throw (.badOperand s!"sync takes no operands" item.lineNo)
   -- Coprocessor-0 (CP0) register move / execution control (real MIPS32
   -- ISA, docs/spec/MIPS-COVERAGE-GAPS.md \u00a73.10A; see `Instruction.lean`/
   -- `Step.lean`). `rd` is a plain numeric CP0 register reference (0-31);
@@ -1572,6 +1648,75 @@ def regimmProg : Program :=
 #guard decode (regimmProg.getD (textBase + 12#32) 0) = some (.bgezal 8#32 0xfffc#32)
 #guard (assemble "bltz $t0\n").isOk = false
 
+-- "Branch likely" family (real MIPS32; deprecated in MIPS32, removed in
+-- Release 6 -- docs/spec/MIPS-COVERAGE-GAPS.md \u00a73.3): `beql`/`bnel` share
+-- `beq`/`bne`'s `rs, rt, target` shape; `blezl`/`bgtzl`/`bltzl`/`bgezl`/
+-- `bltzall`/`bgezall` share `blez`/`bgtz`/`bltz`/`bgez`/`bltzal`/`bgezal`'s
+-- `rs, target` shape -- same table-driven `bTable` encoding as every other
+-- branch in this file.
+def beqlBnelSrc : String := "beql $t0, $t1, loop\nbnel $t0, $t1, loop\nloop: nop\n"
+def beqlBnelProg : Program :=
+  match assemble beqlBnelSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+-- `beql $t0, $t1, loop`: instrAddr = textBase, nextPc = textBase+4,
+-- target = textBase+8 (loop); offset = (8 - 4)/4 = 1.
+#guard beqlBnelProg.getD textBase 0 = mkIT (0x14#32) (8#32) (9#32) (ofInt32 1)
+#guard decode (beqlBnelProg.getD textBase 0) = some (.beql 8#32 9#32 1#32)
+-- `bnel $t0, $t1, loop`: instrAddr = textBase+4, nextPc = textBase+8,
+-- target = textBase+8 (loop); offset = (8 - 8)/4 = 0.
+#guard beqlBnelProg.getD (textBase + 4#32) 0 = mkIT (0x15#32) (8#32) (9#32) (ofInt32 0)
+#guard decode (beqlBnelProg.getD (textBase + 4#32) 0) = some (.bnel 8#32 9#32 0#32)
+#guard (assemble "beql $t0, $t1\n").isOk = false
+
+def blezlBgtzlSrc : String := "loop: blezl $t0, loop\nbgtzl $t0, loop\n"
+def blezlBgtzlProg : Program :=
+  match assemble blezlBgtzlSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+-- `loop: blezl $t0, loop`: instrAddr = textBase = target; nextPc = +4;
+-- offset = (target - nextPc)/4 = -1.
+#guard blezlBgtzlProg.getD textBase 0 = mkIT (0x16#32) (8#32) (0#32) (ofInt32 (-1))
+#guard decode (blezlBgtzlProg.getD textBase 0) = some (.blezl 8#32 0xffff#32)
+-- `bgtzl $t0, loop`: instrAddr = textBase+4, nextPc = textBase+8,
+-- target = textBase (loop); offset = (0 - 8)/4 = -2.
+#guard blezlBgtzlProg.getD (textBase + 4#32) 0 = mkIT (0x17#32) (8#32) (0#32) (ofInt32 (-2))
+#guard decode (blezlBgtzlProg.getD (textBase + 4#32) 0) = some (.bgtzl 8#32 0xfffe#32)
+#guard (assemble "blezl $t0, $t1, loop\n").isOk = false
+
+-- REGIMM branch-likely zero-comparison family: `bltzl`/`bgezl`/`bltzall`/
+-- `bgezall` all share opcode 0x01 (distinguished by the `rt` field, same
+-- as `bltz`/`bgez`/`bltzal`/`bgezal` above); operand shape is `rs, target`.
+def regimmLikelySrc : String :=
+"loop: bltzl $t0, loop\n" ++
+"bgezl $t0, loop\n" ++
+"bltzall $t0, loop\n" ++
+"bgezall $t0, loop\n"
+def regimmLikelyProg : Program :=
+  match assemble regimmLikelySrc with
+  | .ok p => p
+  | .error _ => ∅
+
+-- `loop: bltzl $t0, loop`: instrAddr = textBase = target; nextPc = +4;
+-- offset = (target - nextPc)/4 = -1.
+#guard regimmLikelyProg.getD textBase 0 = mkIT (0x01#32) (8#32) (0x02#32) (ofInt32 (-1))
+#guard decode (regimmLikelyProg.getD textBase 0) = some (.bltzl 8#32 0xffff#32)
+-- `bgezl $t0, loop`: instrAddr = textBase+4, nextPc = textBase+8,
+-- target = textBase (loop); offset = (0 - 8)/4 = -2.
+#guard regimmLikelyProg.getD (textBase + 4#32) 0 = mkIT (0x01#32) (8#32) (0x03#32) (ofInt32 (-2))
+#guard decode (regimmLikelyProg.getD (textBase + 4#32) 0) = some (.bgezl 8#32 0xfffe#32)
+-- `bltzall $t0, loop`: instrAddr = textBase+8, nextPc = textBase+12;
+-- offset = (0 - 12)/4 = -3.
+#guard regimmLikelyProg.getD (textBase + 8#32) 0 = mkIT (0x01#32) (8#32) (0x12#32) (ofInt32 (-3))
+#guard decode (regimmLikelyProg.getD (textBase + 8#32) 0) = some (.bltzall 8#32 0xfffd#32)
+-- `bgezall $t0, loop`: instrAddr = textBase+12, nextPc = textBase+16;
+-- offset = (0 - 16)/4 = -4.
+#guard regimmLikelyProg.getD (textBase + 12#32) 0 = mkIT (0x01#32) (8#32) (0x13#32) (ofInt32 (-4))
+#guard decode (regimmLikelyProg.getD (textBase + 12#32) 0) = some (.bgezall 8#32 0xfffc#32)
+#guard (assemble "bltzl $t0\n").isOk = false
+
 -- Trap-immediate family: `rs, imm` operands (a plain immediate, not a
 -- branch target), same REGIMM opcode 0x01 as `bltz`/etc. above, selected
 -- by the `rt` field (docs/spec/MIPS-COVERAGE-GAPS.md section 3.8).
@@ -1692,6 +1837,70 @@ def cop1Prog : Program :=
 -- an unknown `$f` register is a `badRegister` error
 #guard (assemble "mov.s $f8, $f32\n").isOk = false
 
+-- Coprocessor-1 (FPU) double-precision mnemonics (v2 addition): same
+-- cross-check style as `cop1Src` above -- every emitted word is checked
+-- word-for-word against `Instruction.encode`.
+def cop1DSrc : String :=
+"ldc1 $f5, 4($sp)\n" ++
+"sdc1 $f5, 4($sp)\n" ++
+"add.d $f8, $f7, $f6\n" ++
+"sub.d $f8, $f7, $f6\n" ++
+"mul.d $f8, $f7, $f6\n" ++
+"div.d $f8, $f7, $f6\n" ++
+"mov.d $f8, $f7\n" ++
+"sqrt.d $f8, $f7\n" ++
+"abs.d $f8, $f7\n" ++
+"neg.d $f8, $f7\n" ++
+"cvt.d.s $f8, $f7\n" ++
+"cvt.s.d $f8, $f7\n" ++
+"cvt.d.w $f8, $f7\n" ++
+"cvt.w.d $f8, $f7\n" ++
+"c.eq.d $f7, $f6\n" ++
+"c.lt.d $f7, $f6\n" ++
+"c.le.d $f7, $f6\n" ++
+"c.f.d $f7, $f6\n" ++
+"c.un.d $f7, $f6\n" ++
+"c.ueq.d $f7, $f6\n" ++
+"c.olt.d $f7, $f6\n" ++
+"c.ult.d $f7, $f6\n" ++
+"c.ole.d $f7, $f6\n" ++
+"c.ule.d $f7, $f6\n"
+
+def cop1DProg : Program :=
+  match assemble cop1DSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard cop1DProg.getD textBase 0 = encode (.ldc1 29#32 5#32 4#32)
+#guard cop1DProg.getD (textBase + 4#32) 0 = encode (.sdc1 29#32 5#32 4#32)
+#guard cop1DProg.getD (textBase + 8#32) 0 = encode (.addD 8#32 7#32 6#32)
+#guard cop1DProg.getD (textBase + 12#32) 0 = encode (.subD 8#32 7#32 6#32)
+#guard cop1DProg.getD (textBase + 16#32) 0 = encode (.mulD 8#32 7#32 6#32)
+#guard cop1DProg.getD (textBase + 20#32) 0 = encode (.divD 8#32 7#32 6#32)
+#guard cop1DProg.getD (textBase + 24#32) 0 = encode (.movD 8#32 7#32)
+#guard cop1DProg.getD (textBase + 28#32) 0 = encode (.sqrtD 8#32 7#32)
+#guard cop1DProg.getD (textBase + 32#32) 0 = encode (.absD 8#32 7#32)
+#guard cop1DProg.getD (textBase + 36#32) 0 = encode (.negD 8#32 7#32)
+#guard cop1DProg.getD (textBase + 40#32) 0 = encode (.cvtDS 8#32 7#32)
+#guard cop1DProg.getD (textBase + 44#32) 0 = encode (.cvtSD 8#32 7#32)
+#guard cop1DProg.getD (textBase + 48#32) 0 = encode (.cvtDW 8#32 7#32)
+#guard cop1DProg.getD (textBase + 52#32) 0 = encode (.cvtWD 8#32 7#32)
+#guard cop1DProg.getD (textBase + 56#32) 0 = encode (.cEqD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 60#32) 0 = encode (.cLtD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 64#32) 0 = encode (.cLeD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 68#32) 0 = encode (.cFD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 72#32) 0 = encode (.cUnD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 76#32) 0 = encode (.cUeqD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 80#32) 0 = encode (.cOltD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 84#32) 0 = encode (.cUltD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 88#32) 0 = encode (.cOleD 7#32 6#32)
+#guard cop1DProg.getD (textBase + 92#32) 0 = encode (.cUleD 7#32 6#32)
+-- every emitted double-precision word also round-trips through `decode`
+#guard decode (cop1DProg.getD textBase 0) = some (.ldc1 29#32 5#32 4#32)
+#guard decode (cop1DProg.getD (textBase + 8#32) 0) = some (.addD 8#32 7#32 6#32)
+#guard decode (cop1DProg.getD (textBase + 40#32) 0) = some (.cvtDS 8#32 7#32)
+#guard decode (cop1DProg.getD (textBase + 56#32) 0) = some (.cEqD 7#32 6#32)
+
 -- `ll`/`sc`: identical `rt, offset(rs)` parsing to `lw`/`sw`, cross-checked
 -- against `Instruction.encode`.
 def llscSrc : String :=
@@ -1770,6 +1979,32 @@ def unalignedProg : Program :=
 #guard decode (unalignedProg.getD (textBase + 4#32) 0) = some (.lwr 29#32 8#32 4#32)
 #guard decode (unalignedProg.getD (textBase + 8#32) 0) = some (.swl 29#32 8#32 1#32)
 #guard decode (unalignedProg.getD (textBase + 12#32) 0) = some (.swr 29#32 8#32 4#32)
+
+-- `sync`/`synci`: real MIPS32 memory-ordering barrier / instruction-cache-
+-- flush hint, completing the atomics story alongside `ll`/`sc` above (see
+-- `docs/spec/MIPS-COVERAGE-GAPS.md` section 3.7 and
+-- `docs/spec/INSTRUCTION-REF.md`). `sync` is zero-operand like `break`;
+-- `synci` takes `offset(rs)` only, identical addressing syntax to `lw`/`sw`
+-- but with no destination/source register operand.
+def syncSrc : String :=
+"sync\n" ++
+"synci 4($sp)\n"
+
+def syncProg : Program :=
+  match assemble syncSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard syncProg.getD textBase 0 = encode .sync
+#guard syncProg.getD (textBase + 4#32) 0 = encode (.synci 29#32 4#32)
+-- both emitted words also round-trip through `decode`
+#guard decode (syncProg.getD textBase 0) = some .sync
+#guard decode (syncProg.getD (textBase + 4#32) 0) = some (.synci 29#32 4#32)
+-- operand errors: `sync` takes no operands; `synci` requires the
+-- `offset(rs)` memory-operand syntax, not a bare register.
+#guard (assemble "sync $t0\n").isOk = false
+#guard (assemble "synci $t0\n").isOk = false
+#guard (assemble "synci $t0, 4($sp)\n").isOk = false
 
 -- One error case per major `AsmError` kind.
 #guard (assemble "frobnicate $t0, $t1\n").isOk = false

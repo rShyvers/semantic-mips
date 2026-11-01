@@ -63,6 +63,22 @@ Field-shape summary (see each constructor's docstring for details):
   0x30/0x38); not part of the original v1 instruction set, added as the
   `State.llBit` single-hart model (see `Types.lean`'s `llBit` docstring and
   `docs/spec/INSTRUCTION-REF.md`).
+- No fields: `sync` — real MIPS32 memory-ordering barrier (opcode 0, funct
+  0x0f; `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7), completing the atomics
+  story alongside `ll`/`sc` above. The real encoding also carries an
+  optional 5-bit `stype` hint field (bits 10..6) selecting which kind of
+  ordering to enforce, but since this single-hart, non-reordering simulator
+  has no concurrency or out-of-order execution for `stype` to distinguish
+  between, it is omitted from this constructor entirely (decode ignores
+  whatever value that field holds; encode always emits 0) — a documented
+  simplification, not an oversight (see `docs/spec/INSTRUCTION-REF.md`).
+- I-type synchronize-caches hint (`rs imm`), same field shape as `blez`:
+  `synci` — real MIPS32 instruction-cache-flush hint for self-modifying
+  code / JIT compilers (REGIMM opcode 0x01, `rt` field fixed `0x1f`;
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7, MIPS32r2). Computes the same
+  `$rs + sext16(offset)` address as `lw`/`sw`, but since this simulator has
+  no instruction-cache model at all, the address is never used for
+  anything (see `Step.lean`/`docs/spec/INSTRUCTION-REF.md`).
 - I-type unaligned load/store (`rs rt imm`), same field shape as `lw`/`sw`:
   `lwl lwr swl swr` — real MIPS32 classic (pre-r6) unaligned memory-access
   pair (opcodes 0x22/0x26/0x2a/0x2e); not part of the original v1
@@ -74,6 +90,14 @@ Field-shape summary (see each constructor's docstring for details):
   requirement at all.
 - I-type branch reg/reg (`rs rt imm`): `beq bne`.
 - I-type branch reg-only (`rs imm`): `blez bgtz` — `rt` is unused/fixed 0.
+- I-type "branch likely" family (same field shapes as their non-likely
+  counterparts above): `beql bnel` (`rs rt imm`), `blezl bgtzl bltzl bgezl
+  bltzall bgezall` (`rs imm`) — real MIPS32, deprecated in MIPS32 and
+  removed in Release 6 (`docs/spec/MIPS-COVERAGE-GAPS.md` §3.3). `decode`/
+  `encode` treat these exactly like `beq`/`bltz`/etc.; the one thing that
+  actually makes them different (nullifying/squashing a not-taken delay
+  slot instead of executing it) is pure `Step.lean` behavior, invisible at
+  the field-shape level this module works at.
 - J-type (`target`): `j jal` — raw 26-bit target field (not yet shifted/combined
   with `PC_next`'s top 4 bits; that composition is `Step`'s job).
 - No fields: `syscall` — the syscall *number* lives in `$v0` at execution
@@ -154,15 +178,62 @@ Field-shape summary (see each constructor's docstring for details):
   - `cfc1`/`ctc1` (`rt fs`): GPR↔FPU-control-register move (v1.x addition,
     MIPS-COVERAGE-GAPS.md §3.9C). No FCSR/FIR semantics are modeled; see
     `cfc1`'s docstring for the chosen scratch-storage model.
-  Double-precision (`.d`) and the remaining 6 "signaling" `C.cond.S`
-  predicates (`c.sf`/`c.ngle`/`c.seq`/`c.ngl`/`c.nge`/`c.ngt`, cond numbers
+  Double-precision (`.d`) — opcode `0x11` COP1, `fmt` = `D` = `0x11` (not to
+  be confused with the single-precision `fmt` = `S` = `0x10`) — v2 addition,
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.9A. A double value in `$fN` occupies
+  a **pair** of adjacent 32-bit FPRs under the classic MIPS32 FR=0
+  convention this project's `fpRegs : Array W32` already follows: `$fN`
+  holds the low 32 bits, `$f(N+1)` holds the high 32 bits (real MIPS32
+  requires `N` even for double operands; this model does not check/enforce
+  that, it just follows the convention when composing/decomposing — see
+  `Step.lean`'s `doubleOfRegPair`/`regPairOfDouble`). `fd`/`fs`/`ft` below
+  name the *low* register of each pair; the high register is implicitly
+  `+1`.
+  - `ldc1`/`sdc1` (`rs ft imm`): load/store a full 64-bit doubleword between
+    memory and an FPR pair, identical addressing to `lwc1`/`swc1` (opcodes
+    `0x35`/`0x3d`). Implemented as two `readMemWord`/`writeMemWord` calls (at
+    `addr` and `addr + 4`), reusing `lw`/`sw`'s already-correct alignment and
+    big-endian byte-order logic rather than adding dedicated 64-bit memory
+    helpers — see `Step.lean`'s cases for the resulting (documented)
+    4-byte-alignment-per-half simplification vs. real MIPS32's 8-byte
+    doubleword alignment.
+  - `addD subD mulD divD` (`fd fs ft`): double-precision IEEE-754
+    arithmetic, same shape/semantics as `addS subS mulS divS` but on
+    register-pair-composed 64-bit `Float` values (`fmt` = `D`, `funct` =
+    `0x00`/`0x01`/`0x02`/`0x03`).
+  - `movD` (`fd fs`): FP register-pair raw-bit copy (both 32-bit halves),
+    no `Float` arithmetic (`fmt` = `D`, `funct` = `0x06`).
+  - `cvtDS`/`cvtSD` (`fd fs`): single↔double numeric promotion/demotion
+    (`cvtDS`: `fmt` = `S` = `0x10` since the *source* is single, `funct` =
+    `0x21`; `cvtSD`: `fmt` = `D`, `funct` = `0x20`).
+  - `cvtDW`/`cvtWD` (`fd fs`): int↔double numeric conversion, the
+    double-precision counterpart of `cvtSW`/`cvtWS` (`cvtDW`: `fmt` = `W` =
+    `0x14`, `funct` = `0x21`; `cvtWD`: `fmt` = `D`, `funct` = `0x24`).
+  - `cEqD cLtD cLeD cFD cUnD cUeqD cOltD cUltD cOleD cUleD` (`fs ft`): the
+    double-precision counterparts of the same 10 quiet `C.cond.S`
+    predicates this project already implements for single precision (`fmt`
+    = `D`, same `funct = 0x30 | cond` numbering as the `.S` family —
+    `cEqD`=`0x32`, `cLtD`=`0x3c`, `cLeD`=`0x3e`, `cFD`=`0x30`, `cUnD`=`0x31`,
+    `cUeqD`=`0x33`, `cOltD`=`0x34`, `cUltD`=`0x35`, `cOleD`=`0x36`,
+    `cUleD`=`0x37`); the remaining 6 "signaling" predicates are out of scope
+    here for the same reason they are for `.S` (see below).
+  - `absD negD` (`fd fs`): raw sign-bit operations on the **high** 32-bit
+    half only (`fmt` = `D`, `funct` = `0x05`/`0x07`) — a double's sign bit is
+    bit 63 of the 64-bit value, which lives in the high register's bit 31
+    under the register-pair convention; the low register is copied
+    unchanged. No `Float` arithmetic involved, same rationale as `absS`/
+    `negS`.
+  - `sqrtD` (`fd fs`): double-precision IEEE-754 square root (`fmt` = `D`,
+    `funct` = `0x04`), via Lean core's `Float.sqrt`.
+  The remaining 6 "signaling" `C.cond.S`/`C.cond.D` predicates
+  (`c.sf`/`c.ngle`/`c.seq`/`c.ngl`/`c.nge`/`c.ngt`, cond numbers
   8/9/10/11/13/15 — the signaling counterparts of `c.un`/`c.eq`/`c.ueq`/
   `c.ult`/`c.ule`; this model has no FP-exception mechanism, so a signaling
   predicate would compute an identical `fpCondFlag` result to its quiet
   counterpart, the same relationship already documented between `cLtS`/
-  `cOltS` and `cLeS`/`cOleS` above) are out of scope for this pass, along
-  with `cvt.d.*`/`cvt.*.d`, multi-cc compares, and `bc1tl`/`bc1fl`; see
-  `docs/spec/INSTRUCTION-REF.md` for the documented follow-up.
+  `cOltS` and `cLeS`/`cOleS` above) remain out of scope, along with
+  multi-cc compares and `bc1tl`/`bc1fl`; see `docs/spec/INSTRUCTION-REF.md`
+  for the documented follow-up.
 -/
 
 /-- The full v1 machine-instruction set (24 original real instructions plus
@@ -459,6 +530,52 @@ inductive Instruction where
   `BGEZAL`). Same unconditional-link convention and `rs = $ra`
   UNPREDICTABLE-case resolution as `bltzal`. -/
   | bgezal (rs imm : W32)
+  -- I-type "branch likely" family (real MIPS32 ISA; deprecated in MIPS32,
+  -- removed in Release 6 -- MD00086 Rev 2.50 section 3.2, Table 3-10, p. 28;
+  -- see docs/spec/MIPS-COVERAGE-GAPS.md section 3.3). Field shapes are
+  -- identical to their non-likely counterparts directly above (beq/bne:
+  -- rs rt imm; blez/bgtz/bltz/bgez/bltzal/bgezal: rs imm). The one
+  -- architectural difference -- and the reason these are not just aliases
+  -- of the plain branches -- is the delay slot: a not-taken branch-likely
+  -- instruction nullifies (squashes) its own delay-slot instruction
+  -- instead of executing it. `Instruction.lean`/`Asm.lean` treat these as
+  -- ordinary field-shape-only mnemonics; the squash mechanism itself lives
+  -- entirely in `Step.lean` (`State.squashNext`), since decode/encode have
+  -- no notion of "what happens next". `beql`/`bnel`: opcode 0x14/0x15.
+  -- `blezl`/`bgtzl`: opcode 0x16/0x17. `bltzl`/`bgezl`/`bltzall`/`bgezall`:
+  -- REGIMM (opcode 0x01), rt field 0x02/0x03/0x12/0x13.
+  /-- `if $rs == $rt then PC = PC_next + (sext16(imm) << 2); else squash the
+  delay-slot instruction` (opcode 0x14, `BEQL`). See `Step.lean`'s
+  `.beql` case and `State.squashNext`'s docstring for the squash mechanism. -/
+  | beql (rs rt imm : W32)
+  /-- `if $rs != $rt then PC = PC_next + (sext16(imm) << 2); else squash`
+  (opcode 0x15, `BNEL`). Same shape/mechanism as `beql`. -/
+  | bnel (rs rt imm : W32)
+  /-- `if $rs <= 0 then PC = PC_next + (sext16(imm) << 2); else squash`,
+  signed (opcode 0x16, `BLEZL`; `rt` field fixed 0). Same mechanism as
+  `beql`. -/
+  | blezl (rs imm : W32)
+  /-- `if $rs > 0 then PC = PC_next + (sext16(imm) << 2); else squash`,
+  signed (opcode 0x17, `BGTZL`; `rt` field fixed 0). Same mechanism as
+  `beql`. -/
+  | bgtzl (rs imm : W32)
+  /-- `if $rs < 0 then PC = PC_next + (sext16(imm) << 2); else squash`,
+  signed (opcode 0x01, `rt` field = 0x02 `BLTZL`). Same mechanism as
+  `beql`. -/
+  | bltzl (rs imm : W32)
+  /-- `if $rs >= 0 then PC = PC_next + (sext16(imm) << 2); else squash`,
+  signed (opcode 0x01, `rt` field = 0x03 `BGEZL`). Same mechanism as
+  `beql`. -/
+  | bgezl (rs imm : W32)
+  /-- `$ra = PC_next + 4` unconditionally (same unconditional-link
+  convention as `bltzal`, including on the not-taken/squashed path),
+  **then** `if $rs < 0 then PC = PC_next + (sext16(imm) << 2); else squash`
+  (opcode 0x01, `rt` field = 0x12 `BLTZALL`). -/
+  | bltzall (rs imm : W32)
+  /-- `$ra = PC_next + 4` unconditionally, **then** `if $rs >= 0 then
+  PC = PC_next + (sext16(imm) << 2); else squash` (opcode 0x01, `rt` field
+  = 0x13 `BGEZALL`). Same unconditional-link convention as `bltzall`. -/
+  | bgezall (rs imm : W32)
   -- I-type REGIMM trap-immediate family (real MIPS32 ISA; opcode 0x01,
   -- same opcode as the zero-comparison branches above, selected by the
   -- same `rt`-field multiplexing). Not part of the original v1 instruction
@@ -486,6 +603,19 @@ inductive Instruction where
   /-- `if $rs <u sext16(imm) then trap`: same sign-extend-then-unsigned-compare
   convention as `tgeiu`/`sltiu` (opcode 0x01, `rt` field = 0x0b `TLTIU`). -/
   | tltiu (rs imm : W32)
+  -- Instruction-cache synchronize hint (real MIPS32 ISA, MIPS32r2; see
+  -- `docs/spec/MIPS-COVERAGE-GAPS.md` section 3.7). Shares REGIMM's opcode 0x01
+  -- with the branch/trap-immediate families above, selected the same way
+  -- (by the `rt` field, here fixed to `0x1f`), but its remaining operands
+  -- (`rs`, `imm`) are an address computation like `lw`/`sw`/`blez`, not a
+  -- branch target or trap comparand.
+  /-- Hint to flush the instruction cache at `$rs + sext16(offset)`, for
+  self-modifying code / JIT compilers (opcode 0x01 REGIMM, `rt` field =
+  `0x1f` `SYNCI`). This simulator has no instruction-cache model, so
+  `Step.lean` computes the address (exactly like `lw`/`sw`) but never uses
+  it for anything -- a documented no-op, not a silently-dropped cache
+  effect. -/
+  | synci (rs imm : W32)
   -- J-type
   /-- `PC = (PC_next & 0xF0000000) | (target << 2)` (opcode 0x02). -/
   | j   (target : W32)
@@ -515,6 +645,15 @@ inductive Instruction where
   /-- Unconditional trap (opcode 0, funct 0x0d — the funct value immediately
   after `syscall`'s 0x0c). -/
   | break
+  -- sync (no fields; see module docstring -- the real `stype` hint field is
+  -- out of scope, same "documented simplification, not an oversight"
+  -- rationale as `break`'s omitted "code" field above).
+  /-- Memory-ordering barrier (opcode 0, funct 0x0f -- the next funct value
+  after `break`'s 0x0d, skipping the unassigned 0x0e). Real MIPS32: ensures
+  all loads/stores issued before `sync` complete, as observed by other
+  processors/coherent I/O, before any issued after it -- see
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7. -/
+  | sync
   -- Coprocessor 0 (CP0) register move and execution-control instructions
   -- (v1.x addition; `docs/spec/MIPS-COVERAGE-GAPS.md` §3.10A). Real MIPS32
   -- encoding (opcode 0x10, COP0), scoped to exactly the three CP0
@@ -554,6 +693,16 @@ inductive Instruction where
   | lwc1 (rs ft imm : W32)
   /-- `MEM32[$rs + offset] = rawbits($ft)`, word-aligned (opcode 0x39). -/
   | swc1 (rs ft imm : W32)
+  /-- `{$ft,$ft+1} = MEM64[$rs + offset]`, raw bits, into an FPR pair per the
+  module docstring's register-pair convention (opcode 0x35 `LDC1`). This
+  model only checks each 32-bit half's own 4-byte alignment (via two
+  `readMemWord` calls at `addr`/`addr+4`), not real MIPS32's 8-byte
+  doubleword alignment requirement -- a documented simplification (see
+  `Step.lean`). -/
+  | ldc1 (rs ft imm : W32)
+  /-- `MEM64[$rs + offset] = rawbits({$ft,$ft+1})`, inverse of `ldc1`
+  (opcode 0x3d `SDC1`); same alignment simplification. -/
+  | sdc1 (rs ft imm : W32)
   /-- `$fd = $fs + $ft`, single-precision IEEE-754 (opcode 0x11 COP1,
   `fmt` = `S` = 0x10, `funct` = 0x00 `ADD.S`). -/
   | addS (fd fs ft : W32)
@@ -679,6 +828,107 @@ inductive Instruction where
   `funct` = 0x37, `cond(ULE) = 7`; `cc` fixed 0). Built from `Float32.isNaN`
   explicitly, same rationale as `cUnS`. -/
   | cUleS (fs ft : W32)
+  -- Double-precision (`.d`) arithmetic/move/convert/compare -- opcode 0x11
+  -- COP1, `fmt` = `D` = 0x11 (see the module docstring's double-precision
+  -- bullet for the register-pair convention). `fd`/`fs`/`ft` name the *low*
+  -- register of each operand's pair; `Step.lean`'s `doubleOfRegPair`/
+  -- `regPairOfDouble` do the pair composition/decomposition.
+  /-- `{$fd,$fd+1} = {$fs,$fs+1} + {$ft,$ft+1}`, double-precision IEEE-754
+  (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x00 `ADD.D`). -/
+  | addD (fd fs ft : W32)
+  /-- `{$fd,$fd+1} = {$fs,$fs+1} - {$ft,$ft+1}`, double-precision IEEE-754
+  (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x01 `SUB.D`). -/
+  | subD (fd fs ft : W32)
+  /-- `{$fd,$fd+1} = {$fs,$fs+1} * {$ft,$ft+1}`, double-precision IEEE-754
+  (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x02 `MUL.D`). -/
+  | mulD (fd fs ft : W32)
+  /-- `{$fd,$fd+1} = {$fs,$fs+1} / {$ft,$ft+1}`, double-precision IEEE-754
+  (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x03 `DIV.D`); division by zero
+  produces ±Infinity/NaN per IEEE-754, no trap, same as `divS`. -/
+  | divD (fd fs ft : W32)
+  /-- `{$fd,$fd+1} = {$fs,$fs+1}`, raw pair-to-pair bit copy, both 32-bit
+  halves (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x06 `MOV.D`;
+  `ft`-position field unused/fixed 0). -/
+  | movD (fd fs : W32)
+  /-- `{$fd,$fd+1} = float64(float32bits($fs))`, single-to-double promotion
+  (opcode 0x11 COP1, `fmt` = `S` = 0x10 since the *source* is single,
+  `funct` = 0x21 `CVT.D.S`; `ft`-position field unused). Exact: every
+  `Float32` value is exactly representable as a `Float` (binary64 strictly
+  extends binary32's range/precision). -/
+  | cvtDS (fd fs : W32)
+  /-- `$fd = float32(float64bits({$fs,$fs+1}))`, double-to-single demotion,
+  rounding to the nearest `Float32` (opcode 0x11 COP1, `fmt` = `D`, `funct`
+  = 0x20 `CVT.S.D`; `ft`-position field unused). May lose precision/
+  overflow to ±Infinity, per IEEE-754 double-to-single conversion. -/
+  | cvtSD (fd fs : W32)
+  /-- `{$fd,$fd+1} = float64(int32bits($fs))`, numeric conversion of `$fs`'s
+  bit pattern read as a 32-bit two's-complement int (opcode 0x11 COP1,
+  `fmt` = `W` = 0x14, `funct` = 0x21 `CVT.D.W`; `ft`-position field unused).
+  Exact for every `Int32` value (binary64 has 52 mantissa bits). -/
+  | cvtDW (fd fs : W32)
+  /-- `$fd = int32bits(truncate({$fs,$fs+1}))`, numeric conversion
+  truncating toward zero (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x24
+  `CVT.W.D`; `ft`-position field unused). Same truncating-vs-FCSR-rounding-
+  mode simplification as `cvtWS`. -/
+  | cvtWD (fd fs : W32)
+  /-- `fpCondFlag := ({$fs,$fs+1} == {$ft,$ft+1})`, IEEE-754 double-precision
+  compare (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x32 `C.EQ.D`; `cc`
+  fixed 0). -/
+  | cEqD (fs ft : W32)
+  /-- `fpCondFlag := ({$fs,$fs+1} < {$ft,$ft+1})`, IEEE-754 double-precision
+  compare (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x3c `C.LT.D`; `cc`
+  fixed 0). -/
+  | cLtD (fs ft : W32)
+  /-- `fpCondFlag := ({$fs,$fs+1} <= {$ft,$ft+1})`, IEEE-754 double-precision
+  compare (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x3e `C.LE.D`; `cc`
+  fixed 0). -/
+  | cLeD (fs ft : W32)
+  /-- `fpCondFlag := false`, unconditionally (opcode 0x11 COP1, `fmt` = `D`,
+  `funct` = 0x30, `cond(F) = 0`; `cc` fixed 0). Double-precision counterpart
+  of `cFS`. -/
+  | cFD (fs ft : W32)
+  /-- `fpCondFlag := isNaN({$fs,$fs+1}) ∨ isNaN({$ft,$ft+1})` ("unordered")
+  (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x31, `cond(UN) = 1`; `cc` fixed
+  0). Double-precision counterpart of `cUnS`, same `Float.isNaN`-based
+  rationale. -/
+  | cUnD (fs ft : W32)
+  /-- `fpCondFlag := ({$fs,$fs+1} == {$ft,$ft+1}) ∨ unordered` (opcode 0x11
+  COP1, `fmt` = `D`, `funct` = 0x33, `cond(UEQ) = 3`; `cc` fixed 0). -/
+  | cUeqD (fs ft : W32)
+  /-- `fpCondFlag := ordered ∧ ({$fs,$fs+1} < {$ft,$ft+1})` (opcode 0x11
+  COP1, `fmt` = `D`, `funct` = 0x34, `cond(OLT) = 4`; `cc` fixed 0).
+  Numerically identical to `cLtD`'s modeled result, same `cLtS`/`cOltS`
+  relationship. -/
+  | cOltD (fs ft : W32)
+  /-- `fpCondFlag := ({$fs,$fs+1} < {$ft,$ft+1}) ∨ unordered` (opcode 0x11
+  COP1, `fmt` = `D`, `funct` = 0x35, `cond(ULT) = 5`; `cc` fixed 0). -/
+  | cUltD (fs ft : W32)
+  /-- `fpCondFlag := ordered ∧ ({$fs,$fs+1} <= {$ft,$ft+1})` (opcode 0x11
+  COP1, `fmt` = `D`, `funct` = 0x36, `cond(OLE) = 6`; `cc` fixed 0). -/
+  | cOleD (fs ft : W32)
+  /-- `fpCondFlag := ({$fs,$fs+1} <= {$ft,$ft+1}) ∨ unordered` (opcode 0x11
+  COP1, `fmt` = `D`, `funct` = 0x37, `cond(ULE) = 7`; `cc` fixed 0). -/
+  | cUleD (fs ft : W32)
+  /-- `$fd = sqrt({$fs,$fs+1})`, double-precision IEEE-754 square root
+  (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x04 `SQRT.D`; `ft`-position
+  field unused). Via Lean core's `Float.sqrt` (`@[extern "sqrt"]`, backed by
+  the C library's `sqrt`). -/
+  | sqrtD (fd fs : W32)
+  /-- `{$fd,$fd+1} = |{$fs,$fs+1}|`, i.e. the pair with the sign bit (bit 31
+  of the **high** register, `$fs+1`) cleared and the low register copied
+  unchanged (opcode 0x11 COP1, `fmt` = `D`, `funct` = 0x05 `ABS.D`;
+  `ft`-position field unused). A double's sign bit is bit 63 of the 64-bit
+  value, which lives in the high register's bit 31 under the register-pair
+  convention -- implemented in `Step.lean` as the raw bit operation
+  `($fs+1) &&& 0x7fffffff` on the high half only, same rationale as
+  `absS`. -/
+  | absD (fd fs : W32)
+  /-- `{$fd,$fd+1} = -{$fs,$fs+1}`, i.e. the pair with the high register's
+  sign bit flipped and the low register copied unchanged (opcode 0x11 COP1,
+  `fmt` = `D`, `funct` = 0x07 `NEG.D`; `ft`-position field unused).
+  Implemented in `Step.lean` as `($fs+1) ^^^ 0x80000000` on the high half
+  only, same rationale as `negS`. -/
+  | negD (fd fs : W32)
   /-- `$rt = FpuControl[$fs]`, move from a coprocessor-1 control register to
   a GPR (opcode 0x11 COP1, `rs`-position field = `CF` = 0x02). Real MIPS32
   exposes named control registers (`FIR` = reg 0, `FCSR` = reg 31, ...) with
@@ -778,6 +1028,11 @@ def decode (w : W32) : Option Instruction :=
     | 0x09 => some (.jalr rs rd)
     | 0x0c => some .syscall
     | 0x0d => some .break
+    -- sync: funct 0x0f. The real `stype` hint lives in the `shamt` field
+    -- (bits 10..6); not modeled, so decode matches regardless of its value,
+    -- the same "ignore an unmodeled sub-field" convention as the SPECIAL2
+    -- bit-count family's rt/rd duplication above.
+    | 0x0f => some .sync
     | 0x34 => some (.teq rs rt)
     | 0x36 => some (.tne rs rt)
     | 0x32 => some (.tlt rs rt)
@@ -835,19 +1090,33 @@ def decode (w : W32) : Option Instruction :=
   | 0x05 => some (.bne rs rt imm)
   | 0x06 => some (.blez rs imm)
   | 0x07 => some (.bgtz rs imm)
+  -- "Branch likely" family (real MIPS32; deprecated in MIPS32, removed in
+  -- Release 6 -- see the `.beql`..`.bgezall` docstrings above): same
+  -- opcode positions as `beq`/`bne`/`blez`/`bgtz` would occupy one opcode
+  -- bit higher (0x14..0x17 vs. 0x04..0x07).
+  | 0x14 => some (.beql rs rt imm)
+  | 0x15 => some (.bnel rs rt imm)
+  | 0x16 => some (.blezl rs imm)
+  | 0x17 => some (.bgtzl rs imm)
   | 0x01 =>  -- REGIMM: rt field (not the opcode) selects
-             -- bltz/bgez/bltzal/bgezal/tgei/tgeiu/tlti/tltiu/teqi/tnei
+             -- bltz/bgez/bltzal/bgezal/bltzl/bgezl/bltzall/bgezall/
+             -- tgei/tgeiu/tlti/tltiu/teqi/tnei/synci
     match rt.toNat with
     | 0x00 => some (.bltz rs imm)
     | 0x01 => some (.bgez rs imm)
     | 0x10 => some (.bltzal rs imm)
     | 0x11 => some (.bgezal rs imm)
+    | 0x02 => some (.bltzl rs imm)
+    | 0x03 => some (.bgezl rs imm)
+    | 0x12 => some (.bltzall rs imm)
+    | 0x13 => some (.bgezall rs imm)
     | 0x08 => some (.tgei rs imm)
     | 0x09 => some (.tgeiu rs imm)
     | 0x0a => some (.tlti rs imm)
     | 0x0b => some (.tltiu rs imm)
     | 0x0c => some (.teqi rs imm)
     | 0x0e => some (.tnei rs imm)
+    | 0x1f => some (.synci rs imm)
     | _ => none
   | 0x02 => some (.j target)
   | 0x03 => some (.jal target)
@@ -866,6 +1135,8 @@ def decode (w : W32) : Option Instruction :=
     | _ => none
   | 0x31 => some (.lwc1 rs rt imm)
   | 0x39 => some (.swc1 rs rt imm)
+  | 0x35 => some (.ldc1 rs rt imm)
+  | 0x3d => some (.sdc1 rs rt imm)
   -- Coprocessor 1 (FPU): `rs`-position field is `fmt`/sub-opcode, `rt` is
   -- `ft` (or the GPR for mtc1/mfc1), `rd` is `fs` (or `ft` for arithmetic
   -- format, see each case), `shamt` is `fd` for arithmetic format.
@@ -908,10 +1179,42 @@ def decode (w : W32) : Option Instruction :=
       | 0x35 => if shamt.toNat == 0 then some (.cUltS rd rt) else none
       | 0x36 => if shamt.toNat == 0 then some (.cOleS rd rt) else none
       | 0x37 => if shamt.toNat == 0 then some (.cUleS rd rt) else none
+      -- `cvt.d.s`: source is single, so it's funct 0x21 in the *S* fmt block
+      -- (not the D block below), same "fmt names the source format"
+      -- convention as `cvtSW`/`cvtWS`.
+      | 0x21 => some (.cvtDS shamt rd)
       | _ => none
     | 0x14 =>  -- fmt = W
       match (functOf w).toNat with
       | 0x20 => some (.cvtSW shamt rd)
+      -- `cvt.d.w`: source is a word (int), funct 0x21, same field shape.
+      | 0x21 => some (.cvtDW shamt rd)
+      | _ => none
+    -- fmt = D (0x11): double-precision arithmetic/compare/move/convert
+    -- format, exact same field shape as fmt = S above (ft=rt, fs=rd,
+    -- fd=shamt) -- see the module docstring's double-precision bullet.
+    | 0x11 =>
+      match (functOf w).toNat with
+      | 0x00 => some (.addD shamt rd rt)
+      | 0x01 => some (.subD shamt rd rt)
+      | 0x02 => some (.mulD shamt rd rt)
+      | 0x03 => some (.divD shamt rd rt)
+      | 0x06 => some (.movD shamt rd)
+      | 0x20 => some (.cvtSD shamt rd)
+      | 0x24 => some (.cvtWD shamt rd)
+      | 0x04 => some (.sqrtD shamt rd)
+      | 0x05 => some (.absD shamt rd)
+      | 0x07 => some (.negD shamt rd)
+      | 0x32 => if shamt.toNat == 0 then some (.cEqD rd rt) else none
+      | 0x3c => if shamt.toNat == 0 then some (.cLtD rd rt) else none
+      | 0x3e => if shamt.toNat == 0 then some (.cLeD rd rt) else none
+      | 0x30 => if shamt.toNat == 0 then some (.cFD rd rt) else none
+      | 0x31 => if shamt.toNat == 0 then some (.cUnD rd rt) else none
+      | 0x33 => if shamt.toNat == 0 then some (.cUeqD rd rt) else none
+      | 0x34 => if shamt.toNat == 0 then some (.cOltD rd rt) else none
+      | 0x35 => if shamt.toNat == 0 then some (.cUltD rd rt) else none
+      | 0x36 => if shamt.toNat == 0 then some (.cOleD rd rt) else none
+      | 0x37 => if shamt.toNat == 0 then some (.cUleD rd rt) else none
       | _ => none
     | _ => none
   | _ => none
@@ -998,12 +1301,21 @@ def encode (i : Instruction) : W32 :=
   | .bgez   rs imm => mkIT 0x01#32 rs 0x01#32 imm
   | .bltzal rs imm => mkIT 0x01#32 rs 0x10#32 imm
   | .bgezal rs imm => mkIT 0x01#32 rs 0x11#32 imm
+  | .beql rs rt imm => mkIT 0x14#32 rs rt imm
+  | .bnel rs rt imm => mkIT 0x15#32 rs rt imm
+  | .blezl rs imm => mkIT 0x16#32 rs 0#32 imm
+  | .bgtzl rs imm => mkIT 0x17#32 rs 0#32 imm
+  | .bltzl   rs imm => mkIT 0x01#32 rs 0x02#32 imm
+  | .bgezl   rs imm => mkIT 0x01#32 rs 0x03#32 imm
+  | .bltzall rs imm => mkIT 0x01#32 rs 0x12#32 imm
+  | .bgezall rs imm => mkIT 0x01#32 rs 0x13#32 imm
   | .teqi   rs imm => mkIT 0x01#32 rs 0x0c#32 imm
   | .tnei   rs imm => mkIT 0x01#32 rs 0x0e#32 imm
   | .tgei   rs imm => mkIT 0x01#32 rs 0x08#32 imm
   | .tgeiu  rs imm => mkIT 0x01#32 rs 0x09#32 imm
   | .tlti   rs imm => mkIT 0x01#32 rs 0x0a#32 imm
   | .tltiu  rs imm => mkIT 0x01#32 rs 0x0b#32 imm
+  | .synci  rs imm => mkIT 0x01#32 rs 0x1f#32 imm
   | .j   target => (0x02#32 <<< 26) ||| mkJT target
   | .jal target => (0x03#32 <<< 26) ||| mkJT target
   | .syscall => mkRT 0#32 0#32 0#32 0#32 0x0c#32
@@ -1014,6 +1326,10 @@ def encode (i : Instruction) : W32 :=
   | .tltu rs rt => mkRT rs rt 0#32 0#32 0x33#32
   | .tgeu rs rt => mkRT rs rt 0#32 0#32 0x31#32
   | .break => mkRT 0#32 0#32 0#32 0#32 0x0d#32
+  -- sync: no stored `stype` field, so this always encodes `stype = 0`
+  -- (the default "complete barrier"), same simplification as `break`'s
+  -- unmodeled "code" field.
+  | .sync => mkRT 0#32 0#32 0#32 0#32 0x0f#32
   -- Coprocessor 0 (CP0). Same opcode-OR convention as the COP1 cases below.
   | .mfc0 rt rd => (0x10#32 <<< 26) ||| mkRT 0x00#32 rt rd 0#32 0#32
   | .mtc0 rt rd => (0x10#32 <<< 26) ||| mkRT 0x04#32 rt rd 0#32 0#32
@@ -1026,6 +1342,8 @@ def encode (i : Instruction) : W32 :=
   | .mtc1 rt fs => (0x11#32 <<< 26) ||| mkRT 0x04#32 rt fs 0#32 0#32
   | .lwc1 rs ft imm => mkIT 0x31#32 rs ft imm
   | .swc1 rs ft imm => mkIT 0x39#32 rs ft imm
+  | .ldc1 rs ft imm => mkIT 0x35#32 rs ft imm
+  | .sdc1 rs ft imm => mkIT 0x3d#32 rs ft imm
   | .addS fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs fd 0x00#32
   | .subS fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs fd 0x01#32
   | .mulS fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs fd 0x02#32
@@ -1050,6 +1368,31 @@ def encode (i : Instruction) : W32 :=
   | .cUltS fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs 0#32 0x35#32
   | .cOleS fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs 0#32 0x36#32
   | .cUleS fs ft => (0x11#32 <<< 26) ||| mkRT 0x10#32 ft fs 0#32 0x37#32
+  -- Double-precision (`.d`): `fmt` = `D` = 0x11, same field shape as the
+  -- single-precision cases above; `cvtDS`/`cvtDW` use the *source*'s `fmt`
+  -- (`S`/`W`), same convention as `cvtSW`/`cvtWS`.
+  | .addD fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs fd 0x00#32
+  | .subD fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs fd 0x01#32
+  | .mulD fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs fd 0x02#32
+  | .divD fd fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs fd 0x03#32
+  | .movD fd fs => (0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 fs fd 0x06#32
+  | .cvtDS fd fs => (0x11#32 <<< 26) ||| mkRT 0x10#32 0#32 fs fd 0x21#32
+  | .cvtSD fd fs => (0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 fs fd 0x20#32
+  | .cvtDW fd fs => (0x11#32 <<< 26) ||| mkRT 0x14#32 0#32 fs fd 0x21#32
+  | .cvtWD fd fs => (0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 fs fd 0x24#32
+  | .sqrtD fd fs => (0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 fs fd 0x04#32
+  | .absD fd fs => (0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 fs fd 0x05#32
+  | .negD fd fs => (0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 fs fd 0x07#32
+  | .cEqD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x32#32
+  | .cLtD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x3c#32
+  | .cLeD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x3e#32
+  | .cFD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x30#32
+  | .cUnD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x31#32
+  | .cUeqD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x33#32
+  | .cOltD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x34#32
+  | .cUltD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x35#32
+  | .cOleD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x36#32
+  | .cUleD fs ft => (0x11#32 <<< 26) ||| mkRT 0x11#32 ft fs 0#32 0x37#32
   | .cfc1 rt fs => (0x11#32 <<< 26) ||| mkRT 0x02#32 rt fs 0#32 0#32
   | .ctc1 rt fs => (0x11#32 <<< 26) ||| mkRT 0x06#32 rt fs 0#32 0#32
   | .bc1t imm => mkIT 0x11#32 0x08#32 1#32 imm
@@ -1140,6 +1483,13 @@ example : decode ((0x1f#32 <<< 26) ||| mkRT 29#32 8#32 15#32 6#32 0x04#32) = som
 -- break: opcode 0, funct 0x0d, all other fields 0
 example : decode (mkRT 0#32 0#32 0#32 0#32 0x0d#32) = some .break := by decide
 
+-- sync: opcode 0, funct 0x0f, all other fields 0
+example : decode (mkRT 0#32 0#32 0#32 0#32 0x0f#32) = some .sync := by decide
+-- sync decodes the same way regardless of the (unmodeled) `stype` field,
+-- here carried in the raw `shamt`-position bits (e.g. `stype = 0x10`,
+-- a real MIPS32 "load ordering" hint value)
+example : decode (mkRT 0#32 0#32 0#32 0x10#32 0x0f#32) = some .sync := by decide
+
 -- R-type trap-on-condition: rs=29, rt=8 (same shape as mult/div)
 example : decode (mkRT 29#32 8#32 0#32 0#32 0x34#32) = some (.teq 29#32 8#32) := by decide
 example : decode (mkRT 29#32 8#32 0#32 0#32 0x36#32) = some (.tne 29#32 8#32) := by decide
@@ -1189,12 +1539,25 @@ example : decode (mkIT 0x05#32 29#32 8#32 0x1234#32) = some (.bne 29#32 8#32 0x1
 example : decode (mkIT 0x06#32 29#32 0#32 0x1234#32) = some (.blez 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x07#32 29#32 0#32 0x1234#32) = some (.bgtz 29#32 0x1234#32) := by decide
 
+-- "branch likely" family: same field shapes as beq/bne/blez/bgtz, opcodes
+-- 0x14..0x17 (MIPS-COVERAGE-GAPS.md \u00a73.3).
+example : decode (mkIT 0x14#32 29#32 8#32 0x1234#32) = some (.beql 29#32 8#32 0x1234#32) := by decide
+example : decode (mkIT 0x15#32 29#32 8#32 0x1234#32) = some (.bnel 29#32 8#32 0x1234#32) := by decide
+example : decode (mkIT 0x16#32 29#32 0#32 0x1234#32) = some (.blezl 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x17#32 29#32 0#32 0x1234#32) = some (.bgtzl 29#32 0x1234#32) := by decide
+
 -- REGIMM zero-comparison branches: opcode 0x01, rs=29, imm=0x1234, rt field
 -- selects bltz/bgez/bltzal/bgezal
 example : decode (mkIT 0x01#32 29#32 0x00#32 0x1234#32) = some (.bltz 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x01#32 29#32 0x01#32 0x1234#32) = some (.bgez 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x01#32 29#32 0x10#32 0x1234#32) = some (.bltzal 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x01#32 29#32 0x11#32 0x1234#32) = some (.bgezal 29#32 0x1234#32) := by decide
+-- REGIMM branch-likely zero-comparison family: same opcode 0x01, rt field
+-- 0x02/0x03/0x12/0x13 selects bltzl/bgezl/bltzall/bgezall.
+example : decode (mkIT 0x01#32 29#32 0x02#32 0x1234#32) = some (.bltzl 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x03#32 0x1234#32) = some (.bgezl 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x12#32 0x1234#32) = some (.bltzall 29#32 0x1234#32) := by decide
+example : decode (mkIT 0x01#32 29#32 0x13#32 0x1234#32) = some (.bgezall 29#32 0x1234#32) := by decide
 -- REGIMM trap-immediate family: same opcode 0x01, `rt` field selects
 -- teqi/tnei/tgei/tgeiu/tlti/tltiu (real MIPS32 ISA, MD00086 Rev 2.50 §3.2,
 -- Table 3-2 -- see docs/spec/MIPS-COVERAGE-GAPS.md §3.8).
@@ -1204,9 +1567,13 @@ example : decode (mkIT 0x01#32 29#32 0x08#32 0x1234#32) = some (.tgei 29#32 0x12
 example : decode (mkIT 0x01#32 29#32 0x09#32 0x1234#32) = some (.tgeiu 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x01#32 29#32 0x0a#32 0x1234#32) = some (.tlti 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x01#32 29#32 0x0b#32 0x1234#32) = some (.tltiu 29#32 0x1234#32) := by decide
+-- synci: same opcode 0x01, `rt` field fixed 0x1f (real MIPS32 MIPS32r2
+-- addition, docs/spec/MIPS-COVERAGE-GAPS.md §3.7), `rs, imm` shape
+-- identical to `blez`/`bgtz`.
+example : decode (mkIT 0x01#32 29#32 0x1f#32 0x1234#32) = some (.synci 29#32 0x1234#32) := by decide
 -- a REGIMM word with an unrecognized rt field (0x1d is reserved in the
 -- real MIPS32 REGIMM table -- not one of bltz/bgez/bltzal/bgezal/the trap
--- family above) decodes to none
+-- family/synci above) decodes to none
 #guard decode (mkIT 0x01#32 29#32 0x1d#32 0x1234#32) = none
 
 -- J-type: target = 0x3ffffff (all 26 bits)
@@ -1264,6 +1631,52 @@ example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 0#32 0x36#32) = so
 example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 0#32 0x37#32) = some (.cUleS 7#32 6#32) := by decide
 -- c.un.s with a nonzero cc field (unsupported, only cc=0 modeled) → none
 example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 6#32 7#32 1#32 0x31#32) = none := by decide
+
+-- ldc1/sdc1: rs=29 (base), ft=5, imm=0x1234 (identical layout to lwc1/swc1)
+example : decode (mkIT 0x35#32 29#32 5#32 0x1234#32) = some (.ldc1 29#32 5#32 0x1234#32) := by
+  decide
+example : decode (mkIT 0x3d#32 29#32 5#32 0x1234#32) = some (.sdc1 29#32 5#32 0x1234#32) := by
+  decide
+-- add.d/sub.d/mul.d/div.d: fmt=D, ft=6, fs=7, fd=8
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 8#32 0x00#32) = some (.addD 8#32 7#32 6#32) := by
+  decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 8#32 0x01#32) = some (.subD 8#32 7#32 6#32) := by
+  decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 8#32 0x02#32) = some (.mulD 8#32 7#32 6#32) := by
+  decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 8#32 0x03#32) = some (.divD 8#32 7#32 6#32) := by
+  decide
+-- mov.d/sqrt.d/abs.d/neg.d/cvt.w.d: fmt=D, fs=7, fd=8 (ft-position fixed 0)
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 7#32 8#32 0x06#32) = some (.movD 8#32 7#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 7#32 8#32 0x04#32) = some (.sqrtD 8#32 7#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 7#32 8#32 0x05#32) = some (.absD 8#32 7#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 7#32 8#32 0x07#32) = some (.negD 8#32 7#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 7#32 8#32 0x24#32) = some (.cvtWD 8#32 7#32) := by
+  decide
+-- cvt.d.s: fmt=S (source is single), fs=7, fd=8
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x10#32 0#32 7#32 8#32 0x21#32) = some (.cvtDS 8#32 7#32) := by
+  decide
+-- cvt.s.d: fmt=D (source is double), fs=7, fd=8
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 0#32 7#32 8#32 0x20#32) = some (.cvtSD 8#32 7#32) := by
+  decide
+-- cvt.d.w: fmt=W (source is a word), fs=7, fd=8
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x14#32 0#32 7#32 8#32 0x21#32) = some (.cvtDW 8#32 7#32) := by
+  decide
+-- c.eq.d/c.lt.d/c.le.d/c.f.d/c.un.d/c.ueq.d/c.olt.d/c.ult.d/c.ole.d/c.ule.d:
+-- fmt=D, fs=7, ft=6, fd-position (cc) fixed 0
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x32#32) = some (.cEqD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x3c#32) = some (.cLtD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x3e#32) = some (.cLeD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x30#32) = some (.cFD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x31#32) = some (.cUnD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x33#32) = some (.cUeqD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x34#32) = some (.cOltD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x35#32) = some (.cUltD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x36#32) = some (.cOleD 7#32 6#32) := by decide
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 0#32 0x37#32) = some (.cUleD 7#32 6#32) := by decide
+-- c.eq.d with a nonzero cc field (unsupported, only cc=0 modeled) → none
+example : decode ((0x11#32 <<< 26) ||| mkRT 0x11#32 6#32 7#32 1#32 0x32#32) = none := by decide
+
 -- cfc1/mfc1 share the same (rt, fs) field shape, distinguished by the
 -- rs-position sub-opcode (CF=0x02 vs MF=0x00); ctc1/mtc1 likewise (CT=0x06 vs MT=0x04)
 example : decode ((0x11#32 <<< 26) ||| mkRT 0x02#32 8#32 3#32 0#32 0#32) = some (.cfc1 8#32 3#32) := by decide
@@ -1340,6 +1753,12 @@ example : decode (encode (.tltu 29#32 8#32)) = some (.tltu 29#32 8#32) := by dec
 example : decode (encode (.tgeu 29#32 8#32)) = some (.tgeu 29#32 8#32) := by decide
 example : decode (encode .break) = some .break := by decide
 
+-- sync/synci: encode matches the hand-computed word, and decode (encode i) = some i
+example : encode .sync = mkRT 0#32 0#32 0#32 0#32 0x0f#32 := by decide
+example : encode (.synci 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x1f#32 0x1234#32 := by decide
+example : decode (encode .sync) = some .sync := by decide
+example : decode (encode (.synci 29#32 0x1234#32)) = some (.synci 29#32 0x1234#32) := by decide
+
 -- Coprocessor 1 (FPU): full `decode (encode i) = some i` round-trips
 example : decode (encode (.mfc1 8#32 3#32)) = some (.mfc1 8#32 3#32) := by decide
 example : decode (encode (.mtc1 8#32 3#32)) = some (.mtc1 8#32 3#32) := by decide
@@ -1376,11 +1795,57 @@ example : decode (encode (.ctc1 8#32 3#32)) = some (.ctc1 8#32 3#32) := by decid
 example : decode (encode (.bc1t 0x1234#32)) = some (.bc1t 0x1234#32) := by decide
 example : decode (encode (.bc1f 0x1234#32)) = some (.bc1f 0x1234#32) := by decide
 
+-- Coprocessor 1 (FPU), double-precision: full `decode (encode i) = some i` round-trips
+example : decode (encode (.ldc1 29#32 5#32 0x1234#32)) = some (.ldc1 29#32 5#32 0x1234#32) := by
+  decide
+example : decode (encode (.sdc1 29#32 5#32 0x1234#32)) = some (.sdc1 29#32 5#32 0x1234#32) := by
+  decide
+example : decode (encode (.addD 8#32 7#32 6#32)) = some (.addD 8#32 7#32 6#32) := by decide
+example : decode (encode (.subD 8#32 7#32 6#32)) = some (.subD 8#32 7#32 6#32) := by decide
+example : decode (encode (.mulD 8#32 7#32 6#32)) = some (.mulD 8#32 7#32 6#32) := by decide
+example : decode (encode (.divD 8#32 7#32 6#32)) = some (.divD 8#32 7#32 6#32) := by decide
+example : decode (encode (.movD 8#32 7#32)) = some (.movD 8#32 7#32) := by decide
+example : decode (encode (.cvtDS 8#32 7#32)) = some (.cvtDS 8#32 7#32) := by decide
+example : decode (encode (.cvtSD 8#32 7#32)) = some (.cvtSD 8#32 7#32) := by decide
+example : decode (encode (.cvtDW 8#32 7#32)) = some (.cvtDW 8#32 7#32) := by decide
+example : decode (encode (.cvtWD 8#32 7#32)) = some (.cvtWD 8#32 7#32) := by decide
+example : decode (encode (.sqrtD 8#32 7#32)) = some (.sqrtD 8#32 7#32) := by decide
+example : decode (encode (.absD 8#32 7#32)) = some (.absD 8#32 7#32) := by decide
+example : decode (encode (.negD 8#32 7#32)) = some (.negD 8#32 7#32) := by decide
+example : decode (encode (.cEqD 7#32 6#32)) = some (.cEqD 7#32 6#32) := by decide
+example : decode (encode (.cLtD 7#32 6#32)) = some (.cLtD 7#32 6#32) := by decide
+example : decode (encode (.cLeD 7#32 6#32)) = some (.cLeD 7#32 6#32) := by decide
+example : decode (encode (.cFD 7#32 6#32)) = some (.cFD 7#32 6#32) := by decide
+example : decode (encode (.cUnD 7#32 6#32)) = some (.cUnD 7#32 6#32) := by decide
+example : decode (encode (.cUeqD 7#32 6#32)) = some (.cUeqD 7#32 6#32) := by decide
+example : decode (encode (.cOltD 7#32 6#32)) = some (.cOltD 7#32 6#32) := by decide
+example : decode (encode (.cUltD 7#32 6#32)) = some (.cUltD 7#32 6#32) := by decide
+example : decode (encode (.cOleD 7#32 6#32)) = some (.cOleD 7#32 6#32) := by decide
+example : decode (encode (.cUleD 7#32 6#32)) = some (.cUleD 7#32 6#32) := by decide
+
 -- REGIMM zero-comparison branches: full decode(encode i) = some i round-trips
 example : decode (encode (.bltz 29#32 0x1234#32)) = some (.bltz 29#32 0x1234#32) := by decide
 example : decode (encode (.bgez 29#32 0x1234#32)) = some (.bgez 29#32 0x1234#32) := by decide
 example : decode (encode (.bltzal 29#32 0x1234#32)) = some (.bltzal 29#32 0x1234#32) := by decide
 example : decode (encode (.bgezal 29#32 0x1234#32)) = some (.bgezal 29#32 0x1234#32) := by decide
+-- "Branch likely" family: encode matches the hand-computed opcode, and
+-- full decode(encode i) = some i round-trips (MIPS-COVERAGE-GAPS.md \u00a73.3).
+example : encode (.beql 29#32 8#32 0x1234#32) = mkIT 0x14#32 29#32 8#32 0x1234#32 := by decide
+example : encode (.bnel 29#32 8#32 0x1234#32) = mkIT 0x15#32 29#32 8#32 0x1234#32 := by decide
+example : encode (.blezl 29#32 0x1234#32) = mkIT 0x16#32 29#32 0#32 0x1234#32 := by decide
+example : encode (.bgtzl 29#32 0x1234#32) = mkIT 0x17#32 29#32 0#32 0x1234#32 := by decide
+example : encode (.bltzl 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x02#32 0x1234#32 := by decide
+example : encode (.bgezl 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x03#32 0x1234#32 := by decide
+example : encode (.bltzall 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x12#32 0x1234#32 := by decide
+example : encode (.bgezall 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x13#32 0x1234#32 := by decide
+example : decode (encode (.beql 29#32 8#32 0x1234#32)) = some (.beql 29#32 8#32 0x1234#32) := by decide
+example : decode (encode (.bnel 29#32 8#32 0x1234#32)) = some (.bnel 29#32 8#32 0x1234#32) := by decide
+example : decode (encode (.blezl 29#32 0x1234#32)) = some (.blezl 29#32 0x1234#32) := by decide
+example : decode (encode (.bgtzl 29#32 0x1234#32)) = some (.bgtzl 29#32 0x1234#32) := by decide
+example : decode (encode (.bltzl 29#32 0x1234#32)) = some (.bltzl 29#32 0x1234#32) := by decide
+example : decode (encode (.bgezl 29#32 0x1234#32)) = some (.bgezl 29#32 0x1234#32) := by decide
+example : decode (encode (.bltzall 29#32 0x1234#32)) = some (.bltzall 29#32 0x1234#32) := by decide
+example : decode (encode (.bgezall 29#32 0x1234#32)) = some (.bgezall 29#32 0x1234#32) := by decide
 -- REGIMM trap-immediate family: encode matches the hand-computed opcode,
 -- and full decode(encode i) = some i round-trips.
 example : encode (.teqi 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x0c#32 0x1234#32 := by decide
@@ -1416,8 +1881,11 @@ example : decode (encode (.swr 29#32 8#32 0x1234#32)) = some (.swr 29#32 8#32 0x
 -- opcode 0x11 (COP1) is implemented for the fmt/funct combinations below;
 -- an unrecognized fmt (not MF/MT/BC1/S/W) still decodes to `none`.
 #guard decode (mkIT 0x11#32 0x1f#32 0#32 0#32) = none
-#guard decode (mkIT 0x16#32 0#32 0#32 0#32) = none
-#guard decode (mkIT 0x17#32 0#32 0#32 0#32) = none
+-- opcodes 0x16/0x17 are now assigned to the branch-likely family
+-- (blezl/bgtzl, this track's addition); 0x12/0x13 (COP2, out of scope)
+-- remain unassigned instead.
+#guard decode (mkIT 0x12#32 0#32 0#32 0#32) = none
+#guard decode (mkIT 0x13#32 0#32 0#32 0#32) = none
 -- opcode 0x1c (SPECIAL2) funct 0x00/0x01/0x02/0x04/0x05/0x20/0x21 are now
 -- assigned (madd/maddu/mul/msub/msubu/clz/clo); funct 0x3f remains unassigned.
 #guard decode (mkIT 0x1c#32 0#32 0#32 0x3f#32) = none
@@ -1439,6 +1907,8 @@ example : decode (encode (.swr 29#32 8#32 0x1234#32)) = some (.swr 29#32 8#32 0x
 -- in the real MIPS32 trap family; no mnemonic maps to it.
 #guard decode (mkRT 0#32 0#32 0#32 0#32 0x35#32) = none
 #guard decode (encode (.addS 8#32 7#32 6#32)) = some (.addS 8#32 7#32 6#32)
+#guard decode (encode (.addD 8#32 7#32 6#32)) = some (.addD 8#32 7#32 6#32)
+#guard decode (encode (.ldc1 29#32 5#32 0x1234#32)) = some (.ldc1 29#32 5#32 0x1234#32)
 
 -- Coprocessor 0 (CP0) register move / execution control: mfc0/mtc0/eret/wait
 -- (docs/spec/MIPS-COVERAGE-GAPS.md §3.10A). rt=8 (GPR), rd=13 (Cause).

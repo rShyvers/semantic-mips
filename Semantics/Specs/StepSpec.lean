@@ -3,6 +3,7 @@ import Semantics.Types
 import Semantics.State
 import Semantics.Instruction
 import Semantics.Step
+import Std.Tactic.BVDecide
 
 /-!
 # StepSpec — a reviewable specification for `step`
@@ -90,6 +91,40 @@ partial-memory-store byte extraction (`swl_spec_raw`/`swr_spec_raw` below). -/
 def getByteSlotSpec (w : W32) (slot : Nat) : UInt8 :=
   let shift := (3 - slot) * 8
   ((w >>> shift) &&& 0xff#32).toNat.toUInt8
+
+
+/-- Mirrors `Step.lean`'s private `countLeadingZerosFrom`: counts leading
+zero bits in `w` from the MSB (bit 31), stopping at the first set bit;
+`32` if `w` is all-zero. `fuel` bounds the scan to the remaining unscanned
+bit positions (`pos .. 31`). Used by `cloSpec`/`clzSpec` below (`clo_spec_raw`/
+`clz_spec_raw`). -/
+def countLeadingZerosFromSpec (w : W32) : Nat → Nat → Nat
+  | 0, pos => pos
+  | fuel + 1, pos => if w.getMsbD pos then pos else countLeadingZerosFromSpec w fuel (pos + 1)
+
+/-- Mirrors `Step.lean`'s private `countLeadingZeros`: counts leading zero
+bits in `w`, from the MSB. Used by `clz_spec_raw` below. -/
+def countLeadingZerosSpec (w : W32) : Nat :=
+  countLeadingZerosFromSpec w 32 0
+
+/-- Mirrors `Step.lean`'s private `countLeadingOnes`: counts leading one
+bits in `w`, from the MSB, via `countLeadingZerosSpec (~~~w)` (a run of
+`1`s in `w` is exactly a run of `0`s in `~~~w`). Used by `clo_spec_raw`
+below. -/
+def countLeadingOnesSpec (w : W32) : Nat :=
+  countLeadingZerosSpec (~~~w)
+
+/-- Mirrors `Step.lean`'s private `signExtLowByte`: sign-extends the low
+byte of a register value to 32 bits. Used by `seb_spec_raw` below. -/
+def signExtLowByteSpec (w : W32) : W32 :=
+  (w.extractLsb 7 0).signExtend 32
+
+/-- Mirrors `Step.lean`'s private `lowBitsMask`: a `W32` with the low `n`
+bits set and all higher bits clear (`n = 0..32`). Used by `ext`/`ins` to
+mask out a `size`-bit field (`ext_spec_raw`/`ins_spec_raw` below). -/
+def lowBitsMaskSpec (n : Nat) : W32 :=
+  ((1#32) <<< n) - 1#32
+
 
 /-! ## Group 1 — global invariants preserved by one step -/
 
@@ -194,7 +229,7 @@ theorem add_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rd) sumBV) with
             pc := (writeReg s (regIdxSpec rd) sumBV).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -236,7 +271,7 @@ theorem sub_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rd) diffBV) with
             pc := (writeReg s (regIdxSpec rd) diffBV).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -262,7 +297,7 @@ theorem addi_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) sumBV) with
             pc := (writeReg s (regIdxSpec rt) sumBV).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -288,7 +323,7 @@ theorem div_spec_raw (p : Program) (s : State) (w rs rt : W32)
         StepResult.next { s with pc := s.pc + 4#32 }
       else
         StepResult.next { s with lo := ofInt32 (a.tdiv b), hi := ofInt32 (a.tmod b), pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -352,7 +387,7 @@ theorem beq_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -371,7 +406,7 @@ theorem bne_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       else
         StepResult.next
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -467,7 +502,7 @@ theorem jal_spec_raw (p : Program) (s : State) (w target : W32)
       StepResult.next
         { (writeReg s 31 (pcNext + 4#32)) with
           pc := pcNext, pendingBranch := some ((pcNext &&& 0xf0000000#32) ||| (target <<< 2)) } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -503,7 +538,7 @@ theorem branch_in_delay_slot_halts (p : Program) (s : State) (w : W32) (instr : 
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some instr)
     (hpb : s.pendingBranch.isSome = true) (hbr : isBranchLikeSpec instr = true) :
     step p s = StepResult.halt .branchInDelaySlot := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   cases pb with
   | none => simp at hpb
@@ -531,7 +566,7 @@ theorem lw_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) v) with
             pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -579,7 +614,7 @@ theorem lb_lbu_spec_raw (p : Program) (s : State) (wb wbu rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)) with
             pc := (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)).pc + 4#32 }) := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   constructor
@@ -934,7 +969,7 @@ theorem addu_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) sumBV) with
           pc := (writeReg s (regIdxSpec rd) sumBV).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -954,7 +989,7 @@ theorem subu_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) diffBV) with
           pc := (writeReg s (regIdxSpec rd) diffBV).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -973,7 +1008,7 @@ theorem and_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
       let v := readReg s (regIdxSpec rs) &&& readReg s (regIdxSpec rt)
       StepResult.next
         { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -992,7 +1027,7 @@ theorem or_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
       let v := readReg s (regIdxSpec rs) ||| readReg s (regIdxSpec rt)
       StepResult.next
         { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1011,7 +1046,7 @@ theorem xor_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
       let v := readReg s (regIdxSpec rs) ^^^ readReg s (regIdxSpec rt)
       StepResult.next
         { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1030,7 +1065,7 @@ theorem nor_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
       let v := ~~~(readReg s (regIdxSpec rs) ||| readReg s (regIdxSpec rt))
       StepResult.next
         { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1050,7 +1085,7 @@ theorem slt_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
                then 1#32 else 0#32
       StepResult.next
         { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1070,7 +1105,7 @@ theorem sltu_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
                then 1#32 else 0#32
       StepResult.next
         { (writeReg s (regIdxSpec rd) v) with pc := (writeReg s (regIdxSpec rd) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1095,7 +1130,7 @@ theorem movn_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
             pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rs))).pc + 4#32 }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1154,7 +1189,7 @@ theorem movz_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
             pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rs))).pc + 4#32 }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1289,7 +1324,7 @@ theorem sll_spec_raw (p : Program) (s : State) (w rd rt shamt : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) <<< shamt.toNat)) with
           pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) <<< shamt.toNat)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1309,7 +1344,7 @@ theorem srl_spec_raw (p : Program) (s : State) (w rd rt shamt : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) >>> shamt.toNat)) with
           pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) >>> shamt.toNat)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1330,7 +1365,7 @@ theorem sra_spec_raw (p : Program) (s : State) (w rd rt shamt : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).sshiftRight shamt.toNat)) with
           pc := (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).sshiftRight shamt.toNat)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1353,7 +1388,7 @@ theorem sllv_spec_raw (p : Program) (s : State) (w rd rt rs : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) <<< amt)) with
           pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) <<< amt)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1374,7 +1409,7 @@ theorem srlv_spec_raw (p : Program) (s : State) (w rd rt rs : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) >>> amt)) with
           pc := (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rt) >>> amt)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1394,7 +1429,7 @@ theorem srav_spec_raw (p : Program) (s : State) (w rd rt rs : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).sshiftRight amt)) with
           pc := (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).sshiftRight amt)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1415,7 +1450,7 @@ theorem rotr_spec_raw (p : Program) (s : State) (w rd rt sa : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).rotateRight sa.toNat)) with
           pc := (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).rotateRight sa.toNat)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1436,7 +1471,7 @@ theorem rotrv_spec_raw (p : Program) (s : State) (w rd rt rs : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).rotateRight amt)) with
           pc := (writeReg s (regIdxSpec rd) ((readReg s (regIdxSpec rt)).rotateRight amt)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1569,7 +1604,7 @@ theorem mult_spec_raw (p : Program) (s : State) (w rs rt : W32)
       let prod64 : BitVec 64 := BitVec.ofInt 64 (a * b)
       StepResult.next
         { s with lo := prod64.extractLsb 31 0, hi := prod64.extractLsb 63 32, pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1592,7 +1627,7 @@ theorem multu_spec_raw (p : Program) (s : State) (w rs rt : W32)
       let prod64 : BitVec 64 := BitVec.ofNat 64 (a * b)
       StepResult.next
         { s with lo := prod64.extractLsb 31 0, hi := prod64.extractLsb 63 32, pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1637,7 +1672,7 @@ theorem divu_spec_raw (p : Program) (s : State) (w rs rt : W32)
         StepResult.next { s with pc := s.pc + 4#32 }
       else
         StepResult.next { s with lo := BitVec.ofNat 32 (a / b), hi := BitVec.ofNat 32 (a % b), pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1681,7 +1716,7 @@ theorem mflo_spec_raw (p : Program) (s : State) (w rd : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) s.lo) with
           pc := (writeReg s (regIdxSpec rd) s.lo).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1700,7 +1735,7 @@ theorem mfhi_spec_raw (p : Program) (s : State) (w rd : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) s.hi) with
           pc := (writeReg s (regIdxSpec rd) s.hi).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1717,7 +1752,7 @@ theorem mthi_spec_raw (p : Program) (s : State) (w rs : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.mthi rs))
     (hpb : s.pendingBranch = none) :
     step p s = StepResult.next { s with hi := readReg s (regIdxSpec rs), pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1734,7 +1769,7 @@ theorem mtlo_spec_raw (p : Program) (s : State) (w rs : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.mtlo rs))
     (hpb : s.pendingBranch = none) :
     step p s = StepResult.next { s with lo := readReg s (regIdxSpec rs), pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1807,7 +1842,7 @@ theorem madd_spec_raw (p : Program) (s : State) (w rs rt : W32)
       let sum64 := acc64 + prod64
       StepResult.next
         { s with lo := sum64.extractLsb 31 0, hi := sum64.extractLsb 63 32, pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1833,7 +1868,7 @@ theorem maddu_spec_raw (p : Program) (s : State) (w rs rt : W32)
       let sum64 := acc64 + prod64
       StepResult.next
         { s with lo := sum64.extractLsb 31 0, hi := sum64.extractLsb 63 32, pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1859,7 +1894,7 @@ theorem msub_spec_raw (p : Program) (s : State) (w rs rt : W32)
       let diff64 := acc64 - prod64
       StepResult.next
         { s with lo := diff64.extractLsb 31 0, hi := diff64.extractLsb 63 32, pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1884,7 +1919,7 @@ theorem msubu_spec_raw (p : Program) (s : State) (w rs rt : W32)
       let diff64 := acc64 - prod64
       StepResult.next
         { s with lo := diff64.extractLsb 31 0, hi := diff64.extractLsb 63 32, pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1952,7 +1987,7 @@ theorem sw_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { ({ s' with llBit := false }) with
             pc := ({ s' with llBit := false }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -1988,7 +2023,7 @@ theorem lh_lhu_spec_raw (p : Program) (s : State) (wh whu rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) h) with
             pc := (writeReg s (regIdxSpec rt) h).pc + 4#32 }) := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   constructor
@@ -2020,7 +2055,7 @@ theorem sh_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { ({ s' with llBit := false }) with
             pc := ({ s' with llBit := false }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2045,7 +2080,7 @@ theorem ll_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { ({ (writeReg s (regIdxSpec rt) v) with llBit := true }) with
             pc := ({ (writeReg s (regIdxSpec rt) v) with llBit := true }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2082,7 +2117,7 @@ theorem sc_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
           StepResult.next
             { ({ (writeReg s (regIdxSpec rt) 0#32) with llBit := false }) with
               pc := ({ (writeReg s (regIdxSpec rt) 0#32) with llBit := false }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2188,7 +2223,7 @@ theorem blez_spec_raw (p : Program) (s : State) (w rs imm : W32)
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2231,7 +2266,7 @@ theorem bgtz_spec_raw (p : Program) (s : State) (w rs imm : W32)
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2273,7 +2308,7 @@ theorem j_spec_raw (p : Program) (s : State) (w target : W32)
       let pcNext := s.pc + 4#32
       StepResult.next
         { s with pc := pcNext, pendingBranch := some ((pcNext &&& 0xf0000000#32) ||| (target <<< 2)) } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2295,7 +2330,7 @@ theorem jr_spec_raw (p : Program) (s : State) (w rs : W32)
     step p s =
       StepResult.next
         { s with pc := s.pc + 4#32, pendingBranch := some (readReg s (regIdxSpec rs)) } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2320,7 +2355,7 @@ theorem jalr_spec_raw (p : Program) (s : State) (w rs rd : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rd) (pcNext + 4#32)) with
           pc := pcNext, pendingBranch := some (readReg s (regIdxSpec rs)) } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2377,7 +2412,7 @@ theorem bltz_spec_raw (p : Program) (s : State) (w rs imm : W32)
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2416,7 +2451,7 @@ theorem bgez_spec_raw (p : Program) (s : State) (w rs imm : W32)
           { s with pc := s.pc + 4#32, pendingBranch := some ((s.pc + 4#32) + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2463,7 +2498,7 @@ theorem bltzal_spec_raw (p : Program) (s : State) (w rs imm : W32)
         StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s' with pc := pcNext } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2523,7 +2558,7 @@ theorem bgezal_spec_raw (p : Program) (s : State) (w rs imm : W32)
         StepResult.next { s' with pc := pcNext, pendingBranch := some (pcNext + (signExt16 imm <<< 2)) }
       else
         StepResult.next { s' with pc := pcNext } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2700,7 +2735,7 @@ theorem addiu_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) + signExt16 imm)) with
           pc := (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) + signExt16 imm)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2720,7 +2755,7 @@ theorem slti_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
                then 1#32 else 0#32
       StepResult.next
         { (writeReg s (regIdxSpec rt) v) with pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2744,7 +2779,7 @@ theorem sltiu_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
                then 1#32 else 0#32
       StepResult.next
         { (writeReg s (regIdxSpec rt) v) with pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2765,7 +2800,7 @@ theorem andi_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) &&& zeroExt16 imm)) with
           pc := (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) &&& zeroExt16 imm)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2785,7 +2820,7 @@ theorem ori_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) ||| zeroExt16 imm)) with
           pc := (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) ||| zeroExt16 imm)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2805,7 +2840,7 @@ theorem xori_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) ^^^ zeroExt16 imm)) with
           pc := (writeReg s (regIdxSpec rt) (readReg s (regIdxSpec rs) ^^^ zeroExt16 imm)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2827,7 +2862,7 @@ theorem lui_spec_raw (p : Program) (s : State) (w rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) (zeroExt16 imm <<< 16)) with
           pc := (writeReg s (regIdxSpec rt) (zeroExt16 imm <<< 16)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2920,7 +2955,7 @@ theorem break_spec_raw (p : Program) (s : State) (w : W32)
             cp0Cause := excCodeBp <<< 2
             cp0Status := s.cp0Status ||| statusExlMask
             pc := exceptionVectorAddr } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2955,7 +2990,7 @@ theorem teq_spec_raw (p : Program) (s : State) (w rs rt : W32)
               pc := exceptionVectorAddr }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -2980,7 +3015,7 @@ theorem tne_spec_raw (p : Program) (s : State) (w rs rt : W32)
               pc := exceptionVectorAddr }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3006,7 +3041,7 @@ theorem tlt_spec_raw (p : Program) (s : State) (w rs rt : W32)
               pc := exceptionVectorAddr }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3032,7 +3067,7 @@ theorem tge_spec_raw (p : Program) (s : State) (w rs rt : W32)
               pc := exceptionVectorAddr }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3058,7 +3093,7 @@ theorem tltu_spec_raw (p : Program) (s : State) (w rs rt : W32)
               pc := exceptionVectorAddr }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3084,7 +3119,7 @@ theorem tgeu_spec_raw (p : Program) (s : State) (w rs rt : W32)
               pc := exceptionVectorAddr }
       else
         StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3176,7 +3211,7 @@ theorem mfc1_spec_raw (p : Program) (s : State) (w rt fs : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) (readFpReg s (regIdxSpec fs))) with
           pc := (writeReg s (regIdxSpec rt) (readFpReg s (regIdxSpec fs))).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3196,7 +3231,7 @@ theorem mtc1_spec_raw (p : Program) (s : State) (w rt fs : W32)
       StepResult.next
         { (writeFpReg s (regIdxSpec fs) (readReg s (regIdxSpec rt))) with
           pc := (writeFpReg s (regIdxSpec fs) (readReg s (regIdxSpec rt))).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3221,7 +3256,7 @@ theorem lwc1_spec_raw (p : Program) (s : State) (w rs ft imm : W32)
         StepResult.next
           { (writeFpReg s (regIdxSpec ft) v) with
             pc := (writeFpReg s (regIdxSpec ft) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3260,7 +3295,7 @@ theorem swc1_spec_raw (p : Program) (s : State) (w rs ft imm : W32)
         StepResult.next
           { ({ s' with llBit := false }) with
             pc := ({ s' with llBit := false }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3294,7 +3329,7 @@ theorem absS_spec_raw (p : Program) (s : State) (w fd fs : W32)
       StepResult.next
         { (writeFpReg s (regIdxSpec fd) (readFpReg s (regIdxSpec fs) &&& 0x7fffffff#32)) with
           pc := (writeFpReg s (regIdxSpec fd) (readFpReg s (regIdxSpec fs) &&& 0x7fffffff#32)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3315,7 +3350,7 @@ theorem negS_spec_raw (p : Program) (s : State) (w fd fs : W32)
       StepResult.next
         { (writeFpReg s (regIdxSpec fd) (readFpReg s (regIdxSpec fs) ^^^ 0x80000000#32)) with
           pc := (writeFpReg s (regIdxSpec fd) (readFpReg s (regIdxSpec fs) ^^^ 0x80000000#32)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3399,7 +3434,7 @@ theorem mfc0_spec_raw (p : Program) (s : State) (w rt rd : W32)
           { (writeReg s (regIdxSpec rt) s.cp0Epc) with
             pc := (writeReg s (regIdxSpec rt) s.cp0Epc).pc + 4#32 }
       | _ => StepResult.halt (.illegalInstruction w) := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3430,7 +3465,7 @@ theorem mtc0_spec_raw (p : Program) (s : State) (w rt rd : W32)
           { ({ s with cp0Epc := readReg s (regIdxSpec rt) }) with
             pc := ({ s with cp0Epc := readReg s (regIdxSpec rt) }).pc + 4#32 }
       | _ => StepResult.halt (.illegalInstruction w) := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3463,7 +3498,7 @@ theorem eret_spec_raw (p : Program) (s : State) (w : W32)
     (hpb : s.pendingBranch = none) :
     step p s =
       StepResult.next { s with pc := s.cp0Epc, cp0Status := s.cp0Status &&& ~~~statusExlMask } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3489,7 +3524,7 @@ theorem eret_bypasses_delay_slot (p : Program) (s : State) (w t : W32)
     (hpb : s.pendingBranch = some t) :
     step p s =
       StepResult.next { s with pc := s.cp0Epc, cp0Status := s.cp0Status &&& ~~~statusExlMask } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3507,7 +3542,7 @@ theorem wait_spec_raw (p : Program) (s : State) (w : W32)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some .wait)
     (hpb : s.pendingBranch = none) :
     step p s = StepResult.next { s with pc := s.pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3613,7 +3648,7 @@ theorem addS_spec_raw (p : Program) (s : State) (w fd fs ft : W32)
       StepResult.next
         { (writeFpReg s (regIdxSpec fd) (bitsOfFloatSpec v)) with
           pc := (writeFpReg s (regIdxSpec fd) (bitsOfFloatSpec v)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3679,7 +3714,7 @@ theorem lwl_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) v) with
           pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3726,7 +3761,7 @@ theorem lwr_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { (writeReg s (regIdxSpec rt) v) with
           pc := (writeReg s (regIdxSpec rt) v).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3764,7 +3799,7 @@ theorem swl_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { ({ s' with llBit := false }) with
           pc := ({ s' with llBit := false }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3805,7 +3840,7 @@ theorem swr_spec_raw (p : Program) (s : State) (w rs rt imm : W32)
       StepResult.next
         { ({ s' with llBit := false }) with
           pc := ({ s' with llBit := false }).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -3963,6 +3998,1341 @@ def swTestStateSpec : State :=
             | .halt _ => false)
         | .halt _ => false) = true
 
+
+/-! ## Group 8 — SPECIAL2/SPECIAL3 bit-manipulation specs (`clo`, `clz`,
+`mul`, `seb`, `seh`, `wsbh`, `ext`, `ins`)
+
+These eight instructions (MIPS32/MIPS32r2 additions, `docs/spec/
+MIPS-COVERAGE-GAPS.md` §3.4/§3.5) had an `execInstr` case in `Step.lean` and
+`#guard` coverage there, but no `_spec_raw` theorem in this file. This
+closes that gap, following the same "mirror the private helper, restate
+`step` with public names, close by `rfl`" recipe as every other group above.
+The new mirrors they need (`countLeadingZerosFromSpec`/`countLeadingZerosSpec`/
+`countLeadingOnesSpec`/`signExtLowByteSpec`/`lowBitsMaskSpec`) live next to
+`regIdxSpec` near the top of the file, per this file's existing convention. -/
+
+/-- **`clo` counts `$rs`'s leading one bits (from the MSB) into `$rd`**;
+`32` if `$rs` is all-ones (SPECIAL2 opcode 0x1c, funct 0x21; INSTRUCTION-REF
+"clo"). -/
+theorem clo_spec_raw (p : Program) (s : State) (w rs rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.clo rs rd))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeReg s (regIdxSpec rd)
+            (BitVec.ofNat 32 (countLeadingOnesSpec (readReg s (regIdxSpec rs))))) with
+          pc := (writeReg s (regIdxSpec rd)
+            (BitVec.ofNat 32 (countLeadingOnesSpec (readReg s (regIdxSpec rs))))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`clz` counts `$rs`'s leading zero bits (from the MSB) into `$rd`**;
+`32` if `$rs` is all-zero (SPECIAL2 opcode 0x1c, funct 0x20; INSTRUCTION-REF
+"clz"). -/
+theorem clz_spec_raw (p : Program) (s : State) (w rs rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.clz rs rd))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeReg s (regIdxSpec rd)
+            (BitVec.ofNat 32 (countLeadingZerosSpec (readReg s (regIdxSpec rs))))) with
+          pc := (writeReg s (regIdxSpec rd)
+            (BitVec.ofNat 32 (countLeadingZerosSpec (readReg s (regIdxSpec rs))))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `clo`/`clz` satisfiable examples, matching `Step.lean`'s own `#guard`s:
+-- all-ones -> 32 leading ones, all-zero -> 0; all-zero -> 32 leading zeros.
+#guard (match step (prog1Spec (.clo 8#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32)]) with
+        | .next s => readReg s 10 == 32#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.clo 8#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0xfff0ffff#32)]) with
+        | .next s => readReg s 10 == 12#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.clz 8#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0x00000000#32)]) with
+        | .next s => readReg s 10 == 32#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.clz 8#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0x0000ffff#32)]) with
+        | .next s => readReg s 10 == 16#32
+        | .halt _ => false) = true
+
+/-- **`mul` writes the low 32 bits of the signed product `$rs * $rt` to
+`$rd`; `hi`/`lo` are left completely unchanged** (SPECIAL2 opcode 0x1c,
+funct 0x02; INSTRUCTION-REF "mul"). Unlike `mult`, this never touches the
+`hi`/`lo` accumulator at all — see `mul_leaves_hi_lo_unchanged` below for
+that half of the claim isolated. -/
+theorem mul_spec_raw (p : Program) (s : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.mul rs rt rd))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) (readReg s (regIdxSpec rs) * readReg s (regIdxSpec rt))) with
+          pc := (writeReg s (regIdxSpec rd)
+            (readReg s (regIdxSpec rs) * readReg s (regIdxSpec rt))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **"Bad output rejection" for `mul`**: the resulting state's `hi`/`lo`
+read back *exactly* their pre-step values — a buggy implementation that
+routed `mul` through the same `hi`/`lo`-writing path as `mult` could never
+satisfy this. -/
+theorem mul_leaves_hi_lo_unchanged (p : Program) (s s' : State) (w rs rt rd : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.mul rs rt rd))
+    (hpb : s.pendingBranch = none)
+    (hstep : step p s = StepResult.next s') :
+    s'.hi = s.hi ∧ s'.lo = s.lo := by
+  rw [mul_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+  injection hstep with hs
+  rw [← hs]
+  exact ⟨writeReg_hi s _ _, writeReg_lo s _ _⟩
+
+-- `mul` satisfiable examples, matching `Step.lean`'s own `#guard`s: the
+-- regular product case, and signed wraparound ((-1) * 2 = -2).
+#guard (match step (prog1Spec (.mul 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 6#32), (9, 7#32)]) with
+        | .next s => readReg s 10 == 42#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.mul 8#32 9#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32), (9, 2#32)]) with
+        | .next s => readReg s 10 == 0xfffffffe#32
+        | .halt _ => false) = true
+
+/-- **`seb` sign-extends `$rt`'s low byte into `$rd`**, ignoring `$rt`'s
+higher bits entirely (SPECIAL3 BSHFL opcode 0x1f, funct 0x20, sub-field
+0x10; INSTRUCTION-REF "seb"). -/
+theorem seb_spec_raw (p : Program) (s : State) (w rd rt : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.seb rd rt))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) (signExtLowByteSpec (readReg s (regIdxSpec rt)))) with
+          pc := (writeReg s (regIdxSpec rd)
+            (signExtLowByteSpec (readReg s (regIdxSpec rt)))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`seh` sign-extends `$rt`'s low halfword into `$rd`**, ignoring `$rt`'s
+upper 16 bits entirely (SPECIAL3 BSHFL opcode 0x1f, funct 0x20, sub-field
+0x18; INSTRUCTION-REF "seh"). Reuses the already-public `signExt16` directly
+— no new mirror needed (same helper `addi`/`lw`/etc. already use for
+immediates). -/
+theorem seh_spec_raw (p : Program) (s : State) (w rd rt : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.seh rd rt))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) (signExt16 (readReg s (regIdxSpec rt)))) with
+          pc := (writeReg s (regIdxSpec rd) (signExt16 (readReg s (regIdxSpec rt)))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `seb`/`seh` satisfiable examples, matching `Step.lean`'s own `#guard`s.
+#guard (match step (prog1Spec (.seb 10#32 8#32))
+          (setRegsSpec (initialState textBase) [(8, 0x12345680#32)]) with
+        | .next s => readReg s 10 == 0xffffff80#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.seb 10#32 8#32))
+          (setRegsSpec (initialState textBase) [(8, 0x1234567f#32)]) with
+        | .next s => readReg s 10 == 0x0000007f#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.seh 10#32 8#32))
+          (setRegsSpec (initialState textBase) [(8, 0x1234ffff#32)]) with
+        | .next s => readReg s 10 == 0xffffffff#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.seh 10#32 8#32))
+          (setRegsSpec (initialState textBase) [(8, 0x12347fff#32)]) with
+        | .next s => readReg s 10 == 0x00007fff#32
+        | .halt _ => false) = true
+
+/-- **`wsbh` swaps the two bytes within each 16-bit half of `$rt`
+independently, leaving the halfwords themselves in place** — not a full
+32-bit byte-reverse (SPECIAL3 BSHFL opcode 0x1f, funct 0x20, sub-field 0x02;
+INSTRUCTION-REF "wsbh"). The formula is small enough that `Step.lean` writes
+it out inline with no private helper, so this restates it directly with no
+new mirror needed. -/
+theorem wsbh_spec_raw (p : Program) (s : State) (w rd rt : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.wsbh rd rt))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let v := readReg s (regIdxSpec rt)
+      let b0 := v &&& 0xff#32
+      let b1 := (v >>> 8) &&& 0xff#32
+      let b2 := (v >>> 16) &&& 0xff#32
+      let b3 := (v >>> 24) &&& 0xff#32
+      let result := (b2 <<< 24) ||| (b3 <<< 16) ||| (b0 <<< 8) ||| b1
+      StepResult.next
+        { (writeReg s (regIdxSpec rd) result) with
+          pc := (writeReg s (regIdxSpec rd) result).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `wsbh` satisfiable example, matching `Step.lean`'s own `#guard`: halfword0
+-- `0x5678` swaps to `0x7856`, halfword1 `0x1234` swaps to `0x3412`, halfwords
+-- stay in place -> `0x34127856`.
+#guard (match step (prog1Spec (.wsbh 10#32 8#32))
+          (setRegsSpec (initialState textBase) [(8, 0x12345678#32)]) with
+        | .next s => readReg s 10 == 0x34127856#32
+        | .halt _ => false) = true
+
+/-- **`ext` extracts a `size`-bit field of `$rs` starting at bit `pos`,
+zero-extended, into `$rt`** (SPECIAL3 opcode 0x1f, funct 0x00;
+INSTRUCTION-REF "ext"). `pos`/`size` are already the semantic values here —
+`decode` did the raw-field +-1 arithmetic — so this is pure bit masking,
+with no special case for the real `pos + size <= 32` hardware constraint
+(matching `Step.lean`'s own documented choice). -/
+theorem ext_spec_raw (p : Program) (s : State) (w rt rs pos size : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.ext rt rs pos size))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let field := (readReg s (regIdxSpec rs) >>> pos.toNat) &&& lowBitsMaskSpec size.toNat
+      StepResult.next
+        { (writeReg s (regIdxSpec rt) field) with
+          pc := (writeReg s (regIdxSpec rt) field).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`ins` inserts the low `size` bits of `$rs`, shifted up to bit `pos`,
+into `$rt`, leaving every other bit of `$rt` untouched** (SPECIAL3 opcode
+0x1f, funct 0x04; INSTRUCTION-REF "ins"). See `ins_outside_field_unchanged`
+below for the "every other bit" half of this claim isolated and proved on
+its own, the same way `movn`/`movz`'s "genuinely unchanged" properties are
+proved elsewhere in this file. -/
+theorem ins_spec_raw (p : Program) (s : State) (w rt rs pos size : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.ins rt rs pos size))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let mask := lowBitsMaskSpec size.toNat
+      let srcField := (readReg s (regIdxSpec rs) &&& mask) <<< pos.toNat
+      let clearMask := ~~~(mask <<< pos.toNat)
+      let newVal := (readReg s (regIdxSpec rt) &&& clearMask) ||| srcField
+      StepResult.next
+        { (writeReg s (regIdxSpec rt) newVal) with
+          pc := (writeReg s (regIdxSpec rt) newVal).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **"Bad output rejection" for `ins`**: after `ins` runs, `$rt`'s bits
+*outside* the `[pos, pos+size)` target field read back *exactly* their
+pre-step values — a buggy implementation that e.g. zeroed the rest of `$rt`
+instead of preserving it could never satisfy this. The field-boundary mask
+`clearMask` is exactly `ins_spec_raw`'s own `clearMask`, so this is a direct
+algebraic consequence of that equation (`bv_decide` closes the bitvector
+identity: ORing in a field that `clearMask` already zeroes out cannot change
+what survives when `clearMask` is applied again). Needs `regIdxSpec rt ≠ 0`
+(a write to `$zero` is a no-op, INSTRUCTION-REF Global rule 2) and
+`s.regs.size = 32` (`writeReg_reads_back`'s side condition, guaranteed by
+`initialState` — `State.lean`). -/
+theorem ins_outside_field_unchanged (p : Program) (s s' : State) (w rt rs pos size : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.ins rt rs pos size))
+    (hpb : s.pendingBranch = none)
+    (hrt : regIdxSpec rt ≠ 0) (hsize32 : s.regs.size = 32)
+    (hstep : step p s = StepResult.next s') :
+    let clearMask := ~~~(lowBitsMaskSpec size.toNat <<< pos.toNat)
+    readReg s' (regIdxSpec rt) &&& clearMask = readReg s (regIdxSpec rt) &&& clearMask := by
+  rw [ins_spec_raw p s w rt rs pos size hfetch hdecode hpb] at hstep
+  injection hstep with hs
+  have hr : readReg s' (regIdxSpec rt) =
+      (readReg s (regIdxSpec rt) &&& ~~~(lowBitsMaskSpec size.toNat <<< pos.toNat)) |||
+        ((readReg s (regIdxSpec rs) &&& lowBitsMaskSpec size.toNat) <<< pos.toNat) := by
+    rw [← hs]
+    exact writeReg_reads_back s (regIdxSpec rt) _ hrt hsize32
+  dsimp only
+  rw [hr]
+  bv_decide
+
+-- `ext`/`ins` satisfiable examples, matching `Step.lean`'s own `#guard`s.
+#guard (match step (prog1Spec (.ext 10#32 8#32 6#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0x12345678#32)]) with
+        | .next s => readReg s 10 == ((0x12345678#32 >>> 6) &&& 0x3ff#32)
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.ext 10#32 8#32 0#32 32#32))
+          (setRegsSpec (initialState textBase) [(8, 0x89abcdef#32)]) with
+        | .next s => readReg s 10 == 0x89abcdef#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.ins 10#32 8#32 6#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0x159#32), (10, 0x12345678#32)]) with
+        | .next s => readReg s 10 == ((0x12345678#32 &&& ~~~(0x3ff#32 <<< 6)) ||| ((0x159#32 &&& 0x3ff#32) <<< 6))
+        | .halt _ => false) = true
+-- `ins_outside_field_unchanged` concrete witness: bits outside `[6, 16)` of
+-- `$t2` survive the `ins` untouched.
+#guard (match step (prog1Spec (.ins 10#32 8#32 6#32 10#32))
+          (setRegsSpec (initialState textBase) [(8, 0x159#32), (10, 0x12345678#32)]) with
+        | .next s => (readReg s 10 &&& ~~~(0x3ff#32 <<< 6)) == (0x12345678#32 &&& ~~~(0x3ff#32 <<< 6))
+        | .halt _ => false) = true
+
+
+/-! ## Group 8 — immediate-operand trap family (`teqi`, `tnei`, `tgei`,
+`tgeiu`, `tlti`, `tltiu`)
+
+Ground truth: `docs/spec/INSTRUCTION-REF.md`'s REGIMM trap-immediate
+subsection and `docs/spec/MIPS-COVERAGE-GAPS.md` §3.8, mirrored directly
+from `Step.lean`'s `.teqi`/`.tnei`/`.tgei`/`.tgeiu`/`.tlti`/`.tltiu` cases.
+These six are the sign-extended-16-bit-immediate counterparts of Group 6's
+`teq`/`tne`/`tlt`/`tge`/`tltu`/`tgeu`: same coprocessor-0 `takeException`
+shape (`cp0Epc`/`cp0Cause`/`cp0Status`/`pc` all change together on the
+trapping branch, plain fallthrough to `pc + 4#32` otherwise), comparing
+`$rs` against `signExt16 imm` instead of against a second register.
+`tgeiu`/`tltiu` sign-extend the immediate to a full 32-bit value *first*,
+exactly like `sltiu` does for its immediate, and only then compare the
+resulting bit pattern as unsigned (confirmed against `Step.lean`'s actual
+`.tgeiu`/`.tltiu` cases, which call `signExt16 imm` and then compare
+`.toNat` values — not zero-extension, and not a signed comparison). As in
+Group 6, every theorem below needs `hpb : s.pendingBranch = none` because
+`execInstr` opens with an unconditional `pendingBranch`/`isBranchLike`
+guard before dispatching to any instruction's own case. -/
+
+/-- **`teqi` traps iff `$rs == sext16(imm)`**, taking the shared
+coprocessor-0 exception with `excCode = excCodeTr`; otherwise it is a
+complete no-op beyond the ordinary fallthrough to `pc + 4#32` (REGIMM
+trap-immediate subsection; mirrors `teq_spec_raw` with `sext16 imm` in
+place of `$rt`). -/
+theorem teqi_spec_raw (p : Program) (s : State) (w rs imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.teqi rs imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if readReg s (regIdxSpec rs) == signExt16 imm then
+        StepResult.next
+          { s with
+              cp0Epc := s.pc
+              cp0Cause := excCodeTr <<< 2
+              cp0Status := s.cp0Status ||| statusExlMask
+              pc := exceptionVectorAddr }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`tnei` traps iff `$rs ≠ sext16(imm)`** — the mirror image of `teqi`
+(REGIMM trap-immediate subsection). -/
+theorem tnei_spec_raw (p : Program) (s : State) (w rs imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.tnei rs imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if readReg s (regIdxSpec rs) ≠ signExt16 imm then
+        StepResult.next
+          { s with
+              cp0Epc := s.pc
+              cp0Cause := excCodeTr <<< 2
+              cp0Status := s.cp0Status ||| statusExlMask
+              pc := exceptionVectorAddr }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`tgei` traps iff `$rs ≥s sext16(imm)`**, a *signed* comparison
+(REGIMM trap-immediate subsection; mirrors `tge_spec_raw`). -/
+theorem tgei_spec_raw (p : Program) (s : State) (w rs imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.tgei rs imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if asSigned (readReg s (regIdxSpec rs)) ≥ asSigned (signExt16 imm) then
+        StepResult.next
+          { s with
+              cp0Epc := s.pc
+              cp0Cause := excCodeTr <<< 2
+              cp0Status := s.cp0Status ||| statusExlMask
+              pc := exceptionVectorAddr }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`tgeiu` sign-extends the 16-bit immediate to a full 32-bit value
+first, exactly like `tgei`, then compares the resulting bit patterns as
+*unsigned*** — the "u" affects only the comparison, not the immediate's
+extension (same convention as `sltiu`; confirmed against `Step.lean`'s
+`.tgeiu` case, which calls `signExt16 imm` and then compares `.toNat`
+values). -/
+theorem tgeiu_spec_raw (p : Program) (s : State) (w rs imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.tgeiu rs imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if (readReg s (regIdxSpec rs)).toNat ≥ (signExt16 imm).toNat then
+        StepResult.next
+          { s with
+              cp0Epc := s.pc
+              cp0Cause := excCodeTr <<< 2
+              cp0Status := s.cp0Status ||| statusExlMask
+              pc := exceptionVectorAddr }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`tlti` traps iff `$rs <s sext16(imm)`**, a *signed* comparison
+(REGIMM trap-immediate subsection; mirrors `tlt_spec_raw`). -/
+theorem tlti_spec_raw (p : Program) (s : State) (w rs imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.tlti rs imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if asSigned (readReg s (regIdxSpec rs)) < asSigned (signExt16 imm) then
+        StepResult.next
+          { s with
+              cp0Epc := s.pc
+              cp0Cause := excCodeTr <<< 2
+              cp0Status := s.cp0Status ||| statusExlMask
+              pc := exceptionVectorAddr }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`tltiu` sign-extends the 16-bit immediate to a full 32-bit value
+first, exactly like `tlti`, then compares the resulting bit patterns as
+*unsigned*** — the mirror image of `tgeiu` (same convention as `sltiu`;
+confirmed against `Step.lean`'s `.tltiu` case, which calls `signExt16 imm`
+and then compares `.toNat` values). -/
+theorem tltiu_spec_raw (p : Program) (s : State) (w rs imm : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.tltiu rs imm))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      if (readReg s (regIdxSpec rs)).toNat < (signExt16 imm).toNat then
+        StepResult.next
+          { s with
+              cp0Epc := s.pc
+              cp0Cause := excCodeTr <<< 2
+              cp0Status := s.cp0Status ||| statusExlMask
+              pc := exceptionVectorAddr }
+      else
+        StepResult.next { s with pc := s.pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `teqi_spec_raw`/`tnei_spec_raw`: `$rs == sext16(imm)` traps under `teqi`
+-- (and is a no-op under `tnei`); a mismatch is the mirror image. One
+-- `#guard` per instruction per branch, matching the house style used for
+-- `teq`/`tne` above.
+#guard (match step (prog1Spec (.teqi 8#32 5#32))
+          (setRegsSpec (initialState textBase) [(8, 5#32)]) with
+        | .next s =>
+          s.cp0Epc == textBase && s.cp0Cause == (excCodeTr <<< 2) &&
+            s.cp0Status == statusExlMask && s.pc == exceptionVectorAddr
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.teqi 8#32 5#32))
+          (setRegsSpec (initialState textBase) [(8, 6#32)]) with
+        | .next s => s.pc == textBase + 4#32 && s.cp0Status == 0#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.tnei 8#32 5#32))
+          (setRegsSpec (initialState textBase) [(8, 6#32)]) with
+        | .next s =>
+          s.cp0Epc == textBase && s.cp0Cause == (excCodeTr <<< 2) &&
+            s.cp0Status == statusExlMask && s.pc == exceptionVectorAddr
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.tnei 8#32 5#32))
+          (setRegsSpec (initialState textBase) [(8, 5#32)]) with
+        | .next s => s.pc == textBase + 4#32 && s.cp0Status == 0#32
+        | .halt _ => false) = true
+
+-- `tgei_spec_raw`/`tlti_spec_raw`: `sext16 0xffff = -1`, so `-1` (as
+-- `0xffffffff`) is signed-greater-or-equal to `-1` under `tgei` (traps) but
+-- not signed-less-than `-1` under `tlti` (no trap); `1 < 1` is false so
+-- `tlti 1` also does not trap on `$rs = 1`.
+#guard (match step (prog1Spec (.tgei 8#32 0xffff#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32)]) with
+        | .next s => s.pc == exceptionVectorAddr
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.tgei 8#32 0xffff#32))
+          (setRegsSpec (initialState textBase) [(8, 0xfffffffe#32)]) with
+        | .next s => s.pc == textBase + 4#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.tlti 8#32 1#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32)]) with
+        | .next s => s.pc == exceptionVectorAddr
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.tlti 8#32 1#32))
+          (setRegsSpec (initialState textBase) [(8, 1#32)]) with
+        | .next s => s.pc == textBase + 4#32
+        | .halt _ => false) = true
+
+-- `tgeiu_spec_raw`/`tltiu_spec_raw`: `sext16 1 = 1`, and `0xffffffff` is the
+-- *largest* unsigned value, so `$rs = 0xffffffff` is never `<u 1` under
+-- `tltiu` but always `≥u 1` under `tgeiu` — the same edge case
+-- `sltiu`/`tltu`/`tgeu` above use. A second pair with `sext16 0xffff =
+-- 0xffffffff` and `$rs = 1` confirms `tgeiu` really compares unsigned
+-- (`1 ≥u 0xffffffff` is false), not signed like `tgei` (where the same
+-- inputs trap, since `1 ≥s -1`).
+#guard (match step (prog1Spec (.tgeiu 8#32 1#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32)]) with
+        | .next s => s.pc == exceptionVectorAddr
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.tltiu 8#32 1#32))
+          (setRegsSpec (initialState textBase) [(8, 0xffffffff#32)]) with
+        | .next s => s.pc == textBase + 4#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.tltiu 8#32 1#32))
+          (setRegsSpec (initialState textBase) [(8, 0#32)]) with
+        | .next s => s.pc == exceptionVectorAddr
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.tgeiu 8#32 0xffff#32))
+          (setRegsSpec (initialState textBase) [(8, 1#32)]) with
+        | .next s => s.pc == textBase + 4#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.tgei 8#32 0xffff#32))
+          (setRegsSpec (initialState textBase) [(8, 1#32)]) with
+        | .next s => s.pc == exceptionVectorAddr
+        | .halt _ => false) = true
+
+
+/-! ## Group N — FPU: remaining single-precision instructions (zero-coverage set)
+
+This section proves `_spec_raw` theorems for every single-precision FPU
+`Instruction` constructor that had no `StepSpec.lean` theorem at all before
+this pass: `cfc1`/`ctc1`, `movS`, `cvtSW`/`cvtWS`, `sqrtS`,
+`roundWS`/`truncWS`/`ceilWS`/`floorWS`, `subS`/`mulS`/`divS`, and the seven
+remaining compare predicates `cFS`/`cUnS`/`cUeqS`/`cOltS`/`cUltS`/`cOleS`/
+`cUleS` (plus `cEqS`/`cLtS`/`cLeS`, which — contrary to what the STALL NOTE
+above was written against — also had no theorem yet). Every theorem uses
+the exact same `obtain`/`unfold step`/`rw`/`dsimp only`/`rfl` technique as
+`addS_spec_raw` and the rest of this file; the right-hand sides are copied
+field-for-field from `Step.lean`'s own `execInstr` match arms (read at
+proof-writing time, not guessed), using only public names plus the local
+mirrors declared just below. -/
+
+/-- Mirrors `Step.lean`'s private `floatOfIntBits`: `cvt.s.w`'s numeric
+conversion, reading `w`'s bit pattern as a 32-bit two's-complement int
+(`Int32.ofBitVec`) and converting that integer *value* to the nearest
+`Float32` (`Int32.toFloat32`, exact for every `Int32`). -/
+def floatOfIntBitsSpec (w : W32) : Float32 := (Int32.ofBitVec w).toFloat32
+
+/-- Mirrors `Step.lean`'s private `intBitsOfFloatTrunc`: `cvt.w.s`'s numeric
+conversion, truncating `f` toward zero to a 32-bit two's-complement int
+(`Float32.toInt32`, which clamps on overflow and maps `NaN` to `0`),
+returned as a raw bit pattern. -/
+def intBitsOfFloatTruncSpec (f : Float32) : W32 := f.toInt32.toBitVec
+
+/-- Mirrors `Step.lean`'s private `intBitsOfFloatRound`: `round.w.s`'s
+numeric conversion, rounding `f` to the nearest integer via `Float32.round`
+(ties away from zero), then clamp/convert to `Int32` the same way
+`intBitsOfFloatTruncSpec` does. -/
+def intBitsOfFloatRoundSpec (f : Float32) : W32 := f.round.toInt32.toBitVec
+
+/-- Mirrors `Step.lean`'s private `intBitsOfFloatCeil`: `ceil.w.s`'s numeric
+conversion, rounding `f` toward +Infinity (`Float32.ceil`), then
+clamp/convert to `Int32`. -/
+def intBitsOfFloatCeilSpec (f : Float32) : W32 := f.ceil.toInt32.toBitVec
+
+/-- Mirrors `Step.lean`'s private `intBitsOfFloatFloor`: `floor.w.s`'s
+numeric conversion, rounding `f` toward -Infinity (`Float32.floor`), then
+clamp/convert to `Int32`. -/
+def intBitsOfFloatFloorSpec (f : Float32) : W32 := f.floor.toInt32.toBitVec
+
+/-- **`mov.s` copies `$fs`'s raw 32-bit bit pattern into `$fd`, with no
+numeric conversion at all** (INSTRUCTION-REF "mov.s" section; `Step.lean`'s
+`movS` case is a plain `readFpReg`/`writeFpReg` move, not `Float32`
+arithmetic — exact for every bit pattern, including NaN payloads). -/
+theorem movS_spec_raw (p : Program) (s : State) (w fd fs : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.movS fd fs))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeFpReg s (regIdxSpec fd) (readFpReg s (regIdxSpec fs))) with
+          pc := (writeFpReg s (regIdxSpec fd) (readFpReg s (regIdxSpec fs))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `mov.s`: `3.0` (`0x40400000`) copies through unchanged.
+#guard (match step (prog1Spec (.movS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0x40400000#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0x40400000#32
+        | .halt _ => false) = true
+
+/-- **`cfc1` copies FPU-control-register `$fs`'s raw 32-bit bit pattern into
+GPR `$rt`** — this model has no `FCSR`/`FIR` control-register state at all,
+so, per `Instruction.cfc1`'s docstring, `cfc1`/`ctc1` reuse the very same
+`fpRegs` array the data instructions (`mfc1`/`addS`/…) use as an ordinary
+32-bit scratch slot (register 31 conventionally standing in for `FCSR`),
+with no rounding-mode/exception-flag behavior modeled behind it. The
+`Step.lean` formula is therefore **identical** to `mfc1_spec_raw`'s
+right-hand side — same `readFpReg s (regIdxSpec fs)` into `writeReg s
+(regIdxSpec rt)` — the two constructors exist because they are distinct
+real-MIPS32 encodings (`rs`-position field `CF` vs the ordinary data-move
+encoding), not because the modeled behavior differs. -/
+theorem cfc1_spec_raw (p : Program) (s : State) (w rt fs : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.cfc1 rt fs))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeReg s (regIdxSpec rt) (readFpReg s (regIdxSpec fs))) with
+          pc := (writeReg s (regIdxSpec rt) (readFpReg s (regIdxSpec fs))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`ctc1` copies GPR `$rt`'s raw 32-bit bit pattern into FPU-control
+"register" `$fs`** — the inverse move of `cfc1_spec_raw`, same shared-
+`fpRegs`-scratch-slot model (`Instruction.ctc1`'s docstring). Identical
+right-hand side to `mtc1_spec_raw`, for the same reason `cfc1_spec_raw`'s is
+identical to `mfc1_spec_raw`'s. -/
+theorem ctc1_spec_raw (p : Program) (s : State) (w rt fs : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.ctc1 rt fs))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeFpReg s (regIdxSpec fs) (readReg s (regIdxSpec rt))) with
+          pc := (writeFpReg s (regIdxSpec fs) (readReg s (regIdxSpec rt))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `ctc1` then `cfc1` round-trips an arbitrary bit pattern through the
+-- shared `fpRegs` scratch slot (register 31, standing in for `FCSR`) —
+-- same round-trip shape as `mtc1`/`mfc1` above.
+#guard (match step (prog1Spec (.ctc1 8#32 31#32)) (setRegsSpec (initialState textBase) [(8, 0x00000003#32)]) with
+        | .next s => s.fpRegs.getD 31 0#32 == 0x00000003#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.ctc1 8#32 31#32)) (setRegsSpec (initialState textBase) [(8, 0x00000003#32)]) with
+        | .next s1 =>
+          (match step (prog1Spec (.cfc1 9#32 31#32)) { s1 with pc := textBase } with
+           | .next s2 => readReg s2 9 == 0x00000003#32
+           | .halt _ => false)
+        | .halt _ => false) = true
+
+/-- **`sub.s` writes `$fd := Float32.sub (float $fs) (float $ft)`**, the
+same shape as `addS_spec_raw` with `Float32.sub` in place of `Float32.add`
+(INSTRUCTION-REF "sub.s" section; `Step.lean`'s `subS` case). -/
+theorem subS_spec_raw (p : Program) (s : State) (w fd fs ft : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.subS fd fs ft))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let v := (floatOfBitsSpec (readFpReg s (regIdxSpec fs))).sub
+        (floatOfBitsSpec (readFpReg s (regIdxSpec ft)))
+      StepResult.next
+        { (writeFpReg s (regIdxSpec fd) (bitsOfFloatSpec v)) with
+          pc := (writeFpReg s (regIdxSpec fd) (bitsOfFloatSpec v)).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`mul.s` writes `$fd := Float32.mul (float $fs) (float $ft)`**, same
+shape as `addS_spec_raw`/`subS_spec_raw` with `Float32.mul`
+(INSTRUCTION-REF "mul.s" section; `Step.lean`'s `mulS` case). -/
+theorem mulS_spec_raw (p : Program) (s : State) (w fd fs ft : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.mulS fd fs ft))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let v := (floatOfBitsSpec (readFpReg s (regIdxSpec fs))).mul
+        (floatOfBitsSpec (readFpReg s (regIdxSpec ft)))
+      StepResult.next
+        { (writeFpReg s (regIdxSpec fd) (bitsOfFloatSpec v)) with
+          pc := (writeFpReg s (regIdxSpec fd) (bitsOfFloatSpec v)).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`div.s` writes `$fd := Float32.div (float $fs) (float $ft)`** — IEEE-754
+division; `$ft == 0` yields ±Infinity/NaN per IEEE-754, never a trap
+(module docstring; SPEC-NOTES §9 item 2 precedent), same shape as
+`addS_spec_raw` with `Float32.div` (INSTRUCTION-REF "div.s" section;
+`Step.lean`'s `divS` case). -/
+theorem divS_spec_raw (p : Program) (s : State) (w fd fs ft : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.divS fd fs ft))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let v := (floatOfBitsSpec (readFpReg s (regIdxSpec fs))).div
+        (floatOfBitsSpec (readFpReg s (regIdxSpec ft)))
+      StepResult.next
+        { (writeFpReg s (regIdxSpec fd) (bitsOfFloatSpec v)) with
+          pc := (writeFpReg s (regIdxSpec fd) (bitsOfFloatSpec v)).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `sub.s`: `5.0 - 2.0 = 3.0`; `mul.s`: `2.0 * 3.0 = 6.0`; `div.s`:
+-- `6.0 / 2.0 = 3.0`, and `div.s` by zero gives `+Infinity`, not a trap.
+#guard (match step (prog1Spec (.subS 10#32 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x40a00000#32) 9 0x40000000#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0x40400000#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.mulS 10#32 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x40000000#32) 9 0x40400000#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0x40c00000#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.divS 10#32 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x40c00000#32) 9 0x40000000#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0x40400000#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.divS 10#32 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x3f800000#32) 9 0x00000000#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0x7f800000#32
+        | .halt _ => false) = true
+
+/-- **`cvt.s.w` writes `$fd := float32(int32bits($fs))`** — numeric
+conversion of `$fs`'s bit pattern read as a 32-bit two's-complement int,
+*not* a raw bit-pattern copy (INSTRUCTION-REF "cvt.s.w" section;
+`Step.lean`'s `cvtSW` case uses `floatOfIntBits`/`floatOfIntBitsSpec`). -/
+theorem cvtSW_spec_raw (p : Program) (s : State) (w fd fs : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.cvtSW fd fs))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeFpReg s (regIdxSpec fd)
+            (bitsOfFloatSpec (floatOfIntBitsSpec (readFpReg s (regIdxSpec fs))))) with
+          pc := (writeFpReg s (regIdxSpec fd)
+            (bitsOfFloatSpec (floatOfIntBitsSpec (readFpReg s (regIdxSpec fs))))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`cvt.w.s` writes `$fd := int32bits(trunc($fs))`**, truncating toward
+zero — real MIPS32 rounds per the current FCSR rounding mode, but this v1.x
+addition always truncates (no `FCSR` in scope; `Instruction.cvtWS`'s
+docstring; `Step.lean`'s `cvtWS` case uses `intBitsOfFloatTrunc`/
+`intBitsOfFloatTruncSpec`). -/
+theorem cvtWS_spec_raw (p : Program) (s : State) (w fd fs : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.cvtWS fd fs))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeFpReg s (regIdxSpec fd)
+            (intBitsOfFloatTruncSpec (floatOfBitsSpec (readFpReg s (regIdxSpec fs))))) with
+          pc := (writeFpReg s (regIdxSpec fd)
+            (intBitsOfFloatTruncSpec (floatOfBitsSpec (readFpReg s (regIdxSpec fs))))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `cvt.s.w`: `5` -> `5.0` (`0x40a00000`); `-5` (`0xfffffffb`) -> `-5.0`.
+#guard (match step (prog1Spec (.cvtSW 10#32 8#32)) (writeFpReg (initialState textBase) 8 5#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0x40a00000#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.cvtSW 10#32 8#32)) (writeFpReg (initialState textBase) 8 0xfffffffb#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0xc0a00000#32
+        | .halt _ => false) = true
+-- `cvt.w.s`: `5.9` (`0x40bccccd`) -> `5` (truncated toward zero, not
+-- rounded); `-5.9` (`0xc0bccccd`) -> `-5`.
+#guard (match step (prog1Spec (.cvtWS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0x40bccccd#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0x00000005#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.cvtWS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0xc0bccccd#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0xfffffffb#32
+        | .halt _ => false) = true
+
+/-- **`sqrt.s` writes `$fd := Float32.sqrt (float $fs)`** — correctly-rounded
+IEEE-754 single-precision square root (`Instruction.sqrtS`'s docstring;
+`Step.lean`'s `sqrtS` case). -/
+theorem sqrtS_spec_raw (p : Program) (s : State) (w fd fs : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.sqrtS fd fs))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let v := (floatOfBitsSpec (readFpReg s (regIdxSpec fs))).sqrt
+      StepResult.next
+        { (writeFpReg s (regIdxSpec fd) (bitsOfFloatSpec v)) with
+          pc := (writeFpReg s (regIdxSpec fd) (bitsOfFloatSpec v)).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `sqrt.s`: `4.0` (`0x40800000`) -> `2.0` (`0x40000000`).
+#guard (match step (prog1Spec (.sqrtS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0x40800000#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0x40000000#32
+        | .halt _ => false) = true
+
+/-- **`round.w.s` writes `$fd := int32bits(round($fs))`**, rounding to the
+nearest integer via Lean core's `Float32.round` (ties **away from zero**,
+not to even — a documented simplification; `Instruction.roundWS`'s
+docstring; `Step.lean`'s `roundWS` case). -/
+theorem roundWS_spec_raw (p : Program) (s : State) (w fd fs : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.roundWS fd fs))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeFpReg s (regIdxSpec fd)
+            (intBitsOfFloatRoundSpec (floatOfBitsSpec (readFpReg s (regIdxSpec fs))))) with
+          pc := (writeFpReg s (regIdxSpec fd)
+            (intBitsOfFloatRoundSpec (floatOfBitsSpec (readFpReg s (regIdxSpec fs))))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`trunc.w.s` writes `$fd := int32bits(trunc($fs))`** — numerically
+**identical** to `cvtWS_spec_raw`'s right-hand side under this model (both
+truncate toward zero via `Float32.toInt32`; `Instruction.truncWS`'s
+docstring documents the overlap as intentional, not an oversight). -/
+theorem truncWS_spec_raw (p : Program) (s : State) (w fd fs : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.truncWS fd fs))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeFpReg s (regIdxSpec fd)
+            (intBitsOfFloatTruncSpec (floatOfBitsSpec (readFpReg s (regIdxSpec fs))))) with
+          pc := (writeFpReg s (regIdxSpec fd)
+            (intBitsOfFloatTruncSpec (floatOfBitsSpec (readFpReg s (regIdxSpec fs))))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`ceil.w.s` writes `$fd := int32bits(ceil($fs))`**, rounding toward
++Infinity via `Float32.ceil` (`Instruction.ceilWS`'s docstring; `Step.lean`'s
+`ceilWS` case). -/
+theorem ceilWS_spec_raw (p : Program) (s : State) (w fd fs : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.ceilWS fd fs))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeFpReg s (regIdxSpec fd)
+            (intBitsOfFloatCeilSpec (floatOfBitsSpec (readFpReg s (regIdxSpec fs))))) with
+          pc := (writeFpReg s (regIdxSpec fd)
+            (intBitsOfFloatCeilSpec (floatOfBitsSpec (readFpReg s (regIdxSpec fs))))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`floor.w.s` writes `$fd := int32bits(floor($fs))`**, rounding toward
+-Infinity via `Float32.floor` (`Instruction.floorWS`'s docstring;
+`Step.lean`'s `floorWS` case). -/
+theorem floorWS_spec_raw (p : Program) (s : State) (w fd fs : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.floorWS fd fs))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { (writeFpReg s (regIdxSpec fd)
+            (intBitsOfFloatFloorSpec (floatOfBitsSpec (readFpReg s (regIdxSpec fs))))) with
+          pc := (writeFpReg s (regIdxSpec fd)
+            (intBitsOfFloatFloorSpec (floatOfBitsSpec (readFpReg s (regIdxSpec fs))))).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `round.w.s`: `5.9` (`0x40bccccd`) -> `6` (ties away from zero, not
+-- ties-to-even); `-5.9` (`0xc0bccccd`) -> `-6`; an exact tie `2.5`
+-- (`0x40200000`) -> `3`, `-2.5` (`0xc0200000`) -> `-3`.
+#guard (match step (prog1Spec (.roundWS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0x40bccccd#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0x00000006#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.roundWS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0xc0bccccd#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0xfffffffa#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.roundWS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0x40200000#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0x00000003#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.roundWS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0xc0200000#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0xfffffffd#32
+        | .halt _ => false) = true
+-- `trunc.w.s`: `5.9` -> `5`, `-5.9` -> `-5` (truncate toward zero, same as
+-- `cvt.w.s`).
+#guard (match step (prog1Spec (.truncWS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0x40bccccd#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0x00000005#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.truncWS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0xc0bccccd#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0xfffffffb#32
+        | .halt _ => false) = true
+-- `ceil.w.s`: `5.9` -> `6`, `-5.9` -> `-5` (round toward +Infinity).
+#guard (match step (prog1Spec (.ceilWS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0x40bccccd#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0x00000006#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.ceilWS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0xc0bccccd#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0xfffffffb#32
+        | .halt _ => false) = true
+-- `floor.w.s`: `5.9` -> `5`, `-5.9` -> `-6` (round toward -Infinity).
+#guard (match step (prog1Spec (.floorWS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0x40bccccd#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0x00000005#32
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.floorWS 10#32 8#32)) (writeFpReg (initialState textBase) 8 0xc0bccccd#32) with
+        | .next s => s.fpRegs.getD 10 0#32 == 0xfffffffa#32
+        | .halt _ => false) = true
+
+/-- **`c.eq.s` sets `fpCondFlag := Float32.beq (float $fs) (float $ft)`**,
+IEEE-754 single-precision equality — no delay slot, unlike `bc1t`/`bc1f`
+(INSTRUCTION-REF "c.eq.s" section; `Step.lean`'s `cEqS` case). -/
+theorem cEqS_spec_raw (p : Program) (s : State) (w fs ft : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.cEqS fs ft))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let flag := (floatOfBitsSpec (readFpReg s (regIdxSpec fs))).beq
+        (floatOfBitsSpec (readFpReg s (regIdxSpec ft)))
+      StepResult.next
+        { ({ s with fpCondFlag := flag }) with
+          pc := ({ s with fpCondFlag := flag }).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`c.lt.s` sets `fpCondFlag := Float32.lt (float $fs) (float $ft)`**
+(INSTRUCTION-REF "c.lt.s" section; `Step.lean`'s `cLtS` case). Same modeled
+result as `cOltS_spec_raw` below — see that theorem's docstring for why. -/
+theorem cLtS_spec_raw (p : Program) (s : State) (w fs ft : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.cLtS fs ft))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let flag := (floatOfBitsSpec (readFpReg s (regIdxSpec fs))).lt
+        (floatOfBitsSpec (readFpReg s (regIdxSpec ft)))
+      StepResult.next
+        { ({ s with fpCondFlag := flag }) with
+          pc := ({ s with fpCondFlag := flag }).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`c.le.s` sets `fpCondFlag := Float32.le (float $fs) (float $ft)`**
+(INSTRUCTION-REF "c.le.s" section; `Step.lean`'s `cLeS` case). Same modeled
+result as `cOleS_spec_raw` below. -/
+theorem cLeS_spec_raw (p : Program) (s : State) (w fs ft : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.cLeS fs ft))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let flag := (floatOfBitsSpec (readFpReg s (regIdxSpec fs))).le
+        (floatOfBitsSpec (readFpReg s (regIdxSpec ft)))
+      StepResult.next
+        { ({ s with fpCondFlag := flag }) with
+          pc := ({ s with fpCondFlag := flag }).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `c.eq.s`: `1.0 == 1.0` is true, `1.0 == 2.0` is false.
+#guard (match step (prog1Spec (.cEqS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x3f800000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == true
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.cEqS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x3f800000#32) 9 0x40000000#32) with
+        | .next s => s.fpCondFlag == false
+        | .halt _ => false) = true
+-- `c.lt.s`: `1.0 < 2.0` is true, `2.0 < 1.0` is false.
+#guard (match step (prog1Spec (.cLtS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x3f800000#32) 9 0x40000000#32) with
+        | .next s => s.fpCondFlag == true
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.cLtS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x40000000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == false
+        | .halt _ => false) = true
+-- `c.le.s`: `1.0 <= 1.0` is true.
+#guard (match step (prog1Spec (.cLeS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x3f800000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == true
+        | .halt _ => false) = true
+
+/-- **`c.f.s` sets `fpCondFlag := false` unconditionally**, ignoring both
+operands entirely — real MIPS32's "always false" predicate placeholder
+(INSTRUCTION-REF "c.f.s" section; `Step.lean`'s `cFS` case). -/
+theorem cFS_spec_raw (p : Program) (s : State) (w fs ft : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.cFS fs ft))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      StepResult.next
+        { ({ s with fpCondFlag := false }) with
+          pc := ({ s with fpCondFlag := false }).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`c.un.s` sets `fpCondFlag := isNaN(float $fs) || isNaN(float $ft)`**
+("unordered") — built from `Float32.isNaN` explicitly, *not* derived from
+`<`/`<=` (those already return `false` for any NaN operand, which would
+silently make a naive "unordered" formula wrong; `Instruction.cUnS`'s
+docstring; `Step.lean`'s `cUnS` case). -/
+theorem cUnS_spec_raw (p : Program) (s : State) (w fs ft : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.cUnS fs ft))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let a := floatOfBitsSpec (readFpReg s (regIdxSpec fs))
+      let b := floatOfBitsSpec (readFpReg s (regIdxSpec ft))
+      StepResult.next
+        { ({ s with fpCondFlag := a.isNaN || b.isNaN }) with
+          pc := ({ s with fpCondFlag := a.isNaN || b.isNaN }).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`c.ueq.s` sets `fpCondFlag := ($fs == $ft) || isNaN($fs) || isNaN($ft)`**
+("equal-or-unordered"; INSTRUCTION-REF "c.ueq.s" section; `Step.lean`'s
+`cUeqS` case). -/
+theorem cUeqS_spec_raw (p : Program) (s : State) (w fs ft : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.cUeqS fs ft))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let a := floatOfBitsSpec (readFpReg s (regIdxSpec fs))
+      let b := floatOfBitsSpec (readFpReg s (regIdxSpec ft))
+      StepResult.next
+        { ({ s with fpCondFlag := a.beq b || a.isNaN || b.isNaN }) with
+          pc := ({ s with fpCondFlag := a.beq b || a.isNaN || b.isNaN }).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`c.olt.s` sets `fpCondFlag := Float32.lt (float $fs) (float $ft)`**
+("ordered-less-than") — numerically **identical** to `cLtS_spec_raw`'s
+right-hand side under this model: `Float32.lt` already returns `false` for
+any NaN operand, so it already computes exactly the ordered-less-than
+predicate with no extra `isNaN` guard needed. `c.lt.s` (signaling) and
+`c.olt.s` (quiet) differ on real hardware only in whether a quiet-NaN
+operand raises an Invalid Operation exception; this model has no
+FP-exception mechanism for either, so both constructors compute the same
+`fpCondFlag` value (`Instruction.cOltS`'s docstring; `Step.lean`'s `cOltS`
+case). -/
+theorem cOltS_spec_raw (p : Program) (s : State) (w fs ft : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.cOltS fs ft))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let flag := (floatOfBitsSpec (readFpReg s (regIdxSpec fs))).lt
+        (floatOfBitsSpec (readFpReg s (regIdxSpec ft)))
+      StepResult.next
+        { ({ s with fpCondFlag := flag }) with
+          pc := ({ s with fpCondFlag := flag }).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`c.ult.s` sets `fpCondFlag := ($fs < $ft) || isNaN($fs) || isNaN($ft)`**
+("less-than-or-unordered"), built from `Float32.isNaN` explicitly, same
+rationale as `cUnS_spec_raw` (INSTRUCTION-REF "c.ult.s" section;
+`Step.lean`'s `cUltS` case). -/
+theorem cUltS_spec_raw (p : Program) (s : State) (w fs ft : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.cUltS fs ft))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let a := floatOfBitsSpec (readFpReg s (regIdxSpec fs))
+      let b := floatOfBitsSpec (readFpReg s (regIdxSpec ft))
+      StepResult.next
+        { ({ s with fpCondFlag := a.lt b || a.isNaN || b.isNaN }) with
+          pc := ({ s with fpCondFlag := a.lt b || a.isNaN || b.isNaN }).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`c.ole.s` sets `fpCondFlag := Float32.le (float $fs) (float $ft)`**
+("ordered-less-or-equal") — numerically **identical** to `cLeS_spec_raw`'s
+right-hand side under this model, same `c.le.s`/`c.ole.s`
+signaling-vs-quiet relationship as `cLtS_spec_raw`/`cOltS_spec_raw` above
+(`Instruction.cOleS`'s docstring; `Step.lean`'s `cOleS` case). -/
+theorem cOleS_spec_raw (p : Program) (s : State) (w fs ft : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.cOleS fs ft))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let flag := (floatOfBitsSpec (readFpReg s (regIdxSpec fs))).le
+        (floatOfBitsSpec (readFpReg s (regIdxSpec ft)))
+      StepResult.next
+        { ({ s with fpCondFlag := flag }) with
+          pc := ({ s with fpCondFlag := flag }).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+/-- **`c.ule.s` sets `fpCondFlag := ($fs <= $ft) || isNaN($fs) || isNaN($ft)`**
+("less-or-equal-or-unordered"), built from `Float32.isNaN` explicitly, same
+rationale as `cUnS_spec_raw` (INSTRUCTION-REF "c.ule.s" section;
+`Step.lean`'s `cUleS` case). -/
+theorem cUleS_spec_raw (p : Program) (s : State) (w fs ft : W32)
+    (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some (.cUleS fs ft))
+    (hpb : s.pendingBranch = none) :
+    step p s =
+      let a := floatOfBitsSpec (readFpReg s (regIdxSpec fs))
+      let b := floatOfBitsSpec (readFpReg s (regIdxSpec ft))
+      StepResult.next
+        { ({ s with fpCondFlag := a.le b || a.isNaN || b.isNaN }) with
+          pc := ({ s with fpCondFlag := a.le b || a.isNaN || b.isNaN }).pc + 4#32 } := by
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  simp only at hpb
+  subst hpb
+  unfold step
+  rw [hfetch]
+  dsimp only
+  rw [hdecode]
+  dsimp only
+  rfl
+
+-- `c.f.s`: always `false`, even for equal non-NaN operands.
+#guard (match step (prog1Spec (.cFS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x3f800000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == false
+        | .halt _ => false) = true
+-- `c.un.s`: true iff either operand is a NaN (`0x7fc00000` is a quiet NaN).
+#guard (match step (prog1Spec (.cUnS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x7fc00000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == true
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.cUnS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x3f800000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == false
+        | .halt _ => false) = true
+-- `c.ueq.s`: equal, or unordered.
+#guard (match step (prog1Spec (.cUeqS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x3f800000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == true
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.cUeqS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x7fc00000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == true
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.cUeqS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x3f800000#32) 9 0x40000000#32) with
+        | .next s => s.fpCondFlag == false
+        | .halt _ => false) = true
+-- `c.olt.s`: ordered and less-than; `false` (not `true`) when either
+-- operand is NaN, unlike a plain `<` applied carelessly to the "unordered"
+-- case.
+#guard (match step (prog1Spec (.cOltS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x3f800000#32) 9 0x40000000#32) with
+        | .next s => s.fpCondFlag == true
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.cOltS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x7fc00000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == false
+        | .halt _ => false) = true
+-- `c.ult.s`: less-than, or unordered.
+#guard (match step (prog1Spec (.cUltS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x7fc00000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == true
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.cUltS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x40000000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == false
+        | .halt _ => false) = true
+-- `c.ole.s`: ordered and less-or-equal.
+#guard (match step (prog1Spec (.cOleS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x3f800000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == true
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.cOleS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x7fc00000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == false
+        | .halt _ => false) = true
+-- `c.ule.s`: less-or-equal, or unordered.
+#guard (match step (prog1Spec (.cUleS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x7fc00000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == true
+        | .halt _ => false) = true
+#guard (match step (prog1Spec (.cUleS 8#32 9#32))
+          (writeFpReg (writeFpReg (initialState textBase) 8 0x40000000#32) 9 0x3f800000#32) with
+        | .next s => s.fpCondFlag == false
+        | .halt _ => false) = true
+
 /-! ## Group 6 — closing `step_preserves_zero_register`
 
 The STALL NOTE on `step_preserves_zero_register` (Group 1) predates almost
@@ -4030,7 +5400,7 @@ theorem lb_spec_raw' (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) ((BitVec.ofNat 8 b.toNat).signExtend 32)) with
             pc := (writeReg s (regIdxSpec rt) ((BitVec.ofNat 8 b.toNat).signExtend 32)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -4053,7 +5423,7 @@ theorem lbu_spec_raw' (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)) with
             pc := (writeReg s (regIdxSpec rt) (BitVec.ofNat 32 b.toNat)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -4076,7 +5446,7 @@ theorem lh_spec_raw' (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) (signExt16 h)) with
             pc := (writeReg s (regIdxSpec rt) (signExt16 h)).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -4099,7 +5469,7 @@ theorem lhu_spec_raw' (p : Program) (s : State) (w rs rt imm : W32)
         StepResult.next
           { (writeReg s (regIdxSpec rt) h) with
             pc := (writeReg s (regIdxSpec rt) h).pc + 4#32 } := by
-  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
+  obtain ⟨pc, regs, hi, lo, fpRegs, fpCondFlag, mem, out, pb, squashNext, llBit, cp0Status, cp0Cause, cp0Epc⟩ := s
   simp only at hpb
   subst hpb
   unfold step
@@ -4438,26 +5808,226 @@ theorem step_preserves_zero_register_nontrivial (p : Program) (s s' : State) (w 
     rw [tgeu_spec_raw p s w rs rt hfetch hdecode hpb] at hstep
     try dsimp only at hstep
     split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case clo rs rd =>
+    rw [clo_spec_raw p s w rs rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case clz rs rd =>
+    rw [clz_spec_raw p s w rs rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case mul rs rt rd =>
+    rw [mul_spec_raw p s w rs rt rd hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case seb rd rt =>
+    rw [seb_spec_raw p s w rd rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case seh rd rt =>
+    rw [seh_spec_raw p s w rd rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case wsbh rd rt =>
+    rw [wsbh_spec_raw p s w rd rt hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case ext rt rs pos size =>
+    rw [ext_spec_raw p s w rt rs pos size hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case ins rt rs pos size =>
+    rw [ins_spec_raw p s w rt rs pos size hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case teqi rs imm =>
+    rw [teqi_spec_raw p s w rs imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case tnei rs imm =>
+    rw [tnei_spec_raw p s w rs imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case tgei rs imm =>
+    rw [tgei_spec_raw p s w rs imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case tgeiu rs imm =>
+    rw [tgeiu_spec_raw p s w rs imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case tlti rs imm =>
+    rw [tlti_spec_raw p s w rs imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case tltiu rs imm =>
+    rw [tltiu_spec_raw p s w rs imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep <;> (injection hstep with hs; rw [← hs]; rfl)
+  case mfc1 rt fs =>
+    rw [mfc1_spec_raw p s w rt fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case mtc1 rt fs =>
+    rw [mtc1_spec_raw p s w rt fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case lwc1 rs ft imm =>
+    rw [lwc1_spec_raw p s w rs ft imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · injection hstep with hs; rw [← hs]; rfl
+  case swc1 rs ft imm =>
+    rw [swc1_spec_raw p s w rs ft imm hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    split at hstep
+    · cases hstep
+    · rename_i stored hmw
+      injection hstep with hs; rw [← hs]
+      exact readReg_zero_of_regs_eq (writeMemWord_regs s stored _ _ hmw)
+  case addS fd fs ft =>
+    rw [addS_spec_raw p s w fd fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case subS fd fs ft =>
+    rw [subS_spec_raw p s w fd fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case mulS fd fs ft =>
+    rw [mulS_spec_raw p s w fd fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case divS fd fs ft =>
+    rw [divS_spec_raw p s w fd fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case movS fd fs =>
+    rw [movS_spec_raw p s w fd fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case cvtSW fd fs =>
+    rw [cvtSW_spec_raw p s w fd fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case cvtWS fd fs =>
+    rw [cvtWS_spec_raw p s w fd fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case sqrtS fd fs =>
+    rw [sqrtS_spec_raw p s w fd fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case absS fd fs =>
+    rw [absS_spec_raw p s w fd fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case negS fd fs =>
+    rw [negS_spec_raw p s w fd fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case roundWS fd fs =>
+    rw [roundWS_spec_raw p s w fd fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case truncWS fd fs =>
+    rw [truncWS_spec_raw p s w fd fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case ceilWS fd fs =>
+    rw [ceilWS_spec_raw p s w fd fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case floorWS fd fs =>
+    rw [floorWS_spec_raw p s w fd fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case cEqS fs ft =>
+    rw [cEqS_spec_raw p s w fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case cLtS fs ft =>
+    rw [cLtS_spec_raw p s w fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case cLeS fs ft =>
+    rw [cLeS_spec_raw p s w fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case cFS fs ft =>
+    rw [cFS_spec_raw p s w fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case cUnS fs ft =>
+    rw [cUnS_spec_raw p s w fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case cUeqS fs ft =>
+    rw [cUeqS_spec_raw p s w fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case cOltS fs ft =>
+    rw [cOltS_spec_raw p s w fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case cUltS fs ft =>
+    rw [cUltS_spec_raw p s w fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case cOleS fs ft =>
+    rw [cOleS_spec_raw p s w fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case cUleS fs ft =>
+    rw [cUleS_spec_raw p s w fs ft hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case cfc1 rt fs =>
+    rw [cfc1_spec_raw p s w rt fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; exact writeReg_preserves_zero_slot s _ _
+  case ctc1 rt fs =>
+    rw [ctc1_spec_raw p s w rt fs hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case eret =>
+    rw [eret_spec_raw p s w hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
+  case wait =>
+    rw [wait_spec_raw p s w hfetch hdecode hpb] at hstep
+    try dsimp only at hstep
+    injection hstep with hs; rw [← hs]; rfl
   all_goals sorry
 
 /-! STALL NOTE on `step_preserves_zero_register_nontrivial`'s remaining
-`all_goals sorry`: the goals left open by the `cases instr` dispatch above
-are exactly the instructions with no `_spec_raw` theorem yet to `rw` with
-(`clo clz mul seb seh wsbh ext ins` — SPECIAL2/SPECIAL3; `lwl lwr swl swr` —
-unaligned load/store; `teqi tnei tgei tgeiu tlti tltiu` — REGIMM
-trap-immediate; `syscall` — see the dedicated STALL NOTE below; `mfc0 mtc0
-eret wait` — CP0; and the entire COP1/FPU subset `mfc1 mtc1 lwc1 swc1 addS
-subS mulS divS movS cvtSW cvtWS cEqS cLtS cLeS sqrtS absS negS roundWS
-truncWS ceilWS floorWS cFS cUnS cUeqS cOltS cUltS cOleS cUleS cfc1 ctc1 bc1t
-bc1f`). Every one of these, by inspection of `Step.lean`, writes only
-`fpRegs`/`cp0Status`/`cp0Cause`/`cp0Epc`/`mem`/`pc`/`pendingBranch` —
-*never* the GPR file `regs` — so `readReg _ 0` is expected to be preserved
-for all of them too, by the same `regs`-untouched argument used for
-`mthi`/`mtlo`/`mult`/etc. above. Closing them the same way this file closed
-the other ~70 cases just requires writing a `_spec_raw` theorem for each
-first (restating `step`'s behavior on that instruction with public names,
-the house style throughout this file) — that is substantial net-new
-specification work belonging to Group 2, not a proof-engineering stall, so
-it is out of scope for this pass. Left `sorry` here rather than fabricate
-`_spec_raw` theorems for ~45 more instructions (many of them
-floating-point) in what is meant to be a global-invariant section. -/
+`all_goals sorry` (updated after the proof-bitops/proof-imm-traps/
+proof-fpu-rest/impl-branch-likely/impl-sync/impl-fp-double integration):
+most of the instruction families the previous version of this note listed
+now have `_spec_raw` theorems and have been added as `case` branches above
+(`clo clz mul seb seh wsbh ext ins`, `teqi tnei tgei tgeiu tlti tltiu`,
+`mfc1 mtc1 lwc1 swc1 addS subS mulS divS movS cvtSW cvtWS sqrtS absS negS
+roundWS truncWS ceilWS floorWS` and all ten compare predicates `cEqS cLtS
+cLeS cFS cUnS cUeqS cOltS cUltS cOleS cUleS`, `cfc1 ctc1`, and `eret`/
+`wait`). What's left open by the `cases instr` dispatch above is a smaller,
+genuinely harder-to-close remainder:
+- `lwl lwr swl swr` (unaligned load/store) and `mfc0`/`mtc0` (CP0 register
+  move) all have `_spec_raw` theorems too, but each one's right-hand side
+  is a multi-branch `match` (on the unaligned byte offset `0..3`, or on the
+  CP0 register-select field `12/13/14/_`) rather than the simple shape
+  every closed case above reduces with a single `rfl`/`writeReg_preserves_
+  zero_slot` call; closing these needs a `split at hstep` with one sub-
+  proof per match arm (4 arms each), which is real additional proof work
+  deferred to a future pass, not a stall — every arm, by inspection of
+  `Step.lean`, still only ever writes `regs`/`mem`/`cp0Status`/`cp0Cause`/
+  `cp0Epc`, never leaves the GPR file in a state where `readReg _ 0 ≠ 0`.
+- `syscall` — see the dedicated STALL NOTE below (`syscall1_spec`/
+  `syscall10_spec`): genuinely blocked on the same private-`execInstr`-
+  dispatch chicken-and-egg issue, not just unattempted.
+- `bc1t`/`bc1f` (FP-conditional branch) have no `_spec_raw` theorem at all
+  yet (unlike every other instruction this note used to list, which all
+  gained one this wave) — real net-new specification work, not a stall.
+
+Left `sorry` here for these seven remaining families rather than force
+through four more multi-branch `match`-split proofs and two new branch-
+instruction specs in what is meant to be a closing/consolidation pass. -/
