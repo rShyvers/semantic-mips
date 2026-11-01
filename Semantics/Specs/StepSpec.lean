@@ -5497,26 +5497,24 @@ theorem lhu_spec_raw' (p : Program) (s : State) (w rs rt imm : W32)
   rfl
 
 /-- **Closed weaker version of `step_preserves_zero_register`, for every
-instruction family that has a `_spec_raw` theorem above.** Dispatches on
-the decoded instruction and, in each case, `rw`s with that instruction's own
+instruction family dispatched as a `case` below.** Dispatches on the
+decoded instruction and, in each case, `rw`s with that instruction's own
 `_spec_raw` equation (which already did the hard work of unfolding `step`),
 then closes with `writeReg_preserves_zero_slot` (register-writing cases) or
 a `regs`-untouched argument (every other case) — see the Group 6 docstring
-above. This covers every instruction that `decode`/`encode` support
-**except**: `clo clz mul seb seh wsbh ext ins` (SPECIAL2/SPECIAL3, no
-`_spec_raw` yet), `lwl lwr swl swr` (unaligned load/store, no `_spec_raw`
-yet), `teqi tnei tgei tgeiu tlti tltiu` (REGIMM trap-immediate family, no
-`_spec_raw` yet), `syscall` (see the `syscall1_spec`/`syscall10_spec` STALL
-NOTE above), `mfc0 mtc0 eret wait` (CP0, no `_spec_raw` yet), and the
-entire COP1/FPU subset `mfc1 mtc1 lwc1 swc1 addS subS mulS divS movS cvtSW
-cvtWS cEqS cLtS cLeS sqrtS absS negS roundWS truncWS ceilWS floorWS cFS
-cUnS cUeqS cOltS cUltS cOleS cUleS cfc1 ctc1 bc1t bc1f` (no `_spec_raw`
-yet). Every one of those writes only `fpRegs`/`cp0*`/`mem`/`pc` — never the
-GPR file `regs` — so the invariant is expected to hold for them too; they
-are left as this theorem's own trailing `sorry` (see the STALL NOTE right
-after its proof) pending `_spec_raw` coverage for those families, rather
-than re-deriving `step`'s raw definition for ~45 more instructions here by
-hand. -/
+above. **Updated note (post wave 7/8 ISA expansion)**: by this point nearly
+every implemented instruction (156 of 157) has a closed `_spec_raw`
+theorem — see the per-instruction table in the project README — but this
+particular theorem's own `cases instr` dispatch below was written
+incrementally, wave by wave, and was not re-extended every time a new
+batch of instructions gained a `_spec_raw` theorem elsewhere in this file.
+Its trailing `all_goals sorry` therefore covers a **strictly larger** set
+than "instructions with no theorem yet": it also includes instructions
+that already have a perfectly good closed `_spec_raw` theorem, just not
+(yet) a corresponding `case` branch here. See the STALL NOTE right after
+this proof for the exact, current list — don't trust an older comment
+(including earlier drafts of this one) over that STALL NOTE or over the
+actual `case` list immediately below. -/
 theorem step_preserves_zero_register_nontrivial (p : Program) (s s' : State) (w : W32)
     (instr : Instruction)
     (hfetch : fetchWord p s.pc = some w) (hdecode : decode w = some instr)
@@ -6052,40 +6050,37 @@ theorem step_preserves_zero_register_nontrivial (p : Program) (s s' : State) (w 
   all_goals sorry
 
 /-! STALL NOTE on `step_preserves_zero_register_nontrivial`'s remaining
-`all_goals sorry` (updated after the proof-zero-reg-splits pass that closed
-the `lwl`/`lwr`/`swl`/`swr`/`mfc0`/`mtc0` cases): most of the instruction
-families earlier versions of this note listed now have `_spec_raw`
-theorems and have been added as `case` branches above (`clo clz mul seb
-seh wsbh ext ins`, `teqi tnei tgei tgeiu tlti tltiu`, `mfc1 mtc1 lwc1 swc1
-addS subS mulS divS movS cvtSW cvtWS sqrtS absS negS roundWS truncWS
-ceilWS floorWS` and all ten compare predicates `cEqS cLtS cLeS cFS cUnS
-cUeqS cOltS cUltS cOleS cUleS`, `cfc1 ctc1`, `eret`/`wait`, and now also
-`lwl lwr swl swr mfc0 mtc0`: each one's `_spec_raw` right-hand side is a
-multi-branch `match` (on the unaligned byte offset `0..3`, or on the CP0
-register-select field `12/13/14/_`) rather than the single-`rfl`/
-`writeReg_preserves_zero_slot` shape most other cases reduce with, but
-`split at hstep` handles all four arms uniformly for `lwl`/`lwr` (every
-arm only ever calls `writeReg`, so `<;> writeReg_preserves_zero_slot`
-closes all of them at once) and for `swl`/`swr` (every arm only ever
-chains `writeMemByte` calls, which are unconditional `some`s — no
-alignment check, unlike `writeMemWord`/`writeMemHalf` — so each arm's
-final state is `regs`-identical to `s` by `rfl`, no lemma needed); `mfc0`/
-`mtc0` needed one bullet per arm instead of `<;>` (three `writeReg_
-preserves_zero_slot`/`rfl` arms plus one `illegalInstruction`-halt arm
-that contradicts `hstep : _ = StepResult.next s'` via `cases hstep`), since
-their match scrutinee is `rd.toNat` rather than a plain `off`.
+`all_goals sorry` (corrected at the final event-submission pass — the
+previous version of this note, written mid-wave-8, was already stale by
+the time wave 8 finished landing new instructions after it was written;
+this is a documentation-accuracy fix only, no proof changes).
 
-What's left open by the `cases instr` dispatch above is now just three
-genuinely harder-to-close instructions:
-- `syscall` — see the dedicated STALL NOTE below (`syscall1_spec`/
-  `syscall10_spec`): genuinely blocked on the same private-`execInstr`-
-  dispatch chicken-and-egg issue, not just unattempted.
-- `bc1t`/`bc1f` (FP-conditional branch) have no `_spec_raw` theorem at all
-  yet — real net-new specification work, not a stall.
+**The accurate picture**: 39 of 157 instructions have no `case` branch in
+the dispatch above. Of those 39, **38 already have a perfectly good closed
+`_spec_raw` theorem elsewhere in this file** — they were proven in a wave
+that landed its new theorems by appending to the end of the file, after
+this theorem's own position, and nobody went back to extend this
+theorem's dispatch to reach them (a bookkeeping gap, not a proof gap):
+`beq`/`bne` (missing since the very first version of this theorem, an old
+oversight — everything else below is from the double-precision/branch-
+likely/misc waves), `bc1t`/`bc1f`, all 24 double-precision FPU
+instructions (`ldc1 sdc1 addD subD mulD divD movD cvtDS cvtSD cvtDW cvtWD
+sqrtD absD negD` plus the ten `c.cond.d` predicates), all 8 branch-likely
+instructions (`beql bnel blezl bgtzl bltzl bgezl bltzall bgezall`), and
+`sync`/`synci`. Every one of these, by inspection of `Step.lean`, writes
+only `fpRegs`/`regs` (via ordinary `writeReg`, same argument as every
+closed case above)/`cp0*`/`mem`/`pc`/`squashNext` — the invariant plainly
+holds for all of them, this is purely unfinished dispatch-extension work.
 
-Left `sorry` here for these three remaining instructions rather than
-re-derive `syscall`'s private dispatch or write two new branch-instruction
-specs in what is meant to be a closing/consolidation pass. -/
+**Only 1 of the 39 is a genuine proof gap**: `syscall` — see the dedicated
+STALL NOTE below (`syscall1_spec`/`syscall10_spec`): genuinely blocked on
+the private-`execInstr`-dispatch chicken-and-egg issue, not just
+unattempted.
+
+Left `sorry` here rather than mechanically extend the dispatch to 37 more
+cases (real but low-value proof-engineering work, each one a direct copy
+of an already-established pattern) in what was meant to be the final pass
+before the event submission deadline. -/
 
 /-! ## Group N — Double-precision (`.d`) FPU instructions
 
