@@ -135,6 +135,14 @@ value rather than a `UInt8` loaded from memory. -/
 private def signExtLowByte (w : W32) : W32 :=
   (w.extractLsb 7 0).signExtend 32
 
+/-- A `W32` with the low `n` bits set and all higher bits clear (`n = 0..32`).
+Used by `ext`/`ins` to mask out a `size`-bit field. Built as `(1 <<< n) - 1`:
+for `n = 32`, `1 <<< 32` wraps to `0` in a 32-bit `BitVec` (hardware shift
+semantics, `BitVec.shiftLeft`), so `0 - 1` wraps to `0xffffffff` -- exactly
+the all-ones mask a full-word field needs, with no separate case split. -/
+private def lowBitsMask (n : Nat) : W32 :=
+  ((1#32) <<< n) - 1#32
+
 /-- Count leading zero bits in `w` from the MSB (bit 31), stopping at the
 first set bit; `32` if `w` is all-zero. `fuel` bounds the scan to the
 remaining unscanned bit positions (`pos .. 31`) so this terminates by
@@ -303,6 +311,16 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
   | .srav rd rt rs =>
     let amt := ((readReg s (regIdx rs)).extractLsb 4 0).toNat
     mkNext s (writeReg s (regIdx rd) ((readReg s (regIdx rt)).sshiftRight amt))
+  -- R-type rotate (MIPS32r2): bits shifted off the bottom wrap around to the
+  -- top, unlike `srl`/`srlv`'s zero-fill on the same input
+  -- (docs/spec/MIPS-COVERAGE-GAPS.md section 3.4). `BitVec.rotateRight` already
+  -- reduces its shift amount mod the bitvector width, matching the real
+  -- MIPS32 `sa`/`$rs & 0x1f` range (0-31) exactly.
+  | .rotr rd rt sa =>
+    mkNext s (writeReg s (regIdx rd) ((readReg s (regIdx rt)).rotateRight sa.toNat))
+  | .rotrv rd rt rs =>
+    let amt := ((readReg s (regIdx rs)).extractLsb 4 0).toNat
+    mkNext s (writeReg s (regIdx rd) ((readReg s (regIdx rt)).rotateRight amt))
   -- R-type mult/div
   | .mult rs rt =>
     let a := asSigned (readReg s (regIdx rs))
@@ -352,6 +370,32 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
     mkNext s (writeReg s (regIdx rd) (signExtLowByte (readReg s (regIdx rt))))
   | .seh rd rt =>
     mkNext s (writeReg s (regIdx rd) (signExt16 (readReg s (regIdx rt))))
+  -- SPECIAL3 BSHFL word-swap-bytes-within-halfwords (MIPS32r2): swap the
+  -- two bytes of each 16-bit half of `$rt` independently; the halfwords
+  -- themselves stay in their original word positions (not a full 32-bit
+  -- byte-reverse -- that's `wsbh` + `rotr 16`, not modeled as a single op).
+  | .wsbh rd rt =>
+    let v := readReg s (regIdx rt)
+    let b0 := v &&& 0xff#32
+    let b1 := (v >>> 8) &&& 0xff#32
+    let b2 := (v >>> 16) &&& 0xff#32
+    let b3 := (v >>> 24) &&& 0xff#32
+    let result := (b2 <<< 24) ||| (b3 <<< 16) ||| (b0 <<< 8) ||| b1
+    mkNext s (writeReg s (regIdx rd) result)
+  -- SPECIAL3 bitfield extract/insert (MIPS32r2;
+  -- docs/spec/MIPS-COVERAGE-GAPS.md section 3.4). `pos`/`size` are already the
+  -- semantic values (`Instruction.decode` did the raw-field +-1 arithmetic),
+  -- so this is pure bit masking -- no special-casing for the real
+  -- `pos + size <= 32` hardware constraint, per this track's brief.
+  | .ext rt rs pos size =>
+    let field := (readReg s (regIdx rs) >>> pos.toNat) &&& lowBitsMask size.toNat
+    mkNext s (writeReg s (regIdx rt) field)
+  | .ins rt rs pos size =>
+    let mask := lowBitsMask size.toNat
+    let srcField := (readReg s (regIdx rs) &&& mask) <<< pos.toNat
+    let clearMask := ~~~(mask <<< pos.toNat)
+    let newVal := (readReg s (regIdx rt) &&& clearMask) ||| srcField
+    mkNext s (writeReg s (regIdx rt) newVal)
   -- I-type arith/logic
   | .addi rs rt imm =>
     let av := readReg s (regIdx rs)
@@ -985,6 +1029,70 @@ private def seededHiLo : State := { regs0 with hi := 0xdeadbeef#32, lo := 0xcafe
   10 0xc0000000#32
 #guard nextRegEq (step (prog1 (.srav 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x80000000#32), (9, 1#32)]))
   10 0xc0000000#32
+
+-- ### rotr/rotrv/ext/ins/wsbh (MIPS32r2 additions; docs/spec/MIPS-COVERAGE-GAPS.md
+-- §3.4)
+
+-- rotr: wrap-around is the whole point -- contrast directly with `srl` on
+-- the exact same input (0x80000000 >> 31 would be 1 either way, so use a
+-- shamt where zero-fill and wrap-around visibly differ).
+#guard nextRegEq (step (prog1 (.rotr 10#32 8#32 4#32)) (setRegs regs0 [(8, 0x12345678#32)]))
+  10 0x81234567#32  -- rotate right 4: low nibble (0x8) wraps to the top
+#guard nextRegEq (step (prog1 (.srl 10#32 8#32 4#32)) (setRegs regs0 [(8, 0x12345678#32)]))
+  10 0x01234567#32  -- srl on the same input: zero-fills instead of wrapping
+#guard nextRegEq (step (prog1 (.rotr 10#32 8#32 0#32)) (setRegs regs0 [(8, 0x12345678#32)]))
+  10 0x12345678#32  -- rotate by 0 is a no-op
+#guard nextRegEq (step (prog1 (.rotr 10#32 8#32 31#32)) (setRegs regs0 [(8, 0x80000000#32)]))
+  10 1#32  -- rotate right 31 == rotate left 1
+
+-- rotrv: same wrap-around behavior, but the amount comes from a register's
+-- low 5 bits (masking case included, mirroring sllv/srlv/srav above).
+#guard nextRegEq (step (prog1 (.rotrv 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x12345678#32), (9, 4#32)]))
+  10 0x81234567#32
+#guard nextRegEq (step (prog1 (.rotrv 10#32 8#32 9#32)) (setRegs regs0 [(8, 0x12345678#32), (9, 36#32)]))
+  10 0x81234567#32  -- 36 & 0x1f = 4, masks identically to rotrv by 4
+
+-- ext: extract a 10-bit field starting at bit 6 out of a known pattern.
+-- 0x12345678 = 0001 0010 0011 0100 0101 0110 0111 1000; bits [15:6]
+-- (10 bits starting at pos 6, i.e. (0x12345678 >> 6) & 0x3ff) = 0x159.
+#guard nextRegEq (step (prog1 (.ext 10#32 8#32 6#32 10#32)) (setRegs regs0 [(8, 0x12345678#32)]))
+  10 0x159#32
+-- ext: pos=0, size=32 extracts the whole register unchanged
+#guard nextRegEq (step (prog1 (.ext 10#32 8#32 0#32 32#32)) (setRegs regs0 [(8, 0x89abcdef#32)]))
+  10 0x89abcdef#32
+-- ext: a single bit
+#guard nextRegEq (step (prog1 (.ext 10#32 8#32 31#32 1#32)) (setRegs regs0 [(8, 0x80000000#32)]))
+  10 1#32
+
+-- ins: insert the low 10 bits of $rs (0x159) at pos 6 into $rt, leaving the
+-- bits outside [15:6] unchanged -- round-trips with the `ext` example above.
+#guard nextRegEq (step (prog1 (.ins 10#32 8#32 6#32 10#32)) (setRegs regs0 [(8, 0x159#32), (10, 0x12345678#32)]))
+  10 0x12345678#32  -- re-inserting the field ext'd out above reproduces the original word
+-- ins leaves bits outside the target field unchanged, even when the source
+-- register has garbage in its higher bits (only the low `size` bits of $rs
+-- are used) and $rt's target field previously held something different.
+-- low 10 bits of $rs = 0xfffffc01 & 0x3ff = 0x001, shifted to pos 6 = 0x40;
+-- $rt starts at 0, so only that one bit (bit 6) ends up set.
+#guard nextRegEq (step (prog1 (.ins 10#32 8#32 6#32 10#32)) (setRegs regs0 [(8, 0xfffffc01#32), (10, 0x00000000#32)]))
+  10 0x40#32
+-- ext/ins round-trip: ins-ing a field then ext-racting it back gives the
+-- original (masked-to-size) value, for an arbitrary field/position.
+-- (`prog1` always places its single instruction at `textBase`, so a true
+-- two-instruction sequence needs `buildProg`, threading the same program
+-- across two `stepState` calls -- the first executes `ins` at `textBase`
+-- and advances `pc` to `textBase+4`, where the second call then finds
+-- `ext`.)
+private def extInsRoundTripProg : Program :=
+  buildProg textBase [.ins 10#32 8#32 3#32 7#32, .ext 11#32 10#32 3#32 7#32]
+#guard (stepState extInsRoundTripProg (setRegs regs0 [(8, 0x7f#32), (10, 0#32)])).bind
+        (fun s' => (stepState extInsRoundTripProg s').map (fun s'' => readReg s'' 11))
+  = some 0x7f#32
+
+-- wsbh: swap bytes within each halfword independently, halfwords stay put.
+-- 0x12345678 -> halfword0 (0x5678) swaps to 0x7856, halfword1 (0x1234)
+-- swaps to 0x3412 -> result 0x34127856.
+#guard nextRegEq (step (prog1 (.wsbh 10#32 8#32)) (setRegs regs0 [(8, 0x12345678#32)]))
+  10 0x34127856#32
 
 -- ### addi overflow trap vs addiu wrap; andi/ori/xori high-imm-bits; lui
 
