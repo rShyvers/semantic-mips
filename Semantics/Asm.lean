@@ -60,6 +60,13 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   the original v1 set -- see `docs/spec/INSTRUCTION-REF.md`): identical
   `rt, offset(rs)` shape and parsing to `lw`/`sw`, table-driven the same way
   (opcodes 0x30/0x38).
+- `sync` (zero operands, like `break`; opcode 0, funct 0x0f) and `synci
+  offset(rs)` (REGIMM opcode 0x01, `rt` field fixed 0x1f, same addressing
+  syntax as `lw`/`sw` but with no destination/source register operand --
+  table-driven via a new `IForm.memNoRt`) -- real MIPS32 memory-ordering
+  barrier and instruction-cache-flush hint, completing the atomics story
+  alongside `ll`/`sc` above (`docs/spec/MIPS-COVERAGE-GAPS.md` section 3.7;
+  see `docs/spec/INSTRUCTION-REF.md`).
 - `lwl`/`lwr`/`swl`/`swr` (real MIPS32 classic, pre-r6 unaligned load/store
   pair, added on top of the original v1 set -- see `docs/spec/
   MIPS-COVERAGE-GAPS.md` section 3.6 and `docs/spec/INSTRUCTION-REF.md`):
@@ -367,6 +374,7 @@ private inductive IForm
   | lui      -- rt, imm
   | mem      -- rt, offset(rs)
   | trapImm (rtField : Nat)  -- rs, imm (rt field fixed to the given REGIMM trap selector)
+  | memNoRt (rtField : Nat)  -- offset(rs) only, no destination/source register (synci: rt field fixed 0x1f)
 
 private inductive BForm
   | two          -- rs, rt, target
@@ -414,7 +422,12 @@ private def iTable : List (String × Nat × IForm) :=
    -- load/store pair (opcodes 0x22/0x26/0x2a/0x2e; MD00086 Rev 2.50
    -- §3.2, Table 3-4), same `rt, offset(rs)` shape as `lw`/`sw` (see
    -- `Instruction.lean`/`docs/spec/INSTRUCTION-REF.md`).
-   ("lwl", 0x22, .mem), ("lwr", 0x26, .mem), ("swl", 0x2a, .mem), ("swr", 0x2e, .mem)]
+   ("lwl", 0x22, .mem), ("lwr", 0x26, .mem), ("swl", 0x2a, .mem), ("swr", 0x2e, .mem),
+   -- `synci`: real MIPS32 instruction-cache-flush hint (REGIMM opcode
+   -- 0x01, `rt` field fixed 0x1f; MIPS32r2, `docs/spec/MIPS-COVERAGE-GAPS.md`
+   -- section 3.7), `offset(rs)` only -- no destination/source register,
+   -- unlike every other `.mem`-shaped mnemonic above.
+   ("synci", 0x01, .memNoRt 0x1f)]
 
 /-- Static table of J-type mnemonics: (name, opcode). -/
 private def jTable : List (String × Nat) := [("j", 0x02), ("jal", 0x03)]
@@ -463,11 +476,15 @@ private def cop1Table : List (String × Cop1Form) :=
    ("c.ole.s", .compare 0x36), ("c.ule.s", .compare 0x37),
    ("bc1t", .branch 1), ("bc1f", .branch 0)]
 
--- `break` is a real instruction, not a pseudo-op, but it is zero-operand
--- (like `syscall`) rather than fitting any `RForm` with register operands,
--- so it is special-cased alongside `syscall` the same way throughout this
--- file (`isKnownMnemonic`, `wordsForMnemonic`, `encodeInstruction`).
-private def pseudoSet : List String := ["li", "la", "move", "nop", "syscall", "break"]
+-- `break`/`sync` are real instructions, not pseudo-ops, but are
+-- zero-operand (like `syscall`) rather than fitting any `RForm` with
+-- register operands, so they are special-cased alongside `syscall` the
+-- same way throughout this file (`isKnownMnemonic`, `wordsForMnemonic`,
+-- `encodeInstruction`). `sync` (opcode 0, funct 0x0f; real MIPS32 memory-
+-- ordering barrier, `docs/spec/MIPS-COVERAGE-GAPS.md` section 3.7) does not
+-- carry the `stype` hint field this model omits -- see `Instruction.lean`'s
+-- `.sync` docstring.
+private def pseudoSet : List String := ["li", "la", "move", "nop", "syscall", "break", "sync"]
 private def directiveSet : List String := [".text", ".data", ".word", ".half", ".byte", ".asciiz", ".space"]
 
 /-- SPECIAL2/SPECIAL3 mnemonics with an opcode-bearing R-type-like shape that
@@ -653,6 +670,10 @@ private def wordsForMnemonic (mnemonic : String) (operands : List String) (lineN
     match operands with
     | [] => pure 1
     | _ => throw (.badOperand s!"break takes no operands" lineNo)
+  | "sync" =>
+    match operands with
+    | [] => pure 1
+    | _ => throw (.badOperand s!"sync takes no operands" lineNo)
   | _ => pure 1
 
 private def layoutLine (s : LState) (pl : ParsedLine) : Except AsmError LState := do
@@ -812,6 +833,12 @@ private def encodeIForm (name : String) (opcode : Nat) (form : IForm) (operands 
         let imm ← parseImmediate immT lineNo
         pure (itWord opcode rs rtField (ofInt32 imm))
     | _ => throw (.badOperand s!"{name} expects 'rs, imm'" lineNo)
+  | .memNoRt rtField =>
+    match operands with
+    | [memT] => do
+        let (imm, rs) ← parseMemOperand memT lineNo
+        pure (itWord opcode rs rtField (ofInt32 imm))
+    | _ => throw (.badOperand s!"{name} expects 'offset(rs)'" lineNo)
 
 private def encodeJForm (labels : Std.HashMap String W32) (opcode : Nat) (operands : List String)
     (lineNo : Nat) : Except AsmError W32 :=
@@ -1142,6 +1169,10 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
     match item.operands with
     | [] => pure [0x0000000D#32]              -- all fields zero except funct = 0x0d
     | _ => throw (.badOperand s!"break takes no operands" item.lineNo)
+  | "sync" =>
+    match item.operands with
+    | [] => pure [0x0000000F#32]              -- all fields zero except funct = 0x0f (stype = 0)
+    | _ => throw (.badOperand s!"sync takes no operands" item.lineNo)
   -- Coprocessor-0 (CP0) register move / execution control (real MIPS32
   -- ISA, docs/spec/MIPS-COVERAGE-GAPS.md \u00a73.10A; see `Instruction.lean`/
   -- `Step.lean`). `rd` is a plain numeric CP0 register reference (0-31);
@@ -1770,6 +1801,32 @@ def unalignedProg : Program :=
 #guard decode (unalignedProg.getD (textBase + 4#32) 0) = some (.lwr 29#32 8#32 4#32)
 #guard decode (unalignedProg.getD (textBase + 8#32) 0) = some (.swl 29#32 8#32 1#32)
 #guard decode (unalignedProg.getD (textBase + 12#32) 0) = some (.swr 29#32 8#32 4#32)
+
+-- `sync`/`synci`: real MIPS32 memory-ordering barrier / instruction-cache-
+-- flush hint, completing the atomics story alongside `ll`/`sc` above (see
+-- `docs/spec/MIPS-COVERAGE-GAPS.md` section 3.7 and
+-- `docs/spec/INSTRUCTION-REF.md`). `sync` is zero-operand like `break`;
+-- `synci` takes `offset(rs)` only, identical addressing syntax to `lw`/`sw`
+-- but with no destination/source register operand.
+def syncSrc : String :=
+"sync\n" ++
+"synci 4($sp)\n"
+
+def syncProg : Program :=
+  match assemble syncSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard syncProg.getD textBase 0 = encode .sync
+#guard syncProg.getD (textBase + 4#32) 0 = encode (.synci 29#32 4#32)
+-- both emitted words also round-trip through `decode`
+#guard decode (syncProg.getD textBase 0) = some .sync
+#guard decode (syncProg.getD (textBase + 4#32) 0) = some (.synci 29#32 4#32)
+-- operand errors: `sync` takes no operands; `synci` requires the
+-- `offset(rs)` memory-operand syntax, not a bare register.
+#guard (assemble "sync $t0\n").isOk = false
+#guard (assemble "synci $t0\n").isOk = false
+#guard (assemble "synci $t0, 4($sp)\n").isOk = false
 
 -- One error case per major `AsmError` kind.
 #guard (assemble "frobnicate $t0, $t1\n").isOk = false

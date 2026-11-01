@@ -2352,3 +2352,109 @@ are well-established, memorized ISA constants (the same citation already
 used by `docs/spec/MIPS-COVERAGE-GAPS.md` §3.6), and any single value a
 future reader doubts should be cross-checked against a primary MIPS32 ISA
 reference before relying on it for anything beyond this simulator.
+
+## Memory-ordering / cache-hint instructions (`sync`/`synci`) — v1.x addition
+
+This section documents a v1.x addition: the real MIPS32 memory-ordering
+barrier (`sync`) and instruction-cache-flush hint (`synci`), identified as
+a coverage gap in `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7 ("Atomic Memory
+Operations & Synchronization", the same section that documents `ll`/`sc`
+above) as the instructions that complete this project's atomics story.
+**Grounding note**: like every other v1.x addition in this reference, this
+section is grounded directly in the **real MIPS32 architecture** —
+specifically "MIPS32 Architecture For Programmers, Volume II-A: The MIPS32
+Instruction Set" (MD00086, Rev 2.50, §3.2, Table 3-4, p. 26, entries 288
+(`SYNC`) and 290 (`SYNCI`, MIPS32r2)) — not against MARS, which does not
+implement either instruction (per `MIPS-COVERAGE-GAPS.md` §3.7, the same
+section that documents `ll`/`sc`'s absence from MARS).
+
+### Why both are no-ops in this model
+
+Real MIPS32 hardware uses `sync` to order a core's own loads/stores against
+what other cores/coherent I/O devices observe, and `synci` to flush a stale
+instruction-cache line after self-modifying code or a JIT compiler writes
+new instruction bytes. Both instructions exist to manage hazards that only
+arise from things this simulator does not model at all: **`sync`** orders
+against other cores and out-of-order/speculative execution, and this is a
+single-hart simulator with no multiprocessor state and no instruction
+reordering of any kind (every instruction's effect is fully committed,
+in program order, before the next one is fetched — see `Step.lean`'s
+`execInstr`/`mkNext`); **`synci`** orders against a hardware instruction
+cache that might otherwise serve stale fetched bytes, and this simulator
+has no instruction cache (or any cache) at all — `fetchWord` always reads
+the current contents of `Program` directly. With neither hazard able to
+exist in this model, both instructions are **documented no-ops**: each
+falls through to `PC_next` exactly like any other non-control-flow
+instruction, via the same `mkNext` path every arithmetic/logic instruction
+uses, touching no other part of `State` at all. This is the same
+simplification rationale already used for `wait` above (real hardware
+behavior this simulator has no state to usefully model), not a silent
+pretense that ordering or cache-coherence is implemented.
+
+### sync (R, SPECIAL)
+
+- **Encoding**: `opcode=000000` (0, SPECIAL), `funct=001111` (0x0f — the
+  next funct value after `break`'s 0x0d, skipping the unassigned 0x0e).
+  Real MIPS32 additionally carries an optional 5-bit `stype` hint field in
+  bits 10..6 (`rs`/`rt`/`rd`-position bits are otherwise reserved and
+  conventionally 0) selecting which kind of ordering to enforce (e.g.
+  "completion barrier" vs. weaker load/store-ordering-only variants); since
+  this model enforces no ordering of any kind regardless of `stype`'s
+  value, **`stype` is not modeled as an `Instruction` field at all** —
+  `decode` matches funct `0x0f` and produces `.sync` regardless of what the
+  raw `shamt`-position bits hold, and `encode` always emits `stype = 0`
+  (the all-fields-zero default, `0x0000000F`). This mirrors `break`'s
+  already-documented omission of its real 20-bit "code" field one step up
+  in this reference: a field that exists in the real encoding but carries
+  no observable effect in this model is left out of the constructor
+  entirely, rather than stored and ignored.
+- **Semantics**: a complete no-op — see "Why both are no-ops in this
+  model" above. Falls through to `PC_next`; no register, memory, `hi`/`lo`,
+  FPU, or CP0 state is touched.
+- **Errors/halts**: none.
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  ground truth is the real MIPS32 ISA, and MARS does not implement `sync`.
+
+### synci (I, REGIMM)
+
+- **Encoding**: `opcode=000001` (0x01, REGIMM — the same major opcode as
+  `bltz`/`bgez`/the trap-immediate family above), `rt`-field = `11111`
+  (0x1f), selecting `synci` the same way `rt` multiplexes every other
+  REGIMM sub-instruction in this reference. `rs` (base register) and the
+  16-bit `offset` fields are laid out identically to `lw`/`sw`/`blez`.
+- **Semantics**: `addr = $rs + sext16(offset)` — the exact same effective-
+  address computation `lw`/`sw` perform, included for architectural
+  fidelity (a real implementation would use `addr` to identify which
+  cache line to flush) — but since this simulator has no instruction-cache
+  model, `addr` is computed and then **used for nothing**: no memory read,
+  no memory write, no state of any kind is touched. Falls through to
+  `PC_next`, same as `sync` above.
+- **Errors/halts**: none — unlike `lw`/`sw`/`ll`/`sc`, `synci` never
+  checks `addr`'s alignment, because `addr` is never actually dereferenced
+  (real MIPS32 `SYNCI`'s pseudocode does not fault on a misaligned address
+  either, for the same reason: it names a cache line, not a word-granular
+  memory operand).
+- **MARS note**: not applicable — not part of the MARS-grounded v1 set;
+  ground truth is the real MIPS32 ISA, and MARS does not implement `synci`.
+
+### Encoding summary
+
+| Mnemonic | Format | One-line semantics |
+|---|---|---|
+| `sync` | R, opcode 0, funct 0x0f | no-op (falls through to `PC_next`); no concurrency/reordering model exists to order against |
+| `synci offset($rs)` | I, REGIMM opcode 0x01, `rt`=0x1f | no-op (falls through to `PC_next`); `addr = $rs + sext16(offset)` computed but never used — no instruction-cache model exists to flush |
+
+### Citation
+
+"MIPS32 Architecture For Programmers, Volume II-A: The MIPS32 Instruction
+Set" (MD00086, Rev 2.50), §3.2, Table 3-4 (p. 26): `SYNC` (entry 288,
+opcode 0, funct 0x0f) and `SYNCI` (entry 290, opcode 0x01 REGIMM, `rt`
+field 0x1f, MIPS32r2). No internet access was used to write this section;
+these are well-established, memorized ISA constants (the same citation
+already used by `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7, which lists both
+instructions' table/page/entry numbers independently), and any single value
+a future reader doubts — particularly the exact `funct`/`rt`-field values
+above, which were supplied directly rather than independently re-derived in
+this no-internet-access environment — should be cross-checked against a
+primary MIPS32 ISA reference before relying on it for anything beyond this
+simulator.

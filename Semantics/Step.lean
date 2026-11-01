@@ -559,6 +559,28 @@ private def execInstr (s : State) (w : W32) (instr : Instruction) : StepResult :
         mkNext s { (writeReg stored (regIdx rt) 1#32) with llBit := false }
       else
         mkNext s { (writeReg s (regIdx rt) 0#32) with llBit := false }
+  -- `sync`: real MIPS32 memory-ordering barrier (opcode 0, funct 0x0f;
+  -- MD00086 Rev 2.50 §3.2), completing the atomics story alongside `ll`/
+  -- `sc` above (`docs/spec/MIPS-COVERAGE-GAPS.md` §3.7). Real hardware
+  -- ensures every load/store issued before `sync` completes (as observed
+  -- by other processors/coherent I/O) before any issued after it; this
+  -- single-hart simulator models no concurrency or out-of-order execution
+  -- for such a barrier to order anything against, so `sync` is a documented
+  -- no-op that falls through to `pc + 4` via `mkNext`, touching no state at
+  -- all -- same convention as `wait` below.
+  | .sync => mkNext s s
+  -- `synci`: real MIPS32 instruction-cache-flush hint (REGIMM opcode 0x01,
+  -- `rt` field 0x1f; MIPS32r2, `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7),
+  -- used by self-modifying code / JIT compilers to flush a stale
+  -- instruction-cache line after writing new code bytes. Computes the same
+  -- effective address as `lw`/`sw` for architectural fidelity, but this
+  -- simulator has no instruction-cache model at all, so the address is
+  -- never read from or written to memory -- a documented no-op that falls
+  -- through to `pc + 4` via `mkNext`, touching no state at all (not even a
+  -- memory read).
+  | .synci rs imm =>
+    let _addr := readReg s (regIdx rs) + signExt16 imm
+    mkNext s s
   -- `lwl`/`lwr`/`swl`/`swr`: real MIPS32 classic (pre-r6) unaligned
   -- load/store pair (MD00086 Rev 2.50 §3.2, Table 3-4; `docs/spec/
   -- MIPS-COVERAGE-GAPS.md` §3.6). Unlike `lw`/`sw`, `addr` has no alignment
@@ -1112,6 +1134,16 @@ private def nextLlBitEq (r : StepResult) (b : Bool) : Bool :=
   match r with
   | .next s => s.llBit == b
   | .halt _ => false
+
+/-- Every `State` field except `pc` is unchanged between `s` and `s'`. Used
+to confirm a genuinely-no-op instruction (`sync`/`synci`) touches *no*
+state at all, not just the few fields any individual existing test happens
+to check. -/
+private def sameStateExceptPc (s s' : State) : Bool :=
+  s'.regs == s.regs && s'.hi == s.hi && s'.lo == s.lo && s'.fpRegs == s.fpRegs &&
+    s'.fpCondFlag == s.fpCondFlag && s'.mem == s.mem && s'.out == s.out &&
+    s'.pendingBranch == s.pendingBranch && s'.llBit == s.llBit &&
+    s'.cp0Status == s.cp0Status && s'.cp0Cause == s.cp0Cause && s'.cp0Epc == s.cp0Epc
 
 -- `sll $zero, $zero, 0` — the canonical MIPS encoding of `nop` (word
 -- `0x00000000`) — used as an inert delay-slot filler instruction below.
@@ -2017,6 +2049,25 @@ private def teqEretProg : Program :=
 #guard (match stepState (prog1 .wait) regs0 with
         | some s' => s'.cp0Status == regs0.cp0Status && s'.cp0Cause == regs0.cp0Cause
                        && s'.cp0Epc == regs0.cp0Epc
+        | none => false)
+
+-- sync: a documented no-op (no concurrency/out-of-order execution exists to
+-- order), falls through to `pc + 4` with *every* other field of `State`
+-- left exactly as it was (`sameStateExceptPc`, not just a handful of
+-- hand-picked fields the way the `wait` check above does).
+#guard nextPcEq (step (prog1 .sync) regs0) (textBase + 4#32)
+#guard (match stepState (prog1 .sync) regs0 with
+        | some s' => sameStateExceptPc regs0 s'
+        | none => false)
+
+-- synci: a documented no-op (no instruction-cache model exists to flush),
+-- same full-state-untouched check as `sync` above, run from a state with a
+-- nonzero base register so the (unused) address computation actually reads
+-- something -- confirms the computation itself has no observable effect.
+private def synciTestState : State := setRegs regs0 [(8, 0x10010000#32)]
+#guard nextPcEq (step (prog1 (.synci 8#32 4#32)) synciTestState) (textBase + 4#32)
+#guard (match stepState (prog1 (.synci 8#32 4#32)) synciTestState with
+        | some s' => sameStateExceptPc synciTestState s'
         | none => false)
 
 -- ### Undecodable word → illegalInstruction

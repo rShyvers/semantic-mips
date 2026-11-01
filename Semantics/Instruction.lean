@@ -63,6 +63,22 @@ Field-shape summary (see each constructor's docstring for details):
   0x30/0x38); not part of the original v1 instruction set, added as the
   `State.llBit` single-hart model (see `Types.lean`'s `llBit` docstring and
   `docs/spec/INSTRUCTION-REF.md`).
+- No fields: `sync` — real MIPS32 memory-ordering barrier (opcode 0, funct
+  0x0f; `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7), completing the atomics
+  story alongside `ll`/`sc` above. The real encoding also carries an
+  optional 5-bit `stype` hint field (bits 10..6) selecting which kind of
+  ordering to enforce, but since this single-hart, non-reordering simulator
+  has no concurrency or out-of-order execution for `stype` to distinguish
+  between, it is omitted from this constructor entirely (decode ignores
+  whatever value that field holds; encode always emits 0) — a documented
+  simplification, not an oversight (see `docs/spec/INSTRUCTION-REF.md`).
+- I-type synchronize-caches hint (`rs imm`), same field shape as `blez`:
+  `synci` — real MIPS32 instruction-cache-flush hint for self-modifying
+  code / JIT compilers (REGIMM opcode 0x01, `rt` field fixed `0x1f`;
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7, MIPS32r2). Computes the same
+  `$rs + sext16(offset)` address as `lw`/`sw`, but since this simulator has
+  no instruction-cache model at all, the address is never used for
+  anything (see `Step.lean`/`docs/spec/INSTRUCTION-REF.md`).
 - I-type unaligned load/store (`rs rt imm`), same field shape as `lw`/`sw`:
   `lwl lwr swl swr` — real MIPS32 classic (pre-r6) unaligned memory-access
   pair (opcodes 0x22/0x26/0x2a/0x2e); not part of the original v1
@@ -486,6 +502,19 @@ inductive Instruction where
   /-- `if $rs <u sext16(imm) then trap`: same sign-extend-then-unsigned-compare
   convention as `tgeiu`/`sltiu` (opcode 0x01, `rt` field = 0x0b `TLTIU`). -/
   | tltiu (rs imm : W32)
+  -- Instruction-cache synchronize hint (real MIPS32 ISA, MIPS32r2; see
+  -- `docs/spec/MIPS-COVERAGE-GAPS.md` section 3.7). Shares REGIMM's opcode 0x01
+  -- with the branch/trap-immediate families above, selected the same way
+  -- (by the `rt` field, here fixed to `0x1f`), but its remaining operands
+  -- (`rs`, `imm`) are an address computation like `lw`/`sw`/`blez`, not a
+  -- branch target or trap comparand.
+  /-- Hint to flush the instruction cache at `$rs + sext16(offset)`, for
+  self-modifying code / JIT compilers (opcode 0x01 REGIMM, `rt` field =
+  `0x1f` `SYNCI`). This simulator has no instruction-cache model, so
+  `Step.lean` computes the address (exactly like `lw`/`sw`) but never uses
+  it for anything -- a documented no-op, not a silently-dropped cache
+  effect. -/
+  | synci (rs imm : W32)
   -- J-type
   /-- `PC = (PC_next & 0xF0000000) | (target << 2)` (opcode 0x02). -/
   | j   (target : W32)
@@ -515,6 +544,15 @@ inductive Instruction where
   /-- Unconditional trap (opcode 0, funct 0x0d — the funct value immediately
   after `syscall`'s 0x0c). -/
   | break
+  -- sync (no fields; see module docstring -- the real `stype` hint field is
+  -- out of scope, same "documented simplification, not an oversight"
+  -- rationale as `break`'s omitted "code" field above).
+  /-- Memory-ordering barrier (opcode 0, funct 0x0f -- the next funct value
+  after `break`'s 0x0d, skipping the unassigned 0x0e). Real MIPS32: ensures
+  all loads/stores issued before `sync` complete, as observed by other
+  processors/coherent I/O, before any issued after it -- see
+  `docs/spec/MIPS-COVERAGE-GAPS.md` §3.7. -/
+  | sync
   -- Coprocessor 0 (CP0) register move and execution-control instructions
   -- (v1.x addition; `docs/spec/MIPS-COVERAGE-GAPS.md` §3.10A). Real MIPS32
   -- encoding (opcode 0x10, COP0), scoped to exactly the three CP0
@@ -778,6 +816,11 @@ def decode (w : W32) : Option Instruction :=
     | 0x09 => some (.jalr rs rd)
     | 0x0c => some .syscall
     | 0x0d => some .break
+    -- sync: funct 0x0f. The real `stype` hint lives in the `shamt` field
+    -- (bits 10..6); not modeled, so decode matches regardless of its value,
+    -- the same "ignore an unmodeled sub-field" convention as the SPECIAL2
+    -- bit-count family's rt/rd duplication above.
+    | 0x0f => some .sync
     | 0x34 => some (.teq rs rt)
     | 0x36 => some (.tne rs rt)
     | 0x32 => some (.tlt rs rt)
@@ -836,7 +879,7 @@ def decode (w : W32) : Option Instruction :=
   | 0x06 => some (.blez rs imm)
   | 0x07 => some (.bgtz rs imm)
   | 0x01 =>  -- REGIMM: rt field (not the opcode) selects
-             -- bltz/bgez/bltzal/bgezal/tgei/tgeiu/tlti/tltiu/teqi/tnei
+             -- bltz/bgez/bltzal/bgezal/tgei/tgeiu/tlti/tltiu/teqi/tnei/synci
     match rt.toNat with
     | 0x00 => some (.bltz rs imm)
     | 0x01 => some (.bgez rs imm)
@@ -848,6 +891,7 @@ def decode (w : W32) : Option Instruction :=
     | 0x0b => some (.tltiu rs imm)
     | 0x0c => some (.teqi rs imm)
     | 0x0e => some (.tnei rs imm)
+    | 0x1f => some (.synci rs imm)
     | _ => none
   | 0x02 => some (.j target)
   | 0x03 => some (.jal target)
@@ -1004,6 +1048,7 @@ def encode (i : Instruction) : W32 :=
   | .tgeiu  rs imm => mkIT 0x01#32 rs 0x09#32 imm
   | .tlti   rs imm => mkIT 0x01#32 rs 0x0a#32 imm
   | .tltiu  rs imm => mkIT 0x01#32 rs 0x0b#32 imm
+  | .synci  rs imm => mkIT 0x01#32 rs 0x1f#32 imm
   | .j   target => (0x02#32 <<< 26) ||| mkJT target
   | .jal target => (0x03#32 <<< 26) ||| mkJT target
   | .syscall => mkRT 0#32 0#32 0#32 0#32 0x0c#32
@@ -1014,6 +1059,10 @@ def encode (i : Instruction) : W32 :=
   | .tltu rs rt => mkRT rs rt 0#32 0#32 0x33#32
   | .tgeu rs rt => mkRT rs rt 0#32 0#32 0x31#32
   | .break => mkRT 0#32 0#32 0#32 0#32 0x0d#32
+  -- sync: no stored `stype` field, so this always encodes `stype = 0`
+  -- (the default "complete barrier"), same simplification as `break`'s
+  -- unmodeled "code" field.
+  | .sync => mkRT 0#32 0#32 0#32 0#32 0x0f#32
   -- Coprocessor 0 (CP0). Same opcode-OR convention as the COP1 cases below.
   | .mfc0 rt rd => (0x10#32 <<< 26) ||| mkRT 0x00#32 rt rd 0#32 0#32
   | .mtc0 rt rd => (0x10#32 <<< 26) ||| mkRT 0x04#32 rt rd 0#32 0#32
@@ -1140,6 +1189,13 @@ example : decode ((0x1f#32 <<< 26) ||| mkRT 29#32 8#32 15#32 6#32 0x04#32) = som
 -- break: opcode 0, funct 0x0d, all other fields 0
 example : decode (mkRT 0#32 0#32 0#32 0#32 0x0d#32) = some .break := by decide
 
+-- sync: opcode 0, funct 0x0f, all other fields 0
+example : decode (mkRT 0#32 0#32 0#32 0#32 0x0f#32) = some .sync := by decide
+-- sync decodes the same way regardless of the (unmodeled) `stype` field,
+-- here carried in the raw `shamt`-position bits (e.g. `stype = 0x10`,
+-- a real MIPS32 "load ordering" hint value)
+example : decode (mkRT 0#32 0#32 0#32 0x10#32 0x0f#32) = some .sync := by decide
+
 -- R-type trap-on-condition: rs=29, rt=8 (same shape as mult/div)
 example : decode (mkRT 29#32 8#32 0#32 0#32 0x34#32) = some (.teq 29#32 8#32) := by decide
 example : decode (mkRT 29#32 8#32 0#32 0#32 0x36#32) = some (.tne 29#32 8#32) := by decide
@@ -1204,9 +1260,13 @@ example : decode (mkIT 0x01#32 29#32 0x08#32 0x1234#32) = some (.tgei 29#32 0x12
 example : decode (mkIT 0x01#32 29#32 0x09#32 0x1234#32) = some (.tgeiu 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x01#32 29#32 0x0a#32 0x1234#32) = some (.tlti 29#32 0x1234#32) := by decide
 example : decode (mkIT 0x01#32 29#32 0x0b#32 0x1234#32) = some (.tltiu 29#32 0x1234#32) := by decide
+-- synci: same opcode 0x01, `rt` field fixed 0x1f (real MIPS32 MIPS32r2
+-- addition, docs/spec/MIPS-COVERAGE-GAPS.md §3.7), `rs, imm` shape
+-- identical to `blez`/`bgtz`.
+example : decode (mkIT 0x01#32 29#32 0x1f#32 0x1234#32) = some (.synci 29#32 0x1234#32) := by decide
 -- a REGIMM word with an unrecognized rt field (0x1d is reserved in the
 -- real MIPS32 REGIMM table -- not one of bltz/bgez/bltzal/bgezal/the trap
--- family above) decodes to none
+-- family/synci above) decodes to none
 #guard decode (mkIT 0x01#32 29#32 0x1d#32 0x1234#32) = none
 
 -- J-type: target = 0x3ffffff (all 26 bits)
@@ -1339,6 +1399,12 @@ example : decode (encode (.tge 29#32 8#32)) = some (.tge 29#32 8#32) := by decid
 example : decode (encode (.tltu 29#32 8#32)) = some (.tltu 29#32 8#32) := by decide
 example : decode (encode (.tgeu 29#32 8#32)) = some (.tgeu 29#32 8#32) := by decide
 example : decode (encode .break) = some .break := by decide
+
+-- sync/synci: encode matches the hand-computed word, and decode (encode i) = some i
+example : encode .sync = mkRT 0#32 0#32 0#32 0#32 0x0f#32 := by decide
+example : encode (.synci 29#32 0x1234#32) = mkIT 0x01#32 29#32 0x1f#32 0x1234#32 := by decide
+example : decode (encode .sync) = some .sync := by decide
+example : decode (encode (.synci 29#32 0x1234#32)) = some (.synci 29#32 0x1234#32) := by decide
 
 -- Coprocessor 1 (FPU): full `decode (encode i) = some i` round-trips
 example : decode (encode (.mfc1 8#32 3#32)) = some (.mfc1 8#32 3#32) := by decide
