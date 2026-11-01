@@ -77,6 +77,10 @@ execution logic (method `populate()`, lines 77–3236).
 | `bne` | I-branch | `if ($rs != $rt) PC = PC_next + (offset << 2)` |
 | `blez` | I-branch | `if ($rs <= 0) PC = PC_next + (offset << 2)` |
 | `bgtz` | I-branch | `if ($rs > 0) PC = PC_next + (offset << 2)` |
+| `bltz` | I-branch (REGIMM) | `if ($rs < 0) PC = PC_next + (offset << 2)`, signed |
+| `bgez` | I-branch (REGIMM) | `if ($rs >= 0) PC = PC_next + (offset << 2)`, signed |
+| `bltzal` | I-branch (REGIMM) | `$ra = PC_next + 4` unconditionally; `if ($rs < 0) PC = PC_next + (offset << 2)` |
+| `bgezal` | I-branch (REGIMM) | `$ra = PC_next + 4` unconditionally; `if ($rs >= 0) PC = PC_next + (offset << 2)` |
 | syscall 1 | — | print signed decimal integer in `$a0` |
 | syscall 4 | — | print null-terminated byte string starting at address `$a0` |
 | syscall 10 | — | terminate program normally |
@@ -739,6 +743,97 @@ Source: `vendor/mars-src/mars/mips/hardware/Memory.java`:
 - **MARS note**: same real-MIPS32 delay-slot override as `beq` (Global
   rule 3).
 - **Source**: `InstructionSet.java`, lines 926–941.
+
+---
+
+## REGIMM zero-comparison branches (real MIPS32 ISA) — v1.x addition
+
+The four instructions in this section (`bltz`, `bgez`, `bltzal`, `bgezal`)
+complete the zero-comparison conditional-branch family alongside `blez`/
+`bgtz` above (identified as a coverage gap in
+[`MIPS-COVERAGE-GAPS.md`](MIPS-COVERAGE-GAPS.md) §3.2). Per this
+addition's house rule (same precedent as the `movn`/`movz`/`clo`/`clz`/
+`seb`/`seh` section below), their semantics/encodings are grounded directly
+in the **real MIPS32 architecture** — MIPS32 Architecture For
+Programmers, Volume II-A (`MD00086` Rev 2.50), §3.2, Table 3-2, p. 25
+(`BLTZ` p. 85, `BGEZ` p. 73, `BLTZAL` p. 87, `BGEZAL` p. 75) — not
+derived from `InstructionSet.java` line citations, even though MARS does
+also implement all four.
+
+All four share **opcode `0x01`** (the `REGIMM` major opcode): unlike every
+other branch in this document, the opcode alone does not identify the
+instruction — the 5-bit `rt` field (bits 20–16), which carries no
+register operand here, instead selects which of the four REGIMM
+instructions it is. Field layout: `000001 fffff ttttt ssssssssssssssss` →
+`rs=fffff` (operand 0, the register tested), `rt=ttttt` (sub-opcode
+selector, not a register), `offset=ssss...` (operand 1, 16-bit signed word
+displacement, identical convention to `blez`/`bgtz`).
+
+| Mnemonic | `rt` field | Semantics |
+|---|---|---|
+| `bltz` | `0x00` | `if ($rs < 0) PC = PC_next + (offset << 2)`, signed |
+| `bgez` | `0x01` | `if ($rs >= 0) PC = PC_next + (offset << 2)`, signed |
+| `bltzal` | `0x10` | `$ra = PC_next + 4`, unconditionally; then same condition as `bltz` |
+| `bgezal` | `0x11` | `$ra = PC_next + 4`, unconditionally; then same condition as `bgez` |
+
+### bltz (I-branch, REGIMM)
+- **Encoding**: `opcode=000001` (0x01), `rt=00000` (0x00). Fields:
+  `000001 fffff 00000 ssssssssssssssss` → `rs=fffff` (operand 0),
+  `offset=ssss...` (operand 1).
+- **Semantics**: if `$rs < 0` (signed), schedules
+  `PC = PC_next + (offset << 2)` as the delay-slot transfer, same
+  one-delay-slot discipline as `beq`/`blez`/`bgtz` (Global rule 3; this
+  codebase's `State.pendingBranch` mechanism).
+- **Errors/halts**: none directly; a branch/jump occupying `bltz`'s own
+  delay slot halts with `HaltReason.branchInDelaySlot` (Global rule 3).
+- **Source**: MD00086 Rev 2.50, `BLTZ`, p. 85.
+
+### bgez (I-branch, REGIMM)
+- **Encoding**: `opcode=000001` (0x01), `rt=00001` (0x01). Same layout as
+  `bltz`.
+- **Semantics**: if `$rs >= 0` (signed, includes zero), schedules
+  `PC = PC_next + (offset << 2)`, same delay-slot discipline as `bltz`.
+- **Errors/halts**: none directly; same delay-slot halt condition as
+  `bltz`.
+- **Source**: MD00086 Rev 2.50, `BGEZ`, p. 73.
+
+### bltzal (I-branch, REGIMM)
+- **Encoding**: `opcode=000001` (0x01), `rt=10000` (0x10). Same field
+  layout as `bltz`.
+- **Semantics**: links `$ra = PC_next + 4` (i.e. `PC + 8`, past the delay
+  slot, identical convention to `jal`'s link value) **unconditionally** —
+  every execution of `bltzal` writes `$ra`, regardless of whether the
+  branch itself is taken — then, independently, if `$rs < 0` (signed),
+  schedules `PC = PC_next + (offset << 2)` as the delay-slot transfer, same
+  as `bltz`. This two-part unconditional-link/conditional-branch structure
+  is the real MIPS32 architectural definition (MD00086 Rev 2.50, `BLTZAL`
+  pseudocode: `GPR[31] <- PC + 8` executes in the instruction's own cycle
+  unconditionally; the branch condition on `GPR[rs]` is evaluated and
+  applied one cycle later, at the delay slot), not an assumption — it was
+  verified against the ISA pseudocode rather than inferred from `jal`.
+- **Errors/halts**: none directly; same delay-slot halt condition as
+  `bltz`.
+- **UNPREDICTABLE case**: the real ISA pseudocode explicitly marks `rs = 31`
+  ($ra) as **UNPREDICTABLE**, since the link into `$31` happens before the
+  branch condition on `$rs` is tested, so testing `$ra` itself could
+  legitimately observe either its old value or the just-written link value.
+  This simulator resolves that UNPREDICTABLE case by testing the *pre-link*
+  value of `$rs` (i.e. `Step.lean` reads `$rs` from the state as it was
+  before `$ra`'s write is applied) — a documented, deliberate choice for
+  an architecturally-unspecified input, not an oversight.
+- **Source**: MD00086 Rev 2.50, `BLTZAL`, p. 87.
+
+### bgezal (I-branch, REGIMM)
+- **Encoding**: `opcode=000001` (0x01), `rt=10001` (0x11). Same field
+  layout and unconditional-link convention as `bltzal`.
+- **Semantics**: links `$ra = PC_next + 4` unconditionally, then if
+  `$rs >= 0` (signed), schedules `PC = PC_next + (offset << 2)`, same as
+  `bgez`.
+- **Errors/halts**: none directly; same delay-slot halt condition as
+  `bltz`.
+- **UNPREDICTABLE case**: same `rs = $ra` (31) UNPREDICTABLE case and
+  pre-link-value resolution as `bltzal`.
+- **Source**: MD00086 Rev 2.50, `BGEZAL`, p. 75.
 
 ---
 

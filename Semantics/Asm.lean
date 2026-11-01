@@ -310,8 +310,9 @@ private inductive IForm
   | mem      -- rt, offset(rs)
 
 private inductive BForm
-  | two      -- rs, rt, target
-  | one      -- rs, target
+  | two          -- rs, rt, target
+  | one          -- rs, target (rt field fixed 0, e.g. blez/bgtz)
+  | regimm (rt : Nat)  -- rs, target (rt field fixed to the given REGIMM sub-opcode selector)
 
 /-- Static table of R-type mnemonics: (name, funct, form). -/
 private def rTable : List (String × Nat × RForm) :=
@@ -339,9 +340,15 @@ private def iTable : List (String × Nat × IForm) :=
 /-- Static table of J-type mnemonics: (name, opcode). -/
 private def jTable : List (String × Nat) := [("j", 0x02), ("jal", 0x03)]
 
-/-- Static table of branch mnemonics: (name, opcode, form). -/
+/-- Static table of branch mnemonics: (name, opcode, form). The REGIMM
+zero-comparison branches (`bltz`/`bgez`/`bltzal`/`bgezal`) all share opcode
+0x01; the `rt` field (carried in `.regimm`, not a separate opcode) is what
+selects which one, per MD00086 Rev 2.50 §3.2, Table 3-2 (see
+`Instruction.lean`'s decode/encode and `docs/spec/INSTRUCTION-REF.md`). -/
 private def bTable : List (String × Nat × BForm) :=
-  [("beq", 0x04, .two), ("bne", 0x05, .two), ("blez", 0x06, .one), ("bgtz", 0x07, .one)]
+  [("beq", 0x04, .two), ("bne", 0x05, .two), ("blez", 0x06, .one), ("bgtz", 0x07, .one),
+   ("bltz", 0x01, .regimm 0x00), ("bgez", 0x01, .regimm 0x01),
+   ("bltzal", 0x01, .regimm 0x10), ("bgezal", 0x01, .regimm 0x11)]
 
 /-- Coprocessor-1 (FPU) mnemonic operand shapes. The static parameters
 (`fmt`/`opcode`/`funct`/`tf`) needed to build each instruction's word are
@@ -693,6 +700,13 @@ private def encodeBForm (labels : Std.HashMap String W32) (name : String) (opcod
         let rs ← parseRegister rsT lineNo
         let off ← branchOffset labels tgt instrAddr lineNo
         pure (itWord opcode rs 0 (ofInt32 off))
+    | _ => throw (.badOperand s!"{name} expects 'rs, target'" lineNo)
+  | .regimm rtField =>
+    match operands with
+    | [rsT, tgt] => do
+        let rs ← parseRegister rsT lineNo
+        let off ← branchOffset labels tgt instrAddr lineNo
+        pure (itWord opcode rs rtField (ofInt32 off))
     | _ => throw (.badOperand s!"{name} expects 'rs, target'" lineNo)
 
 /-- Encode a coprocessor-1 (FPU) mnemonic's operand list into its word, per
@@ -1069,6 +1083,39 @@ def trapProg : Program :=
 #guard trapProg.getD (textBase + 20#32) 0 = mkRT (8#32) (9#32) (0#32) (0#32) (0x31#32)
 #guard decode (trapProg.getD (textBase + 20#32) 0) = some (.tgeu 8#32 9#32)
 #guard (assemble "teq $t0\n").isOk = false
+
+-- REGIMM zero-comparison branches: `bltz`/`bgez`/`bltzal`/`bgezal` all
+-- share opcode 0x01 (distinguished only by the `rt` field — see
+-- `Instruction.lean`/`docs/spec/INSTRUCTION-REF.md`); operand shape is
+-- `rs, target`, same as `blez`/`bgtz`.
+def regimmSrc : String :=
+"loop: bltz $t0, loop\n" ++
+"bgez $t0, loop\n" ++
+"bltzal $t0, loop\n" ++
+"bgezal $t0, loop\n"
+def regimmProg : Program :=
+  match assemble regimmSrc with
+  | .ok p => p
+  | .error _ => ∅
+
+-- `loop: bltz $t0, loop`: instrAddr = textBase = target; nextPc = +4;
+-- offset = (target - nextPc)/4 = -1.
+#guard regimmProg.getD textBase 0 = mkIT (0x01#32) (8#32) (0x00#32) (ofInt32 (-1))
+#guard decode (regimmProg.getD textBase 0) = some (.bltz 8#32 0xffff#32)
+-- `bgez $t0, loop`: instrAddr = textBase+4, nextPc = textBase+8,
+-- target = textBase (loop); offset = (0 - 8)/4 = -2.
+#guard regimmProg.getD (textBase + 4#32) 0 = mkIT (0x01#32) (8#32) (0x01#32) (ofInt32 (-2))
+#guard decode (regimmProg.getD (textBase + 4#32) 0) = some (.bgez 8#32 0xfffe#32)
+-- `bltzal $t0, loop`: instrAddr = textBase+8, nextPc = textBase+12;
+-- offset = (0 - 12)/4 = -3.
+#guard regimmProg.getD (textBase + 8#32) 0 = mkIT (0x01#32) (8#32) (0x10#32) (ofInt32 (-3))
+#guard decode (regimmProg.getD (textBase + 8#32) 0) = some (.bltzal 8#32 0xfffd#32)
+-- `bgezal $t0, loop`: instrAddr = textBase+12, nextPc = textBase+16;
+-- offset = (0 - 16)/4 = -4.
+#guard regimmProg.getD (textBase + 12#32) 0 = mkIT (0x01#32) (8#32) (0x11#32) (ofInt32 (-4))
+#guard decode (regimmProg.getD (textBase + 12#32) 0) = some (.bgezal 8#32 0xfffc#32)
+#guard (assemble "bltz $t0\n").isOk = false
+
 -- Coprocessor-1 (FPU) mnemonics: cross-checked word-for-word against
 -- `Instruction.encode` (an independent encoding path from this assembler's
 -- `cop1RtWord`/`itWord`), covering registers/`$fN` parsing and every form.
