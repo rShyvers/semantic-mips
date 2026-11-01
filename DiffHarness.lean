@@ -18,7 +18,7 @@ exactly (after stripping MARS's startup banner).
 ```
 DiffHarness [javaPath] [marsJarPath]
 ```
-Defaults: `javaPath := "java"`, `marsJarPath := "../vendor/mars/Mars4_5.jar"`.
+Defaults: `javaPath := "java"`, `marsJarPath := "vendor/mars/Mars4_5.jar"`.
 Exit code `0` iff every corpus program's verdict is PASS.
 
 ## MARS output format (determined empirically — see report)
@@ -250,7 +250,7 @@ def listAsmFiles (dir : System.FilePath) : IO (Array System.FilePath) := do
 
 def main (args : List String) : IO UInt32 := do
   let javaPath := args.getD 0 "java"
-  let marsJarPath := args.getD 1 "../vendor/mars/Mars4_5.jar"
+  let marsJarPath := args.getD 1 "vendor/mars/Mars4_5.jar"
   let corpusDir : System.FilePath := "tests/corpus"
   let files ← listAsmFiles corpusDir
   if files.isEmpty then
