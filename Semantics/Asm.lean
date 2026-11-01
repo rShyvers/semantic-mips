@@ -21,10 +21,15 @@ words directly via `mkRT` / `mkIT` / `mkJT` (Types.lean) — this module does
   logic/shift/mult-div/mfhi/mflo, I-type immediate/logic/memory, J-type,
   branches, and `syscall` (zero operands, all fields zero except
   funct = 0x0c, i.e. word `0x0000000C`).
+- Coprocessor-1 (FPU) single-precision subset (docs/spec/INSTRUCTION-REF.md's
+  floating-point section): `mtc1`/`mfc1`, `lwc1`/`swc1`, `add.s`/`sub.s`/
+  `mul.s`/`div.s`, `mov.s`, `cvt.s.w`/`cvt.w.s`, `c.eq.s`/`c.lt.s`/`c.le.s`,
+  `bc1t`/`bc1f`.
 - Pseudo-ops: `li`, `la` (label only — see deviation note below), `move`,
   `nop`, expanded per `vendor/mars-src/PseudoOps.txt`.
 - Register names `$zero,$at,$v0,$v1,$a0..$a3,$t0..$t7,$s0..$s7,$t8,$t9,
-  $k0,$k1,$gp,$sp,$fp,$ra` plus raw numeric `$0`..`$31`.
+  $k0,$k1,$gp,$sp,$fp,$ra` plus raw numeric `$0`..`$31`, and FP register names
+  `$f0`..`$f31` for the coprocessor-1 instructions.
 
 ## Layout
 `.text` code words are placed sequentially starting at `textBase` (0x00400000);
@@ -219,6 +224,21 @@ private def parseRegister (tok : String) (line : Nat) : Except AsmError Nat := d
     | some n => if n < 32 then pure n else throw (.badRegister s!"register number out of range (0-31): '{tok}'" line)
     | none => throw (.badRegister s!"unknown register: '{tok}'" line)
 
+/-- `$f0`..`$f31`, the coprocessor-1 (FPU) single-precision register names. -/
+private def fpRegTable : List (String × Nat) :=
+  (List.range 32).map (fun i => (s!"f{i}", i))
+
+/-- Parse an FP register operand. Unlike `parseRegister`, there is no raw
+numeric fallback (`$5` is never an FP register) \u2014 FPU operands always use
+the `$fN` spelling, matching real MIPS32 assembly syntax. -/
+private def parseFpRegister (tok : String) (line : Nat) : Except AsmError Nat := do
+  if !(tok.startsWith "$") then
+    throw (.badRegister s!"FP register name must start with '$': '{tok}'" line)
+  let body := dropS tok 1
+  match fpRegTable.find? (fun p => p.1 == body) with
+  | some (_, n) => pure n
+  | none => throw (.badRegister s!"unknown FP register (expected '$f0'..'$f31'): '{tok}'" line)
+
 private def hexDigit? (c : Char) : Option Nat :=
   if '0' ≤ c ∧ c ≤ '9' then some (c.toNat - '0'.toNat)
   else if 'a' ≤ c ∧ c ≤ 'f' then some (c.toNat - 'a'.toNat + 10)
@@ -309,12 +329,37 @@ private def jTable : List (String × Nat) := [("j", 0x02), ("jal", 0x03)]
 private def bTable : List (String × Nat × BForm) :=
   [("beq", 0x04, .two), ("bne", 0x05, .two), ("blez", 0x06, .one), ("bgtz", 0x07, .one)]
 
+/-- Coprocessor-1 (FPU) mnemonic operand shapes. The static parameters
+(`fmt`/`opcode`/`funct`/`tf`) needed to build each instruction's word are
+carried directly in the constructor — see `cop1Table` and
+`docs/spec/INSTRUCTION-REF.md`'s floating-point section for the exact
+encodings (same values as `Instruction.lean`'s `encode`). -/
+private inductive Cop1Form
+  | moveGpFp (fmt : Nat)        -- mtc1 ($rt,$fs; fmt=4) / mfc1 ($rt,$fs; fmt=0)
+  | mem (opcode : Nat)          -- lwc1 ($ft, offset($rs); 0x31) / swc1 (0x39)
+  | arith3 (fmt funct : Nat)    -- add.s/sub.s/mul.s/div.s: $fd, $fs, $ft
+  | unary (fmt funct : Nat)     -- mov.s/cvt.s.w/cvt.w.s: $fd, $fs
+  | compare (funct : Nat)       -- c.eq.s/c.lt.s/c.le.s: $fs, $ft (fmt always S)
+  | branch (tf : Nat)           -- bc1t (tf=1) / bc1f (tf=0): target
+
+/-- Static table of coprocessor-1 (FPU) mnemonics: (name, form). -/
+private def cop1Table : List (String × Cop1Form) :=
+  [("mtc1", .moveGpFp 4), ("mfc1", .moveGpFp 0),
+   ("lwc1", .mem 0x31), ("swc1", .mem 0x39),
+   ("add.s", .arith3 0x10 0x00), ("sub.s", .arith3 0x10 0x01),
+   ("mul.s", .arith3 0x10 0x02), ("div.s", .arith3 0x10 0x03),
+   ("mov.s", .unary 0x10 0x06),
+   ("cvt.s.w", .unary 0x14 0x20), ("cvt.w.s", .unary 0x10 0x24),
+   ("c.eq.s", .compare 0x32), ("c.lt.s", .compare 0x3c), ("c.le.s", .compare 0x3e),
+   ("bc1t", .branch 1), ("bc1f", .branch 0)]
+
 private def pseudoSet : List String := ["li", "la", "move", "nop", "syscall"]
 private def directiveSet : List String := [".text", ".data", ".word", ".half", ".byte", ".asciiz", ".space"]
 
 private def isKnownMnemonic (m : String) : Bool :=
   rTable.any (·.1 == m) ∨ iTable.any (·.1 == m) ∨ jTable.any (·.1 == m) ∨
-    bTable.any (·.1 == m) ∨ pseudoSet.contains m ∨ directiveSet.contains m
+    bTable.any (·.1 == m) ∨ cop1Table.any (·.1 == m) ∨ pseudoSet.contains m ∨
+    directiveSet.contains m
 
 /-- Number of 32-bit words a `li $rt, v` expansion emits, per
 `PseudoOps.txt` lines 245-247: sign-extendable-16-bit values use a single
@@ -493,6 +538,12 @@ private def itWord (opcode rs rt : Nat) (imm : W32) : W32 :=
 private def jWord (opcode : Nat) (targetWordAddr : Nat) : W32 :=
   (natToW32 opcode <<< 26) ||| mkJT (natToW32 targetWordAddr)
 
+/-- Build a coprocessor-1 (FPU) R-type-shaped word: `mkRT`'s opcode field is
+always 0 (correct for plain R-type), so this ORs in opcode 0x11 explicitly,
+the same way `jWord` ORs its opcode over `mkJT`'s target-only field. -/
+private def cop1RtWord (fmt rt rd shamt funct : Nat) : W32 :=
+  (natToW32 0x11 <<< 26) ||| rtWord fmt rt rd shamt funct
+
 /-- Encode an `li $rt, v` expansion per `PseudoOps.txt` (see `liWordCount`). -/
 private def encodeLi (rt : Nat) (v : Int) : List W32 :=
   if (-32768 : Int) ≤ v ∧ v ≤ -1 then
@@ -609,6 +660,54 @@ private def encodeBForm (labels : Std.HashMap String W32) (name : String) (opcod
         pure (itWord opcode rs 0 (ofInt32 off))
     | _ => throw (.badOperand s!"{name} expects 'rs, target'" lineNo)
 
+/-- Encode a coprocessor-1 (FPU) mnemonic's operand list into its word, per
+`Cop1Form`'s shape and the static parameters carried in `cop1Table`. -/
+private def encodeCop1Form (labels : Std.HashMap String W32) (name : String) (form : Cop1Form)
+    (operands : List String) (instrAddr : W32) (lineNo : Nat) : Except AsmError W32 :=
+  match form with
+  | .moveGpFp fmt =>
+    match operands with
+    | [rtT, fsT] => do
+        let rt ← parseRegister rtT lineNo
+        let fs ← parseFpRegister fsT lineNo
+        pure (cop1RtWord fmt rt fs 0 0)
+    | _ => throw (.badOperand s!"{name} expects '$rt, $fs'" lineNo)
+  | .mem opcode =>
+    match operands with
+    | [ftT, memT] => do
+        let ft ← parseFpRegister ftT lineNo
+        let (imm, rs) ← parseMemOperand memT lineNo
+        pure (itWord opcode rs ft (ofInt32 imm))
+    | _ => throw (.badOperand s!"{name} expects '$ft, offset($rs)'" lineNo)
+  | .arith3 fmt funct =>
+    match operands with
+    | [fdT, fsT, ftT] => do
+        let fd ← parseFpRegister fdT lineNo
+        let fs ← parseFpRegister fsT lineNo
+        let ft ← parseFpRegister ftT lineNo
+        pure (cop1RtWord fmt ft fs fd funct)
+    | _ => throw (.badOperand s!"{name} expects '$fd, $fs, $ft'" lineNo)
+  | .unary fmt funct =>
+    match operands with
+    | [fdT, fsT] => do
+        let fd ← parseFpRegister fdT lineNo
+        let fs ← parseFpRegister fsT lineNo
+        pure (cop1RtWord fmt 0 fs fd funct)
+    | _ => throw (.badOperand s!"{name} expects '$fd, $fs'" lineNo)
+  | .compare funct =>
+    match operands with
+    | [fsT, ftT] => do
+        let fs ← parseFpRegister fsT lineNo
+        let ft ← parseFpRegister ftT lineNo
+        pure (cop1RtWord 0x10 ft fs 0 funct)
+    | _ => throw (.badOperand s!"{name} expects '$fs, $ft'" lineNo)
+  | .branch tf =>
+    match operands with
+    | [tgt] => do
+        let off ← branchOffset labels tgt instrAddr lineNo
+        pure (itWord 0x11 0x08 tf (ofInt32 off))
+    | _ => throw (.badOperand s!"{name} expects a single target operand" lineNo)
+
 /-- Encode one real/pseudo instruction item into its emitted word(s). -/
 private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem) :
     Except AsmError (List W32) := do
@@ -624,6 +723,9 @@ private def encodeInstruction (labels : Std.HashMap String W32) (item : RawItem)
   | none =>
   match bTable.find? (·.1 == name) with
   | some (_, opcode, form) => return [← encodeBForm labels name opcode form item.operands item.addr item.lineNo]
+  | none =>
+  match cop1Table.find? (·.1 == name) with
+  | some (_, form) => return [← encodeCop1Form labels name form item.operands item.addr item.lineNo]
   | none =>
   match name with
   | "li" =>
@@ -824,6 +926,62 @@ def syscallProg : Program :=
 
 #guard syscallProg.getD (textBase + 4#32) 0 = 0x0000000C#32
 #guard decode (syscallProg.getD (textBase + 4#32) 0) = some .syscall
+
+-- Coprocessor-1 (FPU) mnemonics: cross-checked word-for-word against
+-- `Instruction.encode` (an independent encoding path from this assembler's
+-- `cop1RtWord`/`itWord`), covering registers/`$fN` parsing and every form.
+def cop1Src : String :=
+"mtc1 $t0, $f3\n" ++
+"mfc1 $t1, $f3\n" ++
+"lwc1 $f5, 4($sp)\n" ++
+"swc1 $f5, 4($sp)\n" ++
+"add.s $f8, $f7, $f6\n" ++
+"sub.s $f8, $f7, $f6\n" ++
+"mul.s $f8, $f7, $f6\n" ++
+"div.s $f8, $f7, $f6\n" ++
+"mov.s $f8, $f7\n" ++
+"cvt.s.w $f8, $f7\n" ++
+"cvt.w.s $f8, $f7\n" ++
+"c.eq.s $f7, $f6\n" ++
+"c.lt.s $f7, $f6\n" ++
+"c.le.s $f7, $f6\n" ++
+"loop: bc1t loop\n" ++
+"bc1f loop\n"
+
+def cop1Prog : Program :=
+  match assemble cop1Src with
+  | .ok p => p
+  | .error _ => ∅
+
+#guard cop1Prog.getD textBase 0 = encode (.mtc1 8#32 3#32)
+#guard cop1Prog.getD (textBase + 4#32) 0 = encode (.mfc1 9#32 3#32)
+#guard cop1Prog.getD (textBase + 8#32) 0 = encode (.lwc1 29#32 5#32 4#32)
+#guard cop1Prog.getD (textBase + 12#32) 0 = encode (.swc1 29#32 5#32 4#32)
+#guard cop1Prog.getD (textBase + 16#32) 0 = encode (.addS 8#32 7#32 6#32)
+#guard cop1Prog.getD (textBase + 20#32) 0 = encode (.subS 8#32 7#32 6#32)
+#guard cop1Prog.getD (textBase + 24#32) 0 = encode (.mulS 8#32 7#32 6#32)
+#guard cop1Prog.getD (textBase + 28#32) 0 = encode (.divS 8#32 7#32 6#32)
+#guard cop1Prog.getD (textBase + 32#32) 0 = encode (.movS 8#32 7#32)
+#guard cop1Prog.getD (textBase + 36#32) 0 = encode (.cvtSW 8#32 7#32)
+#guard cop1Prog.getD (textBase + 40#32) 0 = encode (.cvtWS 8#32 7#32)
+#guard cop1Prog.getD (textBase + 44#32) 0 = encode (.cEqS 7#32 6#32)
+#guard cop1Prog.getD (textBase + 48#32) 0 = encode (.cLtS 7#32 6#32)
+#guard cop1Prog.getD (textBase + 52#32) 0 = encode (.cLeS 7#32 6#32)
+-- `loop: bc1t loop`: instrAddr = textBase+56 = target; nextPc = +4;
+-- offset = (target - nextPc)/4 = -1.
+#guard cop1Prog.getD (textBase + 56#32) 0 = encode (.bc1t (ofInt32 (-1)))
+-- `bc1f loop`: instrAddr = textBase+60, nextPc = textBase+64, target = loop
+-- (textBase+56); offset = (56 - 64)/4 = -2.
+#guard cop1Prog.getD (textBase + 60#32) 0 = encode (.bc1f (ofInt32 (-2)))
+-- every emitted COP1 word also round-trips through `decode`
+#guard decode (cop1Prog.getD textBase 0) = some (.mtc1 8#32 3#32)
+#guard decode (cop1Prog.getD (textBase + 16#32) 0) = some (.addS 8#32 7#32 6#32)
+-- `decode`'s `imm` is the raw 16-bit field (zero-extended), not the
+-- sign-extended offset value, per `Instruction.lean`'s "raw field" convention
+-- (same as `beq`/`bne`'s `imm`); -1 as that raw 16-bit field is 0xffff.
+#guard decode (cop1Prog.getD (textBase + 56#32) 0) = some (.bc1t 0xffff#32)
+-- an unknown `$f` register is a `badRegister` error
+#guard (assemble "mov.s $f8, $f32\n").isOk = false
 
 -- One error case per major `AsmError` kind.
 #guard (assemble "frobnicate $t0, $t1\n").isOk = false

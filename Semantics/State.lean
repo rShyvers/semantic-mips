@@ -15,12 +15,15 @@ Depends only on the foundation (`Word`, `Types`); read-only there.
 
 /-- The initial machine state at program counter `pc`: all general-purpose
 registers are `0` except `$sp` (register 29), which is seeded with `spInit`;
-`hi`/`lo` are `0`; memory is empty; accumulated output is empty. -/
+`hi`/`lo` are `0`; all 32 FP registers (`fpRegs`) are `0`; `fpCondFlag` is
+`false`; memory is empty; accumulated output is empty. -/
 def initialState (pc : W32) : State :=
   { pc := pc
     regs := (Array.replicate 32 (0#32)).set! 29 spInit
     hi := 0#32
     lo := 0#32
+    fpRegs := Array.replicate 32 (0#32)
+    fpCondFlag := false
     mem := ∅
     out := "" }
 
@@ -36,6 +39,20 @@ Per the `$zero` hardwiring rule (INSTRUCTION-REF Global rule §2), writes to
 register `0` are silently ignored and the state is returned unchanged. -/
 def writeReg (s : State) (i : Fin 32) (v : W32) : State :=
   if i == 0 then s else { s with regs := s.regs.set! i.val v }
+
+/-- Read coprocessor-1 (FPU) register `i`, as its raw 32-bit bit pattern (no
+conversion to `Float32` — see `Types.lean`'s `fpRegs` docstring for the
+storage convention). Out-of-range indices, which should not occur for
+`Fin 32`, default to `0`, matching `readReg`. -/
+def readFpReg (s : State) (i : Fin 32) : W32 :=
+  s.fpRegs.getD i.val 0#32
+
+/-- Write `v` (a raw 32-bit bit pattern) into FPU register `i`, returning the
+updated state. Unlike `writeReg`, there is no hardwired-zero FP register in
+MIPS32 — `$f0` is an ordinary read/write register — so this never ignores
+the write. -/
+def writeFpReg (s : State) (i : Fin 32) (v : W32) : State :=
+  { s with fpRegs := s.fpRegs.set! i.val v }
 
 /-- Fetch the instruction word at `pc` from program `p`. Returns `none` if
 `pc` is not word-aligned (a multiple of 4) or if no instruction is recorded
@@ -113,11 +130,16 @@ example : (initialState textBase).regs[1]! = 0#32 := by decide
 example : (initialState textBase).regs[31]! = 0#32 := by decide
 example : (initialState textBase).hi = 0#32 := by decide
 example : (initialState textBase).lo = 0#32 := by decide
+example : (initialState textBase).fpRegs.size = 32 := by decide
+example : (initialState textBase).fpRegs[0]! = 0#32 := by decide
+example : (initialState textBase).fpRegs[31]! = 0#32 := by decide
+example : (initialState textBase).fpCondFlag = false := by decide
 example : (initialState textBase).out = "" := by decide
 -- `Std.HashMap` has no `DecidableEq`, and its operations are not kernel-reducible
 -- (`decide`/`rfl`); check emptiness via a lookup checked with `#guard` instead.
 #guard (initialState textBase).regs[29]! = spInit
 #guard (initialState textBase).regs[0]! = 0#32
+#guard (initialState textBase).fpRegs.size = 32
 #guard (initialState textBase).mem.get? 0x10010000#32 = none
 
 -- `readReg` / `writeReg`: `$zero` write-ignore
@@ -139,6 +161,17 @@ example : readReg (writeReg (initialState textBase) 8 0x12345678#32) 8 = 0x12345
 -- writing one register leaves others untouched
 example :
     readReg (writeReg (initialState textBase) 8 0x12345678#32) 9 = 0#32 := by decide
+
+-- `readFpReg` / `writeFpReg`: round-trip, no `$f0` write-ignore (unlike GPRs)
+example : readFpReg (initialState textBase) 0 = 0#32 := by decide
+example : readFpReg (writeFpReg (initialState textBase) 0 0x3f800000#32) 0 = 0x3f800000#32 := by
+  decide
+example :
+    readFpReg (writeFpReg (initialState textBase) 31 0x40400000#32) 31 = 0x40400000#32 := by
+  decide
+-- writing one FP register leaves others untouched
+example : readFpReg (writeFpReg (initialState textBase) 8 0x12345678#32) 9 = 0#32 := by decide
+#guard readFpReg (writeFpReg (initialState textBase) 0 0x3f800000#32) 0 = 0x3f800000#32
 
 -- `fetchWord`: alignment failure, hit, miss
 def testProg : Program := (∅ : Program).insert textBase 0xdeadbeef#32
